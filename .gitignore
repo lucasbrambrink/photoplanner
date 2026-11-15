@@ -1,0 +1,21 @@
+# Rust build artifacts
+/raycaster/target/
+
+# Cached elevation / LiDAR tiles (USGS 3DEP, SRTM, etc.)
+/data/3dep_cache/
+*.tif
+*.tiff
+*.hgt
+
+# Python bytecode & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# Environment & OS files
+.env
+.env.*
+.DS_Store

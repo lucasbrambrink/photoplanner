@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pp-solar",
+    "crates/pp-terrain",
+    "crates/pp-raycast",
+    "crates/pp-trails",
+    "crates/pp-atmosphere",
+    "crates/pp-wasm",
+    "crates/pp-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[workspace.dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+rayon = "1.10"
+ureq = { version = "2.10", features = ["json"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+clap = { version = "4.5", features = ["derive"] }
+image = "0.25"
+byteorder = "1.5"

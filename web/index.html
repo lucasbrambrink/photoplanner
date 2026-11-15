@@ -1,0 +1,800 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="light dark" />
+  <title>PhotoPlanner 3D — GPU Volumetric Cloud, 3D Cirrus &amp; Topographic Ray Engine</title>
+  <link rel="stylesheet" href="/styles.css?v=20261114g" />
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <!-- Compact single-row top bar (< 10% viewport height per content-first-noise-reduction) -->
+  <header class="topbar">
+    <div class="brand-cluster">
+      <span class="brand-badge" aria-hidden="true">☀️</span>
+      <div class="brand-text-wrap">
+        <h1 class="brand-title">PhotoPlanner</h1>
+        <span class="brand-tag">3D 1m Engine</span>
+      </div>
+    </div>
+
+    <form id="query-form" class="query-bar" aria-label="Landmark &amp; Shoot Date Controls">
+      <div class="control-group control-group-subject">
+        <label for="landmark-select" class="control-label">Subject</label>
+        <select id="landmark-select" class="form-control" name="landmark">
+          <optgroup label="SF Peninsula &amp; Pacific Coast">
+            <option value="Pedro Point Headlands" selected>Pedro Point Headlands (625 ft • Pacifica)</option>
+            <option value="Montara Mountain">Montara Mountain (1,898 ft • SF Coast)</option>
+          </optgroup>
+          <optgroup label="Yosemite National Park">
+            <option value="Half Dome">Half Dome (8,840 ft)</option>
+            <option value="Clouds Rest">Clouds Rest (9,930 ft)</option>
+            <option value="Upper Yosemite Fall">Upper Yosemite Fall</option>
+            <option value="Sentinel Dome">Sentinel Dome</option>
+            <option value="Bridalveil Fall">Bridalveil Fall</option>
+            <option value="North Dome">North Dome</option>
+            <option value="Cathedral Peak">Cathedral Peak</option>
+            <option value="Tenaya Lake">Tenaya Lake</option>
+          </optgroup>
+        </select>
+      </div>
+
+      <div class="control-group">
+        <label for="shoot-date" class="control-label">Date</label>
+        <input type="date" id="shoot-date" class="form-control" name="date" value="2026-04-16" />
+      </div>
+
+      <div class="control-group">
+        <label for="max-miles" class="control-label">Hike</label>
+        <select id="max-miles" class="form-control" name="max_miles">
+          <option value="10">≤ 10 mi</option>
+          <option value="16" selected>≤ 16 mi</option>
+          <option value="22">≤ 22 mi</option>
+        </select>
+      </div>
+
+      <button type="submit" id="compute-btn" class="btn-primary">
+        Plan Shoot
+      </button>
+    </form>
+
+    <div class="topbar-actions">
+      <button type="button" class="btn-ghost" id="btn-open-calendar" popovertarget="annual-calendar-popover" title="Scan 365-day solar keyhole alignments">
+        <span aria-hidden="true">📅</span>
+        <span class="action-btn-label">Best Dates</span>
+      </button>
+      <button type="button" class="btn-ghost" popovertarget="engine-methodology-popover" title="Rust WASM + WebGL2 3D Volumetric Engine Architecture">
+        <span aria-hidden="true">ℹ️</span>
+        <span class="action-btn-label">Engine</span>
+      </button>
+      <button type="button" id="theme-toggle" class="btn-ghost btn-theme-toggle" aria-label="Toggle color theme" title="Switch Light / Dark studio theme">
+        <span id="theme-toggle-icon" aria-hidden="true">☀️</span>
+        <span id="theme-toggle-label" class="action-btn-label">Light</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- Native Popover for Annual Keyhole Light-Notch Alignment Finder -->
+  <div id="annual-calendar-popover" class="methodology-popover calendar-popover" popover>
+    <div class="popover-header">
+      <div>
+        <span class="eyebrow">365-DAY SOLAR EPHEMERIS + HORIZON SOLVER</span>
+        <h2 id="calendar-popover-title">Annual Keyhole Light-Notch Alignments</h2>
+      </div>
+      <button type="button" class="btn-ghost btn-sm" popovertarget="annual-calendar-popover" popovertargetaction="hide">
+        Close
+      </button>
+    </div>
+    <p class="calendar-intro">
+      Exact dates of the year when the rising or setting sun aligns directly through narrow topographic mountain V-notches as seen from <strong id="calendar-vp-name">VP1</strong>:
+    </p>
+    <div id="calendar-alignments-list" class="calendar-alignments-list">
+      <div class="calendar-empty">Scanning 365-day solar ephemeris against 1m LiDAR + SRTM horizon profile…</div>
+    </div>
+  </div>
+
+  <!-- Native Popover for Engine Methodology & Technical Telemetry (content-first-noise-reduction) -->
+  <div id="engine-methodology-popover" class="methodology-popover" popover>
+    <div class="popover-header">
+      <div>
+        <span class="eyebrow fluid-eyebrow">SYSTEM ARCHITECTURE &amp; PHYSICS PIPELINE</span>
+        <h2>Rust WASM 3D Fluid Dynamics + WebGL2 1m Volumetric Engine</h2>
+      </div>
+      <button type="button" class="btn-ghost btn-sm" popovertarget="engine-methodology-popover" popovertargetaction="hide">
+        Close
+      </button>
+    </div>
+    <p class="popover-lead">
+      <strong>PhotoPlanner 3D</strong> couples physical solar ray-casting, 1m USGS 3DEP LiDAR, and a real-time 3D atmospheric fluid solver:
+    </p>
+    <ol class="methodology-list">
+      <li>
+        <strong>Rust WASM 3D Moist Navier-Stokes &amp; Cirrus Solver:</strong> A dedicated Web Worker executes compiled Rust (<code>pp_wasm.wasm</code>) solving Boussinesq buoyancy, terrain-masked Red-Black SOR pressure projection, Scorer mountain lee waves, Clausius-Clapeyron condensation, and Koop ice sedimentation from <code>0 m</code> to the <code>12.2 km</code> tropopause.
+      </li>
+      <li>
+        <strong>WebGL2 1-Meter Detail Cascade &amp; Upper-Air 3D Cirrus:</strong> Hardware trilinear 3D textures sculpt macro fluid water and ice down to <strong>1.0-meter Kolmogorov micro-turbulent wisps</strong>, sheared <em>cirrus uncinus</em> mares' tails (with +3.3° curved-Earth horizon dip afterglow &amp; 22° ice halo), and DEM-occluded crepuscular god-rays.
+      </li>
+      <li>
+        <strong>1m USGS 3DEP Terrain + Instant WASM Ray-Caster:</strong> Click any point on the 3D terrain in <strong>Inspect</strong> mode for sub-millisecond Rust WASM 65-point sightline profiling, 360° horizon notches, and trailhead routing.
+      </li>
+    </ol>
+    <div class="telemetry-grid popover-telemetry-grid" id="telemetry-details">
+      <div><span>Near-Field DEM</span> <strong>USGS 3DEP 1m F32 Binary Stream</strong></div>
+      <div><span>3D Fluid Grid</span> <strong>64×64×48 (0–12.2 km) + 64³ 1m Cascade</strong></div>
+      <div><span>Cloud Lighting</span> <strong>3-Octave Nubis Multi-Scatter + 128² Shadow LUT</strong></div>
+      <div><span>Solar Ephemeris</span> <strong>NOAA / Meeus + Curved-Earth Horizon Dip</strong></div>
+    </div>
+  </div>
+
+  <!-- Native Popover for 3D Map Layers, Surface Style & Color Legend -->
+  <div id="map-layers-popover" class="layers-popover" popover>
+    <div class="popover-header">
+      <div>
+        <span class="eyebrow">VIEWPORT RENDERING</span>
+        <h2>Map Surface &amp; Overlays</h2>
+      </div>
+      <button type="button" class="btn-ghost btn-sm" popovertarget="map-layers-popover" popovertargetaction="hide">
+        Done
+      </button>
+    </div>
+
+    <div class="layers-section">
+      <div class="section-caption">Terrain Surface Style</div>
+      <div class="surface-segment-group" role="group" aria-label="Terrain Surface Style">
+        <button type="button" class="mode-btn is-active" id="btn-surf-granite" data-surface="0">
+          Granite Relief
+        </button>
+        <button type="button" class="mode-btn" id="btn-surf-aerial" data-surface="1">
+          USGS Satellite
+        </button>
+        <button type="button" class="mode-btn" id="btn-surf-topo" data-surface="2">
+          Topo Contours
+        </button>
+      </div>
+    </div>
+
+    <div class="layers-section">
+      <div class="section-caption">3D Layers &amp; Color Key</div>
+      <div class="layer-check-list">
+        <label class="layer-check-row">
+          <input type="checkbox" id="toggle-atmosphere" checked />
+          <i class="swatch swatch-vp1" aria-hidden="true"></i>
+          <span><strong>3D Fluid Clouds &amp; Cirrus</strong> (1m Volumetric + God-Rays)</span>
+        </label>
+        <label class="layer-check-row">
+          <input type="checkbox" id="toggle-sightlines" checked />
+          <span class="swatch-trio" aria-hidden="true">
+            <i class="swatch swatch-vp1"></i>
+            <i class="swatch swatch-vp2"></i>
+            <i class="swatch swatch-vp3"></i>
+          </span>
+          <span><strong>Trails &amp; Sightlines</strong> (VP1 / VP2 / VP3)</span>
+        </label>
+        <label class="layer-check-row">
+          <input type="checkbox" id="toggle-viewshed" />
+          <i class="swatch swatch-viewshed" aria-hidden="true"></i>
+          <span><strong>Live Viewshed Heatmap</strong> (Unobstructed LOS)</span>
+        </label>
+        <label class="layer-check-row">
+          <input type="checkbox" id="toggle-alpenglow-zone" />
+          <i class="swatch swatch-alpenglow" aria-hidden="true"></i>
+          <span><strong>Alpenglow Landing Zone</strong> (Lit Cliff Highlight)</span>
+        </label>
+        <label class="layer-check-row">
+          <input type="checkbox" id="toggle-sun-beams" />
+          <i class="swatch swatch-alpenglow" aria-hidden="true"></i>
+          <span><strong>Analytical Grazing Vectors</strong> (Silhouette Lines)</span>
+        </label>
+        <label class="layer-check-row">
+          <input type="checkbox" id="toggle-light-field" />
+          <i class="swatch swatch-viewshed" aria-hidden="true"></i>
+          <span><strong>Analytical Ray Lattice</strong> (Valley Vector Grid)</span>
+        </label>
+      </div>
+    </div>
+  </div>
+
+  <!-- Native Popover for Curated Weather & Landmark Benchmark Scenarios (content-first-noise-reduction) -->
+  <div id="scenarios-popover" class="scenarios-popover" popover>
+    <div class="popover-header">
+      <div>
+        <span class="eyebrow">CURATED ATMOSPHERIC BENCHMARKS</span>
+        <h2>Featured Shoot Scenarios</h2>
+      </div>
+      <button type="button" class="btn-ghost btn-sm" popovertarget="scenarios-popover" popovertargetaction="hide">
+        Done
+      </button>
+    </div>
+    <p class="popover-lead">
+      Jump directly to live forecasts or calibrated historical cloud, marine fog-sea, and Sierra alpenglow benchmarks:
+    </p>
+    <div class="scenario-preset-list">
+      <button type="button" class="scenario-preset-card" id="btn-vp-yesterday-pedro">
+        <span class="scenario-preset-icon" aria-hidden="true">🌅</span>
+        <span class="scenario-preset-body">
+          <strong>Pedro Point Offshore Slot</strong>
+          <span>3 km HRRR • 93% Open 18 km Horizon Slot + 35% High Cirrus</span>
+        </span>
+      </button>
+      <button type="button" class="scenario-preset-card" id="btn-vp-today-sf">
+        <span class="scenario-preset-icon" aria-hidden="true">🔥</span>
+        <span class="scenario-preset-body">
+          <strong>Montara Mountain Live HRRR</strong>
+          <span>SF Coast 3 km Mesoscale Deck &amp; Coastal Ridge Flow</span>
+        </span>
+      </button>
+      <button type="button" class="scenario-preset-card" id="btn-vp-fog-sea">
+        <span class="scenario-preset-icon" aria-hidden="true">☁️</span>
+        <span class="scenario-preset-body">
+          <strong>Pacific Marine Inversion Fog-Sea ('25)</strong>
+          <span>Aug 15, 2025 • +10.1°F Cap with 1,260 ft Cloud Sea Below Peak</span>
+        </span>
+      </button>
+      <button type="button" class="scenario-preset-card" id="btn-vp-clear-slot">
+        <span class="scenario-preset-icon" aria-hidden="true">✨</span>
+        <span class="scenario-preset-body">
+          <strong>Pedro Point Crimson Cirrus ('25)</strong>
+          <span>Oct 22, 2025 • Broken Low Sc + High Ice Mares' Tails Afterglow</span>
+        </span>
+      </button>
+      <button type="button" class="scenario-preset-card" id="btn-vp-halfdome-alpenglow">
+        <span class="scenario-preset-icon" aria-hidden="true">🏔️</span>
+        <span class="scenario-preset-body">
+          <strong>Half Dome Alpine Cumulus &amp; Cirrus</strong>
+          <span>Yosemite • 1m Anabatic Turrets + 10.5 km Jet-Sheared Cirrus</span>
+        </span>
+      </button>
+      <button type="button" class="scenario-preset-card" id="btn-vp-clouds-rest-wave">
+        <span class="scenario-preset-icon" aria-hidden="true">🛸</span>
+        <span class="scenario-preset-body">
+          <strong>Clouds Rest Sierra Lee-Wave Lenticular</strong>
+          <span>High Sierra • Standing Scorer Gravity Wave + Tropopause Ice</span>
+        </span>
+      </button>
+    </div>
+  </div>
+
+  <!-- Main Workspace Split: Left = Focused Planner Sidebar | Right = Clean 3D Topographic Stage -->
+  <main class="workspace">
+    <aside class="planner-sidebar" aria-label="Recommended Viewpoints and Atmospheric Telemetry">
+      <!-- Compact Landmark Header Card -->
+      <section class="card landmark-summary-card" id="landmark-summary">
+        <div class="landmark-header-row">
+          <div class="landmark-title-group">
+            <span class="eyebrow" id="summary-eyebrow">TARGET SUBJECT</span>
+            <h2 class="landmark-name" id="summary-title">Pedro Point Headlands</h2>
+          </div>
+          <span class="relief-pill" id="summary-elevation">625 ft</span>
+        </div>
+        <p class="landmark-meta" id="summary-subtitle">
+          Loading 1m USGS 3DEP LiDAR &amp; 3D trail sightlines…
+        </p>
+      </section>
+
+      <!-- On-Demand Disclosure: Rust WASM 3D Atmospheric Fluid & 1m Cloud Physics Engine (Open by default) -->
+      <details class="card weather-card fluid-card" id="fluid-physics-disclosure" open>
+        <summary class="weather-summary">
+          <div class="weather-summary-main">
+            <span class="eyebrow fluid-eyebrow">RUST WASM NAVIER-STOKES + WEBGL2 1M</span>
+            <span class="weather-verdict" id="fluid-regime-title">3D Moist Fluid &amp; 10.5 km Cirrus</span>
+            <span class="weather-summary-sub" id="fluid-summary-sub">
+              1.0m Detail Cascade • 0–12.2 km Stretched Column
+            </span>
+          </div>
+          <div class="weather-summary-right">
+            <span class="alpenglow-score-badge fluid-perf-badge" id="fluid-perf-badge">60 FPS</span>
+            <span class="disclosure-chevron" aria-hidden="true">▾</span>
+          </div>
+        </summary>
+
+        <div class="weather-expanded-body">
+          <div class="fluid-control-block">
+            <label for="select-fluid-preset" class="section-caption">Atmospheric Regime &amp; Imputation</label>
+            <select id="select-fluid-preset" class="form-control fluid-select">
+              <option value="live" selected>⚡ Live Forecast Imputation (HRRR / Sounding)</option>
+              <option value="coastal_fog_sea">🌊 Pacific Marine Fog Sea &amp; Inversion</option>
+              <option value="crepuscular_godrays">☀️ Broken Stratocumulus &amp; Crepuscular God-Rays</option>
+              <option value="sierra_cumulus_cirrus">🏔️ Orographic Cumulus &amp; High 3D Cirrus</option>
+              <option value="lenticular_wave">🛸 Sierra Lee-Wave Lenticular &amp; Jet Cirrus</option>
+              <option value="clear_crisp_cirrus">✨ Crystal Alpine Visibility &amp; Wispy Cirrus</option>
+            </select>
+            <p class="weather-rec fluid-preset-desc" id="fluid-preset-desc">
+              Couples Open-Meteo / HRRR pressure-level sounding directly into the 3D Rust Navier-Stokes &amp; ice solver.
+            </p>
+          </div>
+
+          <div class="fluid-quality-row">
+            <div class="surface-segment-group fluid-quality-group" role="group" aria-label="GPU Raymarch Quality">
+              <button type="button" class="mode-btn is-active" data-fluid-quality="ultra">Ultra 1m</button>
+              <button type="button" class="mode-btn" data-fluid-quality="balanced">Balanced</button>
+              <button type="button" class="mode-btn" data-fluid-quality="performance">Fast</button>
+            </div>
+            <button type="button" class="btn-ghost btn-sm fluid-pause-btn" id="btn-toggle-fluid-evolve">⏸ Pause</button>
+          </div>
+
+          <div class="fluid-sliders-grid">
+            <div class="slider-field fluid-slider-field">
+              <div class="slider-header">
+                <label class="slider-label" for="slider-fluid-speed">Evolution Speed</label>
+                <output class="slider-output" id="out-fluid-speed" for="slider-fluid-speed">1.0×</output>
+              </div>
+              <input class="slider-input" id="slider-fluid-speed" type="range" min="0" max="4" step="0.1" value="1.0" />
+            </div>
+
+            <div class="slider-field fluid-slider-field">
+              <div class="slider-header">
+                <label class="slider-label" for="slider-micro-detail">1m Micro Detail</label>
+                <output class="slider-output" id="out-micro-detail" for="slider-micro-detail">100%</output>
+              </div>
+              <input class="slider-input" id="slider-micro-detail" type="range" min="0" max="200" step="5" value="100" />
+            </div>
+
+            <div class="slider-field fluid-slider-field">
+              <div class="slider-header">
+                <label class="slider-label" for="slider-cloud-density">Low / Mid Liquid</label>
+                <output class="slider-output" id="out-cloud-density" for="slider-cloud-density">100%</output>
+              </div>
+              <input class="slider-input" id="slider-cloud-density" type="range" min="15" max="200" step="5" value="100" />
+            </div>
+
+            <div class="slider-field fluid-slider-field">
+              <div class="slider-header">
+                <label class="slider-label" for="slider-cirrus-density">Upper 3D Cirrus</label>
+                <output class="slider-output" id="out-cirrus-density" for="slider-cirrus-density">110%</output>
+              </div>
+              <input class="slider-input" id="slider-cirrus-density" type="range" min="0" max="220" step="5" value="110" />
+            </div>
+          </div>
+
+          <div class="metric-tiles-grid fluid-telemetry-grid" id="fluid-telemetry-grid">
+            <div class="metric-tile">
+              <span class="metric-tile-label">LCL / Freeze Alt</span>
+              <strong class="metric-tile-val" id="val-fluid-lcl">1,250 / 12,400 ft</strong>
+            </div>
+            <div class="metric-tile">
+              <span class="metric-tile-label">3D Cirrus Band</span>
+              <strong class="metric-tile-val" id="val-fluid-cirrus-base">8.4–12.2 km</strong>
+            </div>
+            <div class="metric-tile">
+              <span class="metric-tile-label">Updraft · Liquid</span>
+              <strong class="metric-tile-val" id="val-fluid-updraft">+1.4 m/s · 0.61 g/kg</strong>
+            </div>
+            <div class="metric-tile">
+              <span class="metric-tile-label">Froude · Shear</span>
+              <strong class="metric-tile-val" id="val-fluid-froude-shear">Fr 0.62 · 4.5/km</strong>
+            </div>
+            <div class="metric-tile">
+              <span class="metric-tile-label">Low / Mid Cover</span>
+              <strong class="metric-tile-val" id="val-fluid-low-mid">48% / 20%</strong>
+            </div>
+            <div class="metric-tile">
+              <span class="metric-tile-label">3D Cirrus · Ice</span>
+              <strong class="metric-tile-val" id="val-fluid-cirrus-cov">62% · 0.42 g/kg</strong>
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <!-- On-Demand Disclosure: 3-Station Solar Ray-Path & Alpenglow Forecast -->
+      <details class="card weather-card" id="weather-disclosure">
+        <summary class="weather-summary">
+          <div class="weather-summary-main">
+            <span class="eyebrow" id="weather-corridor-eyebrow">SOLAR RAY &amp; ALPENGLOW FORECAST</span>
+            <span class="weather-verdict" id="weather-verdict">Under-the-Deck Alpenglow Explosion</span>
+            <span class="weather-summary-sub" id="weather-summary-sub">
+              87% Beam Transmittance • Click to inspect 75 km ray corridor
+            </span>
+          </div>
+          <div class="weather-summary-right">
+            <span class="alpenglow-score-badge" id="weather-score-badge">88 / 100</span>
+            <span class="disclosure-chevron" aria-hidden="true">▾</span>
+          </div>
+        </summary>
+
+        <div class="weather-expanded-body">
+          <!-- Sunset vs Sunrise Ray Corridor Switcher -->
+          <div class="corridor-phase-tabs" role="tablist" aria-label="Solar Ray Corridor Direction">
+            <button type="button" class="corridor-tab is-active" id="tab-corridor-sunset" data-phase="sunset">
+              🌇 Sunset Ray (WSW 75 km)
+            </button>
+            <button type="button" class="corridor-tab" id="tab-corridor-sunrise" data-phase="sunrise">
+              🌅 Sunrise Ray (ESE 75 km)
+            </button>
+          </div>
+
+          <p class="weather-rec" id="weather-recommendation">
+            Sampling multi-altitude cloud layers at 75 km Horizon Entry, 18 km Keyhole Ridge, and 0 km Target Canvas…
+          </p>
+
+          <!-- SVG 3-Station Atmospheric Ray-Path Cross-Section (75 km -> 18 km -> 0 km) -->
+          <div class="raypath-diagram-box">
+            <div class="raypath-diagram-header">
+              <span id="raypath-azimuth-label">Solar Beam Corridor: Az 259.1° W (El +0.2°)</span>
+              <span id="raypath-trans-pill" class="raypath-trans-pill">End-to-End Beam: 87%</span>
+            </div>
+            <svg id="raypath-svg" class="raypath-svg" viewBox="0 0 360 92" preserveAspectRatio="none" aria-label="75 km to 0 km Solar Ray Cross-Section"></svg>
+          </div>
+
+          <!-- 3-Station Telemetry Grid (75 km Entry | 18 km Notch | 0 km Canvas) -->
+          <div class="raypath-stations-grid" id="raypath-stations-grid"></div>
+
+          <!-- Fog / Marine Layer Inversion & Dual Sunset Quality Profile -->
+          <div class="raypath-diagram-box" id="inversion-profile-box">
+            <div class="raypath-diagram-header">
+              <span id="inversion-header-label">Fog &amp; Thermal Inversion Profile (2m → 925hPa)</span>
+              <span id="inversion-clearance-pill" class="raypath-trans-pill">+558 ft Above Fog</span>
+            </div>
+            <div class="metric-tiles-grid" id="inversion-metrics-grid">
+              <div class="metric-tile">
+                <span class="metric-tile-label">Fog Base → Top</span>
+                <strong class="metric-tile-val" id="val-fog-band">320 → 1,340 ft</strong>
+              </div>
+              <div class="metric-tile">
+                <span class="metric-tile-label">Thermal Cap (ΔT)</span>
+                <strong class="metric-tile-val" id="val-inv-deltat">+10.1°F (925hPa)</strong>
+              </div>
+              <div class="metric-tile">
+                <span class="metric-tile-label">Cloud-Sea Score</span>
+                <strong class="metric-tile-val" id="val-cloud-sea-score">94 / 100</strong>
+              </div>
+              <div class="metric-tile">
+                <span class="metric-tile-label">Under-Deck Sunset</span>
+                <strong class="metric-tile-val" id="val-under-deck-score">78 / 100</strong>
+              </div>
+            </div>
+          </div>
+
+          <!-- AI Prediction Engines (Google GraphCast, NOAA 3km HRRR, ECMWF, Nowcast) & 3D Atmospheric Feel Synthesizer -->
+          <div class="raypath-diagram-box ai-ensemble-box" id="ai-ensemble-box">
+            <div class="raypath-diagram-header">
+              <span id="ai-ensemble-header">🧠 3D AI Weather Engine &amp; Synthesizer</span>
+              <span id="ai-ensemble-agreement-pill" class="raypath-trans-pill ai-agreement-pill">92% Agreement</span>
+            </div>
+            <div class="corridor-phase-tabs ai-engine-tabs" id="ai-engine-selector-bar" role="group" aria-label="Select 3D Weather Prediction Engine">
+              <button type="button" class="corridor-tab is-active" data-weather-engine="ensemble" title="Hybrid Synthesis: Google DeepMind GraphCast + NOAA 3km HRRR + 15m DEM Downscaling">
+                ⚡ Hybrid
+              </button>
+              <button type="button" class="corridor-tab" data-weather-engine="graphcast" title="Google DeepMind GraphCast: 37-Level Global GNN + Synthesized 3D Cellular Billows">
+                🧠 GraphCast
+              </button>
+              <button type="button" class="corridor-tab" data-weather-engine="hrrr" title="NOAA 3km HRRR: Radar-Assimilated Mesoscale 3D Cloud Deck">
+                🛰️ HRRR
+              </button>
+              <button type="button" class="corridor-tab" data-weather-engine="ecmwf" title="ECMWF 0.25° IFS/AIFS: Upper-Level Cirrus &amp; Synoptic column">
+                🌍 ECMWF
+              </button>
+              <button type="button" class="corridor-tab" data-weather-engine="nowcast" title="GOES-18 West (500m) + Live Wind-Vector Cloud-Break Advection Nowcast">
+                📡 Nowcast
+              </button>
+            </div>
+            <div class="ai-feel-banner" id="ai-feel-banner">
+              <strong id="ai-feel-archetype" class="ai-feel-archetype">Dramatic Overcast Cathedral (Dark Cloud Base + Crepuscular God-Rays)</strong>
+              <span id="ai-feel-note" class="ai-feel-note">Synthesizing a dense 3D stratocumulus ceiling with silver-lined cellular fenestrations drifting on the wind.</span>
+            </div>
+            <div class="raypath-stations-grid ai-models-grid" id="ai-models-comparison-grid"></div>
+          </div>
+
+          <!-- Positional 3D Cloud, Fog Damming & Radar Transect (West -> East) -->
+          <div class="raypath-diagram-box" id="spatial-transect-box">
+            <div class="raypath-diagram-header">
+              <span id="spatial-transect-label">3D Positional Cloud &amp; Fog Transect (W → E)</span>
+              <span id="spatial-transect-pill" class="raypath-trans-pill">8×8 Voxel Field</span>
+            </div>
+            <div class="raypath-stations-grid spatial-transect-grid" id="spatial-transect-grid"></div>
+          </div>
+
+          <!-- Live & Historical Weather Backtesting Quick-Load Bar -->
+          <div class="corridor-phase-tabs corridor-preset-grid" role="group" aria-label="Live and Historical Weather Presets">
+            <button type="button" class="corridor-tab" id="btn-yesterday-pedro" title="Yesterday's Pedro Point Sunset: 93% Open 18km Offshore Slot + 43% Mid Altocumulus &amp; 30–37% Cirrus Back-Edge Clearing">
+              🌅 Pedro Pt Slot
+            </button>
+            <button type="button" class="corridor-tab" id="btn-live-today-sf" title="Today's Live 3km HRRR Sunset Forecast for SF Coast / Montara / Pedro Point">
+              🔥 Today SF 3km
+            </button>
+            <button type="button" class="corridor-tab" id="btn-hist-fog-sea" title="Aug 15, 2025: +10.1°F Marine Inversion Cap with 1,260 ft Fog Sea below Montara Peak">
+              ☁️ Fog-Sea '25
+            </button>
+            <button type="button" class="corridor-tab" id="btn-hist-clear-slot" title="Oct 22, 2025: Broken Coastal Clouds + Clear 18-75 km Offshore Sunset Slot">
+              ✨ Cirrus '25
+            </button>
+          </div>
+
+          <div class="metric-tiles-grid">
+            <div class="metric-tile">
+              <span class="metric-tile-label">LCL Cloud Base</span>
+              <strong class="metric-tile-val" id="val-lcl-base">6,920 ft ASL</strong>
+            </div>
+            <div class="metric-tile">
+              <span class="metric-tile-label">Visibility</span>
+              <strong class="metric-tile-val" id="val-visibility">26.0 mi</strong>
+            </div>
+            <div class="metric-tile">
+              <span class="metric-tile-label">Fog / Inv Chance</span>
+              <strong class="metric-tile-val" id="val-inversion">28%</strong>
+            </div>
+            <div class="metric-tile">
+              <span class="metric-tile-label">Temp &amp; Wind</span>
+              <strong class="metric-tile-val" id="val-temp-wind">54°F • 6 mph</strong>
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <!-- On-Demand Disclosure: Astrophotography, Upper-Air Seeing (250hPa), CAMS Haze & 3D Lunar Horizon -->
+      <details class="card weather-card astro-card" id="astro-disclosure">
+        <summary class="weather-summary">
+          <div class="weather-summary-main">
+            <span class="eyebrow astro-eyebrow" id="astro-eyebrow">ASTROPHOTOGRAPHY &amp; UPPER ATMOSPHERE</span>
+            <span class="weather-verdict" id="astro-verdict">Prime Dark-Sky Galactic Core + Calm Seeing</span>
+            <span class="weather-summary-sub" id="astro-summary-sub">
+              250hPa Jet Stream • AOD Haze • 3D Terrain Moonset
+            </span>
+          </div>
+          <div class="weather-summary-right">
+            <span class="alpenglow-score-badge astro-score-badge" id="astro-score-badge">86 / 100</span>
+            <span class="disclosure-chevron" aria-hidden="true">▾</span>
+          </div>
+        </summary>
+
+        <div class="weather-expanded-body">
+          <p class="weather-rec" id="astro-recommendation">
+            Computing 250hPa jet stream seeing, CAMS aerosol optical depth (550nm), and 3D DEM-occluded lunar &amp; Galactic Core windows…
+          </p>
+
+          <!-- SVG Vertical Atmospheric Column Cross-Section -->
+          <div class="raypath-diagram-box astro-diagram-box">
+            <div class="raypath-diagram-header">
+              <span id="astro-column-label">Vertical Column: 34k ft Jet Stream → 9k ft Crest Haze → 4k ft Valley</span>
+              <span id="astro-seeing-pill" class="raypath-trans-pill astro-trans-pill">Seeing: 86/100</span>
+            </div>
+            <svg id="astro-column-svg" class="raypath-svg astro-column-svg" viewBox="0 0 360 104" preserveAspectRatio="none" aria-label="Vertical Atmospheric Column and 3D Lunar Horizon Cross-Section"></svg>
+          </div>
+
+          <!-- 3-Column Astro Physics Telemetry Grid (Seeing | Haze/AOD | 3D Moon/Core) -->
+          <div class="raypath-stations-grid" id="astro-pillars-grid"></div>
+
+          <div class="metric-tiles-grid astro-metrics-footer">
+            <div class="metric-tile">
+              <span class="metric-tile-label">Moon Phase</span>
+              <strong class="metric-tile-val" id="val-moon-phase">Waxing Crescent (24%)</strong>
+            </div>
+            <div class="metric-tile">
+              <span class="metric-tile-label">Terrain Moonset</span>
+              <strong class="metric-tile-val" id="val-terrain-moonset">21:42 (-36m vs flat)</strong>
+            </div>
+            <div class="metric-tile">
+              <span class="metric-tile-label">Dark-Sky Window</span>
+              <strong class="metric-tile-val" id="val-dark-window">21:42 – 05:15</strong>
+            </div>
+            <div class="metric-tile">
+              <span class="metric-tile-label">Galactic Core</span>
+              <strong class="metric-tile-val" id="val-galactic-core">Peak 20:30 (+14.2°)</strong>
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <!-- Top 3 Viewpoints Accordion (Click a viewpoint to highlight & inspect) -->
+      <section class="vp-section" aria-label="Top 3 Viewpoints">
+        <div class="section-header-row">
+          <h3 class="section-title">Top Viewpoints</h3>
+          <span class="section-hint">Click card to focus &amp; expand</span>
+        </div>
+        <div id="vp-cards-container" class="vp-cards-list"></div>
+      </section>
+    </aside>
+
+    <!-- 3D WebGL Topographic Viewport + Intrinsic 3-Row Studio HUD Grid (Zero Collisions) -->
+    <section class="viewport-stage" id="viewport-stage" aria-label="Interactive 3D Topographic Sun-Ray Map">
+      <div id="canvas-container" class="canvas-container"></div>
+
+      <div class="viewport-hud-shell">
+        <!-- Row 1: Single Consolidated Floating Top HUD Row -->
+        <div class="viewport-toolbar" role="toolbar" aria-label="3D Viewport Controls and Telemetry">
+          <div class="hud-cluster-left">
+            <button
+              type="button"
+              class="toolbar-pill-btn btn-exit-vf"
+              id="btn-orbit-mode"
+              data-mode="orbit"
+              hidden
+            >
+              ← 3D Orbit <kbd class="hud-kbd">Esc</kbd>
+            </button>
+
+            <div class="mode-group" id="hud-click-mode-group" aria-label="Terrain Click Action">
+              <button
+                type="button"
+                class="mode-btn is-active-emerald"
+                id="btn-click-tripod"
+                data-click-mode="tripod"
+                title="Click any point on 3D terrain to inspect sightline and elevation profile"
+              >
+                📍 Inspect
+              </button>
+              <button
+                type="button"
+                class="mode-btn"
+                id="btn-click-target"
+                data-click-mode="target"
+                title="Click any summit or cliff to make it the new target subject"
+              >
+                🎯 Target
+              </button>
+            </div>
+
+            <button
+              type="button"
+              class="toolbar-pill-btn"
+              id="btn-open-layers"
+              popovertarget="map-layers-popover"
+            >
+              🗺️ Layers
+            </button>
+
+            <button
+              type="button"
+              class="toolbar-pill-btn"
+              id="btn-open-scenarios"
+              popovertarget="scenarios-popover"
+            >
+              ✨ Scenarios
+            </button>
+          </div>
+
+          <div class="hud-cluster-right">
+            <button
+              type="button"
+              class="toolbar-pill-btn hud-weather-pill"
+              id="viewport-weather-pill"
+              title="Inspect 75 km Solar Ray Corridor &amp; Multi-Model Weather Telemetry"
+            >
+              🌤️ Loading Sounding…
+            </button>
+
+            <button
+              type="button"
+              class="toolbar-pill-btn gpu-telemetry-pill"
+              id="viewport-gpu-pill"
+              title="Inspect Rust WASM 3D Fluid Solver &amp; WebGL2 Volumetric Controls"
+            >
+              ⚡ 60 FPS • WASM
+            </button>
+          </div>
+        </div>
+
+        <!-- Row 2: Elastic Middle Framing Stage (Viewfinder Reticle, Sightline Inspector, Coords) -->
+        <div class="viewport-hud-middle">
+          <!-- First-Person Camera Viewfinder Reticle Overlay -->
+          <div class="viewfinder-overlay" id="viewfinder-overlay" hidden>
+            <div class="vf-corner vf-tl"></div>
+            <div class="vf-corner vf-tr"></div>
+            <div class="vf-corner vf-bl"></div>
+            <div class="vf-corner vf-br"></div>
+            <div class="vf-grid">
+              <div class="vf-line vf-v1"></div>
+              <div class="vf-line vf-v2"></div>
+              <div class="vf-line vf-h1"></div>
+              <div class="vf-line vf-h2"></div>
+              <div class="vf-center-cross"></div>
+            </div>
+            <div class="vf-bottom-hud" id="vf-hud-readout">
+              VP1 VIEWFINDER • 24–50mm • Bearing 117.9° (ESE) • 1.66 mi to Half Dome
+            </div>
+          </div>
+
+          <!-- Contextual Clicked Tripod & Sightline Cross-Section Inspector -->
+          <aside class="tripod-inspector-card" id="tripod-inspector-card" hidden aria-label="Custom Tripod Line-of-Sight Inspector">
+            <div class="inspector-header">
+              <div class="inspector-title-wrap">
+                <span class="inspector-eyebrow" id="inspector-eyebrow">CUSTOM POINT SIGHTLINE</span>
+                <h4 class="inspector-title" id="inspector-title">Clicked Vantage Point</h4>
+              </div>
+              <div class="inspector-header-actions">
+                <button type="button" class="btn-ghost btn-sm inspector-vf-btn" id="btn-enter-custom-vf">
+                  📷 Viewfinder
+                </button>
+                <button type="button" class="btn-ghost btn-sm" id="btn-close-inspector" aria-label="Close Sightline Inspector">
+                  ✕
+                </button>
+              </div>
+            </div>
+
+            <div class="inspector-status-row" id="inspector-status-row"></div>
+
+            <!-- 64-Sample Sightline vs. Terrain Elevation Cross-Section SVG Chart -->
+            <div class="cross-section-box">
+              <div class="cross-section-label-row">
+                <span>Sightline Profile (Tripod → Target)</span>
+                <span id="cross-section-dist-label">1.66 mi</span>
+              </div>
+              <svg id="cross-section-svg" class="cross-section-svg" viewBox="0 0 420 105" preserveAspectRatio="none" aria-label="Sightline elevation profile"></svg>
+            </div>
+
+            <div class="metric-tiles-grid inspector-meta-grid" id="inspector-meta-grid"></div>
+          </aside>
+
+          <!-- Loading Banner Overlay -->
+          <div class="viewport-loading" id="viewport-loading">
+            <div class="spinner"></div>
+            <span id="loading-text">Loading 1m USGS 3DEP LiDAR &amp; Ray-Casting Solar Vectors…</span>
+          </div>
+
+          <!-- Subtle Terrain Hover Coordinate Readout -->
+          <div class="cursor-coords-pill" id="cursor-coords-bar">
+            Click any terrain point or 3D pin to inspect sightline
+          </div>
+        </div>
+
+        <!-- Row 3: Studio 2-Tier Bottom Solar Ephemeris & Timeline Transport Dock -->
+        <div class="scrubber-dock">
+          <div class="scrubber-header-row">
+            <div class="scrubber-time-cluster">
+              <label class="slider-label" for="time-scrubber">Solar</label>
+              <output class="slider-output" id="time-scrubber-output" for="time-scrubber">
+                17:18 • Sunset Golden Hour
+              </output>
+              <!-- Legacy hooks kept for compatibility -->
+              <span id="hud-local-time" hidden>17:18 Local</span>
+              <span id="hud-phase-badge" hidden>Sunset Golden Hour</span>
+            </div>
+
+            <div class="scrubber-telemetry-pills" aria-label="Live Solar Angles">
+              <span class="telemetry-chip">Az <strong id="hud-sun-az">259.1° W</strong></span>
+              <span class="telemetry-chip">El <strong id="hud-sun-el">+0.1°</strong></span>
+              <span class="telemetry-chip telemetry-chip-lit"><strong id="hud-cliff-lit">96% Alpenglow</strong></span>
+            </div>
+
+            <div class="preset-buttons">
+              <button type="button" class="btn-preset" id="btn-jump-sunrise">
+                🌅 Sunrise
+              </button>
+              <button type="button" class="btn-preset is-active" id="btn-jump-sunset">
+                🌇 Sunset
+              </button>
+              <button type="button" class="btn-preset" id="btn-jump-night">
+                🌌 Night
+              </button>
+              <button type="button" class="btn-preset btn-preset-play" id="btn-play-sun">
+                ▶ Animate
+              </button>
+            </div>
+          </div>
+
+          <div class="slider-field scrubber-slider-field">
+            <input
+              class="slider-input"
+              id="time-scrubber"
+              type="range"
+              min="330"
+              max="1410"
+              value="1038"
+              step="1"
+              aria-label="Solar Time Timeline Scrubber"
+            />
+            <div class="scrubber-ticks" aria-hidden="true">
+              <span>05:30</span>
+              <span>09:00</span>
+              <span>12:00</span>
+              <span>15:00</span>
+              <span>18:00</span>
+              <span>21:00</span>
+              <span>23:30</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="/app.js?v=20261114h"></script>
+</body>
+</html>

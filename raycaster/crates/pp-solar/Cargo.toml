@@ -1,0 +1,8 @@
+[package]
+name = "pp-solar"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chrono.workspace = true
+serde.workspace = true
