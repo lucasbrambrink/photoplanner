@@ -11,6 +11,32 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+#[cfg(target_os = "macos")]
+mod gpu_metal;
+
+/// Returns the active hardware GPU compute backend description if available and enabled.
+pub fn gpu_backend_info() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        return gpu_metal::gpu_device_name();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HorizonProfileRequest {
+    pub origin_lat: f64,
+    pub origin_lon: f64,
+    pub eye_offset_m: f64,
+    pub az_start_deg: f64,
+    pub az_end_deg: f64,
+    pub az_step_deg: f64,
+    pub max_distance_m: f64,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct HorizonSample {
     pub azimuth_deg: f64,
@@ -175,8 +201,8 @@ pub fn cast_horizon_ray(
     }
 }
 
-/// Computes a full or windowed Horizon Profile `H(φ)` in parallel across CPU cores using `rayon`.
-pub fn compute_horizon_profile(
+/// Computes a full or windowed Horizon Profile `H(φ)` on CPU using `rayon`.
+pub fn compute_horizon_profile_cpu(
     terrain: &HybridTerrain,
     origin_lat: f64,
     origin_lon: f64,
@@ -208,6 +234,123 @@ pub fn compute_horizon_profile(
         azimuth_step_deg: az_step_deg,
         samples,
     }
+}
+
+/// Computes a full or windowed Horizon Profile `H(φ)` on Metal GPU when available (with automatic `rayon` CPU fallback).
+pub fn compute_horizon_profile(
+    terrain: &HybridTerrain,
+    origin_lat: f64,
+    origin_lon: f64,
+    eye_offset_m: f64,
+    az_start_deg: f64,
+    az_end_deg: f64,
+    az_step_deg: f64,
+    max_distance_m: f64,
+) -> HorizonProfile {
+    #[cfg(target_os = "macos")]
+    {
+        let ground_z = terrain.elevation_m(origin_lat, origin_lon);
+        let z0 = ground_z + eye_offset_m;
+        let num_steps = (((az_end_deg - az_start_deg) / az_step_deg).round() as usize) + 1;
+        let rays: Vec<(f64, f64, f64, f64, f64)> = (0..num_steps)
+            .map(|i| az_start_deg + (i as f64) * az_step_deg)
+            .filter(|&az| az <= az_end_deg + 1e-6)
+            .map(|az| (origin_lat, origin_lon, z0, az, max_distance_m))
+            .collect();
+
+        if rays.len() >= 16 {
+            if let Some(samples) = gpu_metal::dispatch_horizon_rays_gpu(terrain, &rays) {
+                return HorizonProfile {
+                    origin_lat,
+                    origin_lon,
+                    origin_elevation_m: ground_z,
+                    eye_offset_m,
+                    azimuth_step_deg: az_step_deg,
+                    samples,
+                };
+            }
+        }
+    }
+
+    compute_horizon_profile_cpu(
+        terrain,
+        origin_lat,
+        origin_lon,
+        eye_offset_m,
+        az_start_deg,
+        az_end_deg,
+        az_step_deg,
+        max_distance_m,
+    )
+}
+
+/// Computes multiple windowed or 360° Horizon Profiles in a single batched GPU compute dispatch
+/// (falling back to parallel `rayon` CPU execution if no GPU is available).
+pub fn compute_horizon_profiles_batch(
+    terrain: &HybridTerrain,
+    requests: &[HorizonProfileRequest],
+) -> Vec<HorizonProfile> {
+    if requests.is_empty() {
+        return Vec::new();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut ground_zs = Vec::with_capacity(requests.len());
+        let mut ranges = Vec::with_capacity(requests.len());
+        let mut all_rays = Vec::new();
+
+        for req in requests {
+            let gz = terrain.elevation_m(req.origin_lat, req.origin_lon);
+            let z0 = gz + req.eye_offset_m;
+            ground_zs.push(gz);
+
+            let start_idx = all_rays.len();
+            let num_steps =
+                (((req.az_end_deg - req.az_start_deg) / req.az_step_deg).round() as usize) + 1;
+            for i in 0..num_steps {
+                let az = req.az_start_deg + (i as f64) * req.az_step_deg;
+                if az <= req.az_end_deg + 1e-6 {
+                    all_rays.push((req.origin_lat, req.origin_lon, z0, az, req.max_distance_m));
+                }
+            }
+            ranges.push((start_idx, all_rays.len()));
+        }
+
+        if let Some(all_samples) = gpu_metal::dispatch_horizon_rays_gpu(terrain, &all_rays) {
+            return requests
+                .iter()
+                .enumerate()
+                .map(|(idx, req)| {
+                    let (s, e) = ranges[idx];
+                    HorizonProfile {
+                        origin_lat: req.origin_lat,
+                        origin_lon: req.origin_lon,
+                        origin_elevation_m: ground_zs[idx],
+                        eye_offset_m: req.eye_offset_m,
+                        azimuth_step_deg: req.az_step_deg,
+                        samples: all_samples[s..e].to_vec(),
+                    }
+                })
+                .collect();
+        }
+    }
+
+    requests
+        .par_iter()
+        .map(|req| {
+            compute_horizon_profile_cpu(
+                terrain,
+                req.origin_lat,
+                req.origin_lon,
+                req.eye_offset_m,
+                req.az_start_deg,
+                req.az_end_deg,
+                req.az_step_deg,
+                req.max_distance_m,
+            )
+        })
+        .collect()
 }
 
 /// Detects topographic Light Notches (narrow V-gaps, couloirs, saddles, and rock windows)
@@ -391,8 +534,28 @@ pub struct ShadowLightMapStats {
 }
 
 /// Renders a 2D directional ray-cast shadow & light-shaft map across the 1m grid for a specific `SolarPosition`.
-/// Returns statistics and optionally writes a visual PNG map highlighting terrain shadows and golden-hour light shafts.
+/// Executes on Apple Silicon Metal GPU when available (both shadow ray-casting, spotlight detection, and RGB8 PNG generation),
+/// falling back automatically to multi-core `rayon` CPU execution.
 pub fn compute_shadow_and_light_map(
+    terrain: &HybridTerrain,
+    grid: &MaxMipmapGrid1m,
+    sun: SolarPosition,
+    step_m: usize,
+    output_png: Option<&Path>,
+) -> Result<ShadowLightMapStats> {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(gpu_res) =
+            gpu_metal::dispatch_shadow_and_light_map_gpu(terrain, grid, sun, step_m, output_png)
+        {
+            return gpu_res;
+        }
+    }
+    compute_shadow_and_light_map_cpu(terrain, grid, sun, step_m, output_png)
+}
+
+/// CPU (`rayon`) reference implementation of `compute_shadow_and_light_map`.
+pub fn compute_shadow_and_light_map_cpu(
     terrain: &HybridTerrain,
     grid: &MaxMipmapGrid1m,
     sun: SolarPosition,
@@ -733,27 +896,69 @@ pub fn find_subject_golden_hour_windows(
         ("Sunset Golden Hour / Alpenglow", 15 * 60 + 30, 20 * 60 + 15),
         ("Sunrise Golden Hour", 5 * 60, 9 * 60 + 30),
     ] {
-        let mut lit_samples = Vec::new();
-
+        // Pre-filter candidate golden-hour timestamps (-0.3°..=14.0°) so we can evaluate all
+        // (1 summit + 8 valley) horizon rays in a single batched Metal GPU compute pass!
+        let mut candidate_times = Vec::new();
         for local_min in (start_local_min..=end_local_min).step_by(3) {
             let dt_utc =
                 base_utc + chrono::Duration::minutes(local_min - approx_tz_hours * 60);
             let sun = pp_solar::solar_position(target.summit_lat, target.summit_lon, dt_utc);
-
-            // Golden hour / low-angle light filter: apparent sun elevation between -0.3° and +14.0°
-            if !(-0.3..=14.0).contains(&sun.apparent_elevation_deg) {
-                continue;
+            if (-0.3..=14.0).contains(&sun.apparent_elevation_deg) {
+                candidate_times.push((local_min, dt_utc, sun));
             }
+        }
 
-            // Cast ray from Landmark X's upper cliff face/summit toward the sun
-            let summit_horizon = cast_horizon_ray(
-                terrain,
+        if candidate_times.is_empty() {
+            continue;
+        }
+
+        let rays_per_step = 1 + valley_points.len();
+        let mut batched_rays = Vec::with_capacity(candidate_times.len() * rays_per_step);
+        for &(_, _, ref sun) in &candidate_times {
+            batched_rays.push((
                 target.summit_lat,
                 target.summit_lon,
                 target.summit_elevation_m + 1.0,
                 sun.azimuth_deg,
                 40_000.0,
-            );
+            ));
+            for &(vlat, vlon, vz) in &valley_points {
+                batched_rays.push((vlat, vlon, vz + 1.0, sun.azimuth_deg, 25_000.0));
+            }
+        }
+
+        let ray_results: Vec<HorizonSample> = {
+            #[cfg(target_os = "macos")]
+            {
+                if let Some(gpu_samples) =
+                    gpu_metal::dispatch_horizon_rays_gpu(terrain, &batched_rays)
+                {
+                    gpu_samples
+                } else {
+                    batched_rays
+                        .par_iter()
+                        .map(|&(olat, olon, z0, az, max_d)| {
+                            cast_horizon_ray(terrain, olat, olon, z0, az, max_d)
+                        })
+                        .collect()
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                batched_rays
+                    .par_iter()
+                    .map(|&(olat, olon, z0, az, max_d)| {
+                        cast_horizon_ray(terrain, olat, olon, z0, az, max_d)
+                    })
+                    .collect()
+            }
+        };
+
+        let mut lit_samples = Vec::new();
+
+        for (step_idx, &(local_min, dt_utc, sun)) in candidate_times.iter().enumerate() {
+            let base_idx = step_idx * rays_per_step;
+            let summit_horizon = ray_results[base_idx];
             let clearance_deg =
                 sun.apparent_elevation_deg - summit_horizon.horizon_elevation_deg;
             if clearance_deg < -0.15 {
@@ -761,10 +966,9 @@ pub fn find_subject_golden_hour_windows(
                 continue;
             }
 
-            // Compute how many valley floor points around the landmark are in shadow at this exact minute
             let mut shadowed_valley = 0;
-            for &(vlat, vlon, vz) in &valley_points {
-                let vh = cast_horizon_ray(terrain, vlat, vlon, vz + 1.0, sun.azimuth_deg, 25_000.0);
+            for v_idx in 0..valley_points.len() {
+                let vh = ray_results[base_idx + 1 + v_idx];
                 if sun.apparent_elevation_deg < vh.horizon_elevation_deg {
                     shadowed_valley += 1;
                 }
@@ -953,6 +1157,26 @@ pub fn cast_camera_line_of_sight(
         }
     }
 
+    finalize_line_of_sight_result(
+        total_dist_m,
+        bearing_deg,
+        dir_east,
+        dir_north,
+        visible_relief_m,
+        summit_slope,
+        target,
+    )
+}
+
+fn finalize_line_of_sight_result(
+    total_dist_m: f64,
+    bearing_deg: f64,
+    dir_east: f64,
+    dir_north: f64,
+    visible_relief_m: f64,
+    summit_slope: f64,
+    target: &LandmarkTarget3D,
+) -> LineOfSightResult {
     let visible_fraction =
         (visible_relief_m / target.vertical_relief_m.max(1.0)).clamp(0.0, 1.0);
 
@@ -960,7 +1184,6 @@ pub fn cast_camera_line_of_sight(
     let is_visible = visible_fraction >= 0.25 && visible_relief_m >= 80.0;
 
     // Evaluate how well this viewpoint looks at the landmark's sheer primary cliff face
-    // Vector from landmark to viewpoint: `[-dir_east, -dir_north, ...]`
     let cam_dot_face = (-dir_east * target.primary_face_normal[0]
         + -dir_north * target.primary_face_normal[1])
         .clamp(-1.0, 1.0);
@@ -981,7 +1204,6 @@ pub fn cast_camera_line_of_sight(
         0.0
     };
 
-    // Recommend 35mm full-frame focal length so the landmark fills ~35-50% of a horizontal/vertical frame
     let focal_str = if total_dist_m < 1800.0 {
         "16–24mm (Ultra-Wide)".to_string()
     } else if total_dist_m < 3500.0 {
@@ -1005,6 +1227,86 @@ pub fn cast_camera_line_of_sight(
         recommended_focal_length_mm: focal_str,
         composition_score: (composition_score * 10.0).round() / 10.0,
     }
+}
+
+/// Evaluates 3D Camera Line-of-Sight across a batch of candidate viewpoints `[(vp_lat, vp_lon, vp_z_m)]`
+/// in a single Metal GPU compute dispatch (falling back automatically to multi-core `rayon` CPU).
+pub fn cast_camera_line_of_sight_batch(
+    terrain: &HybridTerrain,
+    viewpoints: &[(f64, f64, f64)],
+    target: &LandmarkTarget3D,
+) -> Vec<LineOfSightResult> {
+    if viewpoints.is_empty() {
+        return Vec::new();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let m_per_lat = METERS_PER_DEG_LAT;
+        let mut valid_indices = Vec::with_capacity(viewpoints.len());
+        let mut valid_vps = Vec::with_capacity(viewpoints.len());
+        let mut geom_meta = Vec::with_capacity(viewpoints.len());
+
+        let mut results: Vec<Option<LineOfSightResult>> = vec![None; viewpoints.len()];
+
+        for (idx, &(vp_lat, vp_lon, vp_z_m)) in viewpoints.iter().enumerate() {
+            let m_per_lon = meters_per_deg_lon(vp_lat);
+            let dy_m = (target.summit_lat - vp_lat) * m_per_lat;
+            let dx_m = (target.summit_lon - vp_lon) * m_per_lon;
+            let total_dist_m = (dx_m * dx_m + dy_m * dy_m).sqrt();
+
+            if !(450.0..=18_000.0).contains(&total_dist_m) {
+                results[idx] = Some(LineOfSightResult {
+                    is_visible: false,
+                    distance_to_landmark_m: total_dist_m,
+                    distance_to_landmark_miles: total_dist_m / 1609.344,
+                    bearing_to_landmark_deg: 0.0,
+                    compass_direction: "N".to_string(),
+                    elevation_angle_to_summit_deg: 0.0,
+                    visible_vertical_relief_m: 0.0,
+                    visible_vertical_relief_ft: 0.0,
+                    visible_relief_fraction: 0.0,
+                    recommended_focal_length_mm: "N/A".to_string(),
+                    composition_score: 0.0,
+                });
+            } else {
+                let bearing_deg = dx_m.atan2(dy_m).to_degrees().rem_euclid(360.0);
+                let dir_east = dx_m / total_dist_m;
+                let dir_north = dy_m / total_dist_m;
+                valid_indices.push(idx);
+                valid_vps.push((vp_lat, vp_lon, vp_z_m));
+                geom_meta.push((total_dist_m, bearing_deg, dir_east, dir_north));
+            }
+        }
+
+        if valid_vps.is_empty() {
+            return results.into_iter().map(|r| r.unwrap()).collect();
+        }
+
+        if let Some(gpu_outs) =
+            gpu_metal::dispatch_camera_los_batch_gpu(terrain, &valid_vps, target)
+        {
+            for (k, out) in gpu_outs.into_iter().enumerate() {
+                let orig_idx = valid_indices[k];
+                let (total_dist_m, bearing_deg, dir_east, dir_north) = geom_meta[k];
+                results[orig_idx] = Some(finalize_line_of_sight_result(
+                    total_dist_m,
+                    bearing_deg,
+                    dir_east,
+                    dir_north,
+                    out.visible_relief_m as f64,
+                    out.summit_slope as f64,
+                    target,
+                ));
+            }
+            return results.into_iter().map(|r| r.unwrap()).collect();
+        }
+    }
+
+    viewpoints
+        .par_iter()
+        .map(|&(lat, lon, z)| cast_camera_line_of_sight(terrain, lat, lon, z, target))
+        .collect()
 }
 
 /// Represents a predicted night window where low-angle moonlight illuminates Landmark X's cliff face
@@ -1088,19 +1390,32 @@ pub fn compute_subject_astro_night_summary(
     let obs_lat = target.summit_lat + (1400.0 * aspect_rad.cos()) / m_per_lat;
     let obs_lon = target.summit_lon + (1400.0 * aspect_rad.sin()) / m_per_lon;
 
-    // Precompute 360° horizon profiles at 1.0° resolution (parallel across cores via rayon)
-    let obs_profile =
-        compute_horizon_profile(terrain, obs_lat, obs_lon, 1.7, 0.0, 359.0, 1.0, 35_000.0);
-    let summit_profile = compute_horizon_profile(
+    // Precompute both 360° horizon profiles in a single batched Metal GPU compute pass (with Rayon CPU fallback)
+    let astro_profiles = compute_horizon_profiles_batch(
         terrain,
-        target.summit_lat,
-        target.summit_lon,
-        1.0,
-        0.0,
-        359.0,
-        1.0,
-        35_000.0,
+        &[
+            HorizonProfileRequest {
+                origin_lat: obs_lat,
+                origin_lon: obs_lon,
+                eye_offset_m: 1.7,
+                az_start_deg: 0.0,
+                az_end_deg: 359.0,
+                az_step_deg: 1.0,
+                max_distance_m: 35_000.0,
+            },
+            HorizonProfileRequest {
+                origin_lat: target.summit_lat,
+                origin_lon: target.summit_lon,
+                eye_offset_m: 1.0,
+                az_start_deg: 0.0,
+                az_end_deg: 359.0,
+                az_step_deg: 1.0,
+                max_distance_m: 35_000.0,
+            },
+        ],
     );
+    let obs_profile = &astro_profiles[0];
+    let summit_profile = &astro_profiles[1];
 
     let fmt_time = |m: i64| -> String {
         let mm = m.rem_euclid(1440);
@@ -1419,5 +1734,212 @@ pub fn compute_subject_astro_night_summary(
         astro_geometry_verdict: verdict,
         astro_geometry_summary: summary,
         nightly_celestial_track: nightly_track,
+    }
+}
+
+/// CPU (`rayon`) reference implementation for resampling a 2D `grid_size x grid_size` hybrid 1m + SRTM patch.
+pub fn compute_terrain_patch_elevations_cpu(
+    terrain: &HybridTerrain,
+    center_lat: f64,
+    center_lon: f64,
+    span_m: f64,
+    grid_size: usize,
+) -> (f64, f64, Vec<f32>) {
+    let m_per_lat = METERS_PER_DEG_LAT;
+    let m_per_lon = meters_per_deg_lon(center_lat);
+    let half_span = span_m * 0.5;
+    let step_m = span_m / ((grid_size.saturating_sub(1)).max(1) as f64);
+
+    let rows: Vec<(f64, f64, Vec<f32>)> = (0..grid_size)
+        .into_par_iter()
+        .map(|iy| {
+            let dy_m = -half_span + (iy as f64) * step_m;
+            let sample_lat = center_lat + dy_m / m_per_lat;
+            let mut row_vals = Vec::with_capacity(grid_size);
+            let mut r_min = f64::INFINITY;
+            let mut r_max = f64::NEG_INFINITY;
+            for ix in 0..grid_size {
+                let dx_m = -half_span + (ix as f64) * step_m;
+                let sample_lon = center_lon + dx_m / m_per_lon;
+                let z = terrain.elevation_m(sample_lat, sample_lon);
+                let z_round = (z * 100.0).round() as f32 / 100.0;
+                r_min = r_min.min(z_round as f64);
+                r_max = r_max.max(z_round as f64);
+                row_vals.push(z_round);
+            }
+            (r_min, r_max, row_vals)
+        })
+        .collect();
+
+    let mut elevations = Vec::with_capacity(grid_size * grid_size);
+    let mut min_z = f64::INFINITY;
+    let mut max_z = f64::NEG_INFINITY;
+    for (r_min, r_max, mut r_vals) in rows {
+        min_z = min_z.min(r_min);
+        max_z = max_z.max(r_max);
+        elevations.append(&mut r_vals);
+    }
+    (min_z, max_z, elevations)
+}
+
+/// Resamples a 2D `grid_size x grid_size` hybrid 1m + SRTM `TerrainPatch` on Metal GPU
+/// (falling back automatically to multi-core `rayon` CPU execution).
+pub fn compute_terrain_patch_elevations(
+    terrain: &HybridTerrain,
+    center_lat: f64,
+    center_lon: f64,
+    span_m: f64,
+    grid_size: usize,
+) -> (f64, f64, Vec<f32>) {
+    #[cfg(target_os = "macos")]
+    {
+        if grid_size >= 16 {
+            if let Some(gpu_res) = gpu_metal::dispatch_terrain_patch_gpu(
+                terrain, center_lat, center_lon, span_m, grid_size,
+            ) {
+                return gpu_res;
+            }
+        }
+    }
+    compute_terrain_patch_elevations_cpu(terrain, center_lat, center_lon, span_m, grid_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pp_terrain::{SrtmCache, SrtmTile};
+
+    fn build_synthetic_hybrid_terrain() -> (HybridTerrain, f64, f64) {
+        let center_lat = 37.7455;
+        let center_lon = -119.5332;
+        let samples = 120usize;
+        let side = samples + 1;
+        let mut srtm_data = vec![1200.0_f32; side * side];
+        for r in 0..side {
+            let lat = 38.0 - (r as f64) / (samples as f64);
+            for c in 0..side {
+                let lon = -120.0 + (c as f64) / (samples as f64);
+                let dy = (lat - center_lat) * METERS_PER_DEG_LAT;
+                let dx = (lon - center_lon) * meters_per_deg_lon(center_lat);
+                let dist = (dx * dx + dy * dy).sqrt();
+                let dome = 1400.0 * (-dist * dist / (2.0 * 900.0 * 900.0)).exp();
+                let ridge = 450.0 * (-(dy - 2200.0).powi(2) / (2.0 * 400.0 * 400.0)).exp();
+                srtm_data[r * side + c] = (1150.0 + dome + ridge) as f32;
+            }
+        }
+
+        let mut srtm = SrtmCache::new(Vec::new());
+        srtm.tiles.insert(
+            (37, -120),
+            SrtmTile {
+                tile_name: "N37W120".to_string(),
+                lat_floor: 37,
+                lon_floor: -120,
+                samples,
+                data: srtm_data,
+            },
+        );
+
+        let near = MaxMipmapGrid1m::build_1m_from_srtm(&srtm, center_lat, center_lon, 512, 512, true);
+        (HybridTerrain::new(Some(near), srtm), center_lat, center_lon)
+    }
+
+    #[test]
+    fn test_metal_gpu_vs_cpu_horizon_profile_parity() {
+        let (terrain, lat, lon) = build_synthetic_hybrid_terrain();
+        #[cfg(target_os = "macos")]
+        {
+            if std::env::var_os("PP_DISABLE_GPU").is_none() {
+                assert!(
+                    gpu_backend_info().is_some(),
+                    "Expected Metal GPU backend to initialize on macOS"
+                );
+            }
+        }
+
+        let obs_lat = lat - 0.0012;
+        let obs_lon = lon - 0.0015;
+        let gpu_prof = compute_horizon_profile(&terrain, obs_lat, obs_lon, 1.65, 0.0, 358.0, 2.0, 18_000.0);
+        let cpu_prof = compute_horizon_profile_cpu(&terrain, obs_lat, obs_lon, 1.65, 0.0, 358.0, 2.0, 18_000.0);
+
+        assert_eq!(gpu_prof.samples.len(), cpu_prof.samples.len());
+        let mut max_deg_err = 0.0_f64;
+        for (g, c) in gpu_prof.samples.iter().zip(cpu_prof.samples.iter()) {
+            let err = (g.horizon_elevation_deg - c.horizon_elevation_deg).abs();
+            if err > max_deg_err {
+                max_deg_err = err;
+            }
+        }
+        assert!(
+            max_deg_err < 0.08,
+            "Horizon elevation GPU vs CPU max error too large: {:.4}°",
+            max_deg_err
+        );
+    }
+
+    #[test]
+    fn test_metal_gpu_vs_cpu_shadow_map_parity() {
+        let (terrain, _lat, _lon) = build_synthetic_hybrid_terrain();
+        let grid = terrain.near_1m.as_ref().unwrap();
+        let sun = SolarPosition {
+            azimuth_deg: 252.0,
+            geometric_elevation_deg: 6.1,
+            apparent_elevation_deg: 6.2,
+            is_golden_hour: true,
+        };
+
+        let gpu_stats = compute_shadow_and_light_map(&terrain, grid, sun, 4, None).unwrap();
+        let cpu_stats = compute_shadow_and_light_map_cpu(&terrain, grid, sun, 4, None).unwrap();
+
+        assert_eq!(gpu_stats.width_px, cpu_stats.width_px);
+        assert_eq!(gpu_stats.height_px, cpu_stats.height_px);
+        let frac_diff = (gpu_stats.illuminated_fraction - cpu_stats.illuminated_fraction).abs();
+        assert!(
+            frac_diff <= 0.015,
+            "Shadow map illuminated fraction mismatch: gpu={} vs cpu={}",
+            gpu_stats.illuminated_fraction,
+            cpu_stats.illuminated_fraction
+        );
+    }
+
+    #[test]
+    fn test_metal_gpu_vs_cpu_camera_los_and_terrain_patch_parity() {
+        let (terrain, lat, lon) = build_synthetic_hybrid_terrain();
+        let target = extract_landmark_3d_geometry(&terrain, "Synthetic Dome", lat, lon);
+
+        let vps = vec![
+            (lat - 0.018, lon - 0.022, terrain.elevation_m(lat - 0.018, lon - 0.022)),
+            (lat + 0.015, lon - 0.014, terrain.elevation_m(lat + 0.015, lon - 0.014)),
+            (lat - 0.001, lon - 0.001, terrain.elevation_m(lat - 0.001, lon - 0.001)), // <450m culled
+        ];
+
+        let gpu_los = cast_camera_line_of_sight_batch(&terrain, &vps, &target);
+        for (i, &(vlat, vlon, vz)) in vps.iter().enumerate() {
+            let cpu_los = cast_camera_line_of_sight(&terrain, vlat, vlon, vz, &target);
+            assert_eq!(gpu_los[i].is_visible, cpu_los.is_visible);
+            assert!(
+                (gpu_los[i].composition_score - cpu_los.composition_score).abs() <= 0.5,
+                "LOS composition score mismatch at {}: gpu={} vs cpu={}",
+                i,
+                gpu_los[i].composition_score,
+                cpu_los.composition_score
+            );
+        }
+
+        let (g_min, g_max, g_el) = compute_terrain_patch_elevations(&terrain, lat, lon, 2400.0, 64);
+        let (c_min, c_max, c_el) = compute_terrain_patch_elevations_cpu(&terrain, lat, lon, 2400.0, 64);
+        assert_eq!(g_el.len(), c_el.len());
+        assert!((g_min - c_min).abs() < 0.25);
+        assert!((g_max - c_max).abs() < 0.25);
+        let max_z_diff = g_el
+            .iter()
+            .zip(c_el.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_z_diff <= 0.25,
+            "Terrain patch GPU vs CPU max elevation diff: {}",
+            max_z_diff
+        );
     }
 }

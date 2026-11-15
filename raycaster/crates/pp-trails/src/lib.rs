@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use pp_raycast::{
-    cast_camera_line_of_sight, compute_horizon_profile, compute_subject_astro_night_summary,
-    detect_light_notches, extract_landmark_3d_geometry, find_subject_golden_hour_windows,
+    cast_camera_line_of_sight, cast_camera_line_of_sight_batch, compute_horizon_profile,
+    compute_horizon_profiles_batch, compute_subject_astro_night_summary, detect_light_notches,
+    extract_landmark_3d_geometry, find_subject_golden_hour_windows, HorizonProfileRequest,
     LandmarkTarget3D, LightNotch, LineOfSightResult, SubjectAstroNightSummary,
     SubjectGoldenHourWindow,
 };
@@ -374,24 +375,48 @@ pub fn build_itinerary_for_route(
         candidate_indices.push(half_len - 1);
     }
 
-    // 3. Evaluate horizon profiles and Light Notches at each candidate trail point in parallel
+    // 3. Batch all sunrise & sunset 0.10° horizon windows across all candidate trail points into
+    //    a single Metal GPU compute dispatch (with automatic parallel Rayon CPU fallback)
     let ((sr_min, sr_max), (ss_min, ss_max)) =
         pp_solar::annual_solar_azimuth_windows(route.trailhead_lat);
 
+    let mut batch_reqs = Vec::with_capacity(candidate_indices.len() * 2);
+    for &idx in &candidate_indices {
+        let lon = route.geometry[idx][0];
+        let lat = route.geometry[idx][1];
+        batch_reqs.push(HorizonProfileRequest {
+            origin_lat: lat,
+            origin_lon: lon,
+            eye_offset_m: 1.65,
+            az_start_deg: sr_min,
+            az_end_deg: sr_max,
+            az_step_deg: 0.10,
+            max_distance_m: 35_000.0,
+        });
+        batch_reqs.push(HorizonProfileRequest {
+            origin_lat: lat,
+            origin_lon: lon,
+            eye_offset_m: 1.65,
+            az_start_deg: ss_min,
+            az_end_deg: ss_max,
+            az_step_deg: 0.10,
+            max_distance_m: 35_000.0,
+        });
+    }
+
+    let batched_profiles = compute_horizon_profiles_batch(terrain, &batch_reqs);
+
     let mut vantage_plans: Vec<TrailVantageShootPlan> = candidate_indices
-        .into_par_iter()
-        .filter_map(|idx| {
+        .par_iter()
+        .enumerate()
+        .filter_map(|(cand_pos, &idx)| {
             let lon = route.geometry[idx][0];
             let lat = route.geometry[idx][1];
+            let sr_profile = &batched_profiles[cand_pos * 2];
+            let ss_profile = &batched_profiles[cand_pos * 2 + 1];
 
-            // Compute sunrise and sunset horizon windows at 0.10° resolution (separately to avoid azimuth jump)
-            let sr_profile =
-                compute_horizon_profile(terrain, lat, lon, 1.65, sr_min, sr_max, 0.10, 35_000.0);
-            let ss_profile =
-                compute_horizon_profile(terrain, lat, lon, 1.65, ss_min, ss_max, 0.10, 35_000.0);
-
-            let mut notches = detect_light_notches(&sr_profile, year, 0.55, 8.0);
-            notches.extend(detect_light_notches(&ss_profile, year, 0.55, 8.0));
+            let mut notches = detect_light_notches(sr_profile, year, 0.55, 8.0);
+            notches.extend(detect_light_notches(ss_profile, year, 0.55, 8.0));
             notches.sort_by(|a, b| {
                 b.notch_quality_score
                     .partial_cmp(&a.notch_quality_score)
@@ -576,13 +601,18 @@ pub fn find_best_viewpoints_for_seed(
         db.find_all_routes_near(target_3d.summit_lat, target_3d.summit_lon, 0.14, max_miles)?;
     let total_routes_scanned = all_routes.len();
 
-    // 4. In parallel across all routes, walk the trail geometry up to its turnaround point,
-    // cast 3D Line-of-Sight rays to Landmark X, and pick the best unobstructed viewpoint on each route.
-    let route_evaluations: Vec<(usize, Option<LandmarkViewpointHikeOption>)> = all_routes
+    // 4. Walk all routes in parallel to accumulate Tobler hike metrics & 3D trail paths, then evaluate
+    //    ALL candidate 3D camera sightlines across every route in ONE batched Metal GPU compute pass!
+    struct RouteWalkData {
+        path_3d: Vec<[f64; 3]>,
+        samples: Vec<(usize, f64, f64, f64, f64, f64, f64)>, // (vertex_idx, lat, lon, z, cum_dist_m, cum_gain_m, cum_time_min)
+    }
+
+    let walked_routes: Vec<Option<RouteWalkData>> = all_routes
         .par_iter()
         .map(|route| {
             if route.geometry.len() < 2 {
-                return (0, None);
+                return None;
             }
             let half_len = (route.geometry.len() / 2 + 1)
                 .max(2)
@@ -593,8 +623,6 @@ pub fn find_best_viewpoints_for_seed(
             let mut cum_time_min = 0.0_f64;
             let mut prev_z = terrain.elevation_m(route.geometry[0][1], route.geometry[0][0]);
 
-            let mut best_vp_for_route: Option<LandmarkViewpointHikeOption> = None;
-            let mut vertices_checked = 0usize;
             let mut path_3d: Vec<[f64; 3]> = Vec::with_capacity(half_len);
             path_3d.push([
                 route.geometry[0][0],
@@ -602,7 +630,8 @@ pub fn find_best_viewpoints_for_seed(
                 (prev_z * 10.0).round() / 10.0,
             ]);
 
-            // Sample every ~4th vertex along the trail (plus the turnaround apex)
+            let mut samples = Vec::with_capacity(half_len / 3 + 2);
+
             for i in 1..half_len {
                 let (lon0, lat0) = (route.geometry[i - 1][0], route.geometry[i - 1][1]);
                 let (lon1, lat1) = (route.geometry[i][0], route.geometry[i][1]);
@@ -627,22 +656,53 @@ pub fn find_best_viewpoints_for_seed(
                 if i % 3 != 0 && i != half_len - 1 {
                     continue;
                 }
-                vertices_checked += 1;
+                samples.push((i, lat1, lon1, z1, cum_dist_m, cum_gain_m, cum_time_min));
+            }
 
-                let los = cast_camera_line_of_sight(terrain, lat1, lon1, z1, &target_3d);
+            Some(RouteWalkData { path_3d, samples })
+        })
+        .collect();
+
+    let mut flat_vps = Vec::new();
+    let mut route_sample_ranges = Vec::with_capacity(all_routes.len());
+    for wd_opt in &walked_routes {
+        let start = flat_vps.len();
+        if let Some(wd) = wd_opt {
+            for &(_, lat, lon, z, _, _, _) in &wd.samples {
+                flat_vps.push((lat, lon, z));
+            }
+        }
+        route_sample_ranges.push((start, flat_vps.len()));
+    }
+
+    let total_trail_vertices_evaluated = flat_vps.len();
+    let flat_los_results = cast_camera_line_of_sight_batch(terrain, &flat_vps, &target_3d);
+
+    let mut candidates: Vec<LandmarkViewpointHikeOption> = all_routes
+        .par_iter()
+        .enumerate()
+        .filter_map(|(r_idx, route)| {
+            let wd = walked_routes[r_idx].as_ref()?;
+            let (s_start, s_end) = route_sample_ranges[r_idx];
+            let los_slice = &flat_los_results[s_start..s_end];
+
+            let mut best_vp_for_route: Option<(usize, LandmarkViewpointHikeOption)> = None;
+
+            for (k, &(v_idx, lat1, lon1, z1, cum_dist_m, cum_gain_m, cum_time_min)) in
+                wd.samples.iter().enumerate()
+            {
+                let los = &los_slice[k];
                 if !los.is_visible {
                     continue;
                 }
 
-                // Build Golden-Hour shooting schedules & evaluate lighting angle between camera sightline and sun ray
                 let mut schedules = Vec::new();
                 let mut best_light_bonus = 0.0_f64;
                 let hike_mins = cum_time_min.round() as u32;
 
                 for win in &gh_windows {
-                    // Angle between camera->subject bearing and sun->subject ray
-                    // Camera is at `los.bearing_to_landmark_deg + 180°` relative to Landmark X
-                    let cam_from_target_az = (los.bearing_to_landmark_deg + 180.0).rem_euclid(360.0);
+                    let cam_from_target_az =
+                        (los.bearing_to_landmark_deg + 180.0).rem_euclid(360.0);
                     let angle_diff = ((cam_from_target_az - win.sun_azimuth_deg + 540.0)
                         .rem_euclid(360.0)
                         - 180.0)
@@ -651,7 +711,10 @@ pub fn find_best_viewpoints_for_seed(
                     let (lighting_style, angle_bonus) = if angle_diff <= 35.0 {
                         ("Direct Front Alpenglow (Warm Full-Face Light)", 18.0)
                     } else if angle_diff <= 105.0 {
-                        ("3/4 Side-Relief Alpenglow (Dramatic 3D Granite Texture & Shadows)", 24.0)
+                        (
+                            "3/4 Side-Relief Alpenglow (Dramatic 3D Granite Texture & Shadows)",
+                            24.0,
+                        )
                     } else if angle_diff <= 145.0 {
                         ("Grazing Edge / Rim Light", 14.0)
                     } else {
@@ -662,7 +725,6 @@ pub fn find_best_viewpoints_for_seed(
                         best_light_bonus = angle_bonus;
                     }
 
-                    // Target arriving 20 minutes before the Golden Hour Window starts
                     let arrival_local = subtract_minutes_from_hhmm(&win.window_start_local, 20);
                     let depart_local = subtract_minutes_from_hhmm(
                         &win.window_start_local,
@@ -686,7 +748,6 @@ pub fn find_best_viewpoints_for_seed(
                     });
                 }
 
-                // Slight efficiency bonus for reasonable hike distance (1.0..6.0 miles to VP)
                 let hike_miles = cum_dist_m / 1609.344;
                 let hike_bonus = if hike_miles <= 5.5 { 6.0 } else { 2.0 };
                 let overall_score =
@@ -694,7 +755,7 @@ pub fn find_best_viewpoints_for_seed(
 
                 if best_vp_for_route
                     .as_ref()
-                    .map_or(true, |b| overall_score > b.overall_score)
+                    .map_or(true, |(_, b)| overall_score > b.overall_score)
                 {
                     let vp_label = if let Some(first_lm) = route.landmarks.first() {
                         format!(
@@ -705,39 +766,38 @@ pub fn find_best_viewpoints_for_seed(
                         format!("{} Viewpoint", route.name)
                     };
 
-                    best_vp_for_route = Some(LandmarkViewpointHikeOption {
-                        viewpoint_rank: 0,
-                        viewpoint_label: vp_label,
-                        viewpoint_lat: (lat1 * 100_000.0).round() / 100_000.0,
-                        viewpoint_lon: (lon1 * 100_000.0).round() / 100_000.0,
-                        viewpoint_elevation_m: (z1 * 10.0).round() / 10.0,
-                        viewpoint_elevation_ft: (z1 * 3.28084).round(),
-                        route_id: route.id,
-                        route_name: route.name.clone(),
-                        route_type: route.route_type.clone(),
-                        trailhead_name: route.trailhead_name.clone(),
-                        trailhead_lat: route.trailhead_lat,
-                        trailhead_lon: route.trailhead_lon,
-                        hike_distance_to_vp_miles: (hike_miles * 100.0).round() / 100.0,
-                        total_route_distance_miles: route.distance_miles,
-                        elevation_gain_to_vp_feet: (cum_gain_m * 3.28084).round(),
-                        hike_duration_to_vp_minutes: hike_mins,
-                        sightline: los,
-                        overall_score,
-                        schedules,
-                        trail_path_to_vp: path_3d.clone(),
-                    });
+                    best_vp_for_route = Some((
+                        v_idx,
+                        LandmarkViewpointHikeOption {
+                            viewpoint_rank: 0,
+                            viewpoint_label: vp_label,
+                            viewpoint_lat: (lat1 * 100_000.0).round() / 100_000.0,
+                            viewpoint_lon: (lon1 * 100_000.0).round() / 100_000.0,
+                            viewpoint_elevation_m: (z1 * 10.0).round() / 10.0,
+                            viewpoint_elevation_ft: (z1 * 3.28084).round(),
+                            route_id: route.id,
+                            route_name: route.name.clone(),
+                            route_type: route.route_type.clone(),
+                            trailhead_name: route.trailhead_name.clone(),
+                            trailhead_lat: route.trailhead_lat,
+                            trailhead_lon: route.trailhead_lon,
+                            hike_distance_to_vp_miles: (hike_miles * 100.0).round() / 100.0,
+                            total_route_distance_miles: route.distance_miles,
+                            elevation_gain_to_vp_feet: (cum_gain_m * 3.28084).round(),
+                            hike_duration_to_vp_minutes: hike_mins,
+                            sightline: los.clone(),
+                            overall_score,
+                            schedules,
+                            trail_path_to_vp: Vec::new(),
+                        },
+                    ));
                 }
             }
 
-            (vertices_checked, best_vp_for_route)
+            let (win_v_idx, mut vp_opt) = best_vp_for_route?;
+            vp_opt.trail_path_to_vp = wd.path_3d[..=win_v_idx].to_vec();
+            Some(vp_opt)
         })
-        .collect();
-
-    let total_trail_vertices_evaluated: usize = route_evaluations.iter().map(|e| e.0).sum();
-    let mut candidates: Vec<LandmarkViewpointHikeOption> = route_evaluations
-        .into_iter()
-        .filter_map(|e| e.1)
         .collect();
 
     // Sort candidates by overall photographic score descending

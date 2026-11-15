@@ -12,3 +12,6 @@ rayon.workspace = true
 image.workspace = true
 pp-solar = { path = "../pp-solar" }
 pp-terrain = { path = "../pp-terrain" }
+
+[target.'cfg(target_os = "macos")'.build-dependencies]
+cc = "1.11"

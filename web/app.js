@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { VolumetricAtmosphereEngine, WEATHER_REGIME_PRESETS } from "./volumetric-engine.js?v=20261114d";
+import { VolumetricAtmosphereEngine, WEATHER_REGIME_PRESETS } from "./volumetric-engine.js?v=20261115g";
 
 // Conditional Popover API polyfill loader (content-first-noise-reduction)
 if (!Object.hasOwn(HTMLElement.prototype, "popover")) {
@@ -379,17 +379,26 @@ function disposeObjectTree(group) {
 }
 
 // Custom GLSL Topographic Shader:
+// - GPU Vertex-Shader Elevation Displacement directly from `uHeightTex` (zero CPU vertex loops)
 // - 9-tap Sobel Micro-Relief Normals & Laplacian Cavity Shading
-// - 128-step Solar Ray-Marching for Topographic Shadows & Alpenglow Landing Zone
-// - 8x8 Positional Cloud Shadow Projection & 15m Windward Topographic Fog Damming
-// - 80-step Real-Time GPU Viewshed Ray-Marching (Pixel -> Target Upper Face)
+// - O(1) Fetch from GPU-Baked Topographic Soft-Penumbra Shadow & 96-Step Viewshed LUT (`uTerrainBakeTex`)
+// - GPU 256x256 Volumetric Cloud Ground-Shadow Projection (`uCloudShadowTex`) & 15m Topographic Fog Damming
 // - 3 Surface Modes: Granite Relief (0), USGS Satellite Ortho (1), Topo Contours (2)
 const TERRAIN_VERTEX_SHADER = /* glsl */ `
+  uniform sampler2D uHeightTex;
+  uniform float uGridSize;
+  uniform float uMinZ;
+
   varying vec2 vUv;
   varying vec3 vWorldPos;
+
   void main() {
     vUv = uv;
-    vec4 wp = modelMatrix * vec4(position, 1.0);
+    float n = max(uGridSize, 240.0);
+    vec2 tcUv = clamp(uv, 0.0, 1.0) * ((n - 1.0) / n) + vec2(0.5 / n);
+    float zM = texture2D(uHeightTex, tcUv).r;
+    vec3 displaced = vec3(position.x, zM - uMinZ, position.z);
+    vec4 wp = modelMatrix * vec4(displaced, 1.0);
     vWorldPos = wp.xyz;
     gl_Position = projectionMatrix * viewMatrix * wp;
   }
@@ -399,6 +408,7 @@ const TERRAIN_FRAGMENT_SHADER = /* glsl */ `
   precision highp float;
 
   uniform sampler2D uHeightTex;
+  uniform sampler2D uTerrainBakeTex;
   uniform sampler2D uOrthoTex;
   uniform sampler2D uSpatialCloudTex;
   uniform sampler2D uCloudShadowTex;
@@ -507,56 +517,13 @@ const TERRAIN_FRAGMENT_SHADER = /* glsl */ `
 
     float ndotl = max(dot(normalENU, uSunDirENU), 0.0);
 
-    // 1. Hardware-bilinear DEM shadow march with 3D surface-normal origin offset (eliminates grazing cliff-facet
-    //    sawteeth on sheer 80-deg granite walls like Half Dome!) + physical 0.53-deg solar disk penumbra
-    float lit = 1.0;
-    float minClearance = 1e5;
-    float closestOccluderDist = 0.0;
-    float minPenumbraRatio = 1e5;
-    if (uSunDirENU.z <= -0.01) {
-      lit = 0.0;
-    } else if (ndotl <= 0.002) {
-      // Back-facing cliff slopes turned away from the Sun are naturally in self-shadow!
-      lit = 0.0;
-    } else {
-      vec2 horizDir = normalize(uSunDirENU.xy + vec2(1e-5));
-      float tanEl = uSunDirENU.z / max(length(uSunDirENU.xy), 0.005);
-      float marchStepM = uSpanM / 280.0;
-      vec2 uvStep = (horizDir * marchStepM) / uSpanM;
-      // Offset ray origin outward along the 3D cliff normal by ~1.8 DEM cells so grazing rays along sheer walls
-      // never scrape sideways through adjacent 15m raster columns!
-      vec2 startUv = vUv + (normalENU.xy * stepWorld * 1.85) / uSpanM;
-      float zOrigin = z + 0.85 + normalENU.z * 1.25;
-
-      for (int i = 1; i <= 165; i++) {
-        float fi = float(i);
-        vec2 sampleUv = startUv + uvStep * fi;
-        if (sampleUv.x < 0.0 || sampleUv.x > 1.0 || sampleUv.y < 0.0 || sampleUv.y > 1.0) {
-          break;
-        }
-        float distM = fi * marchStepM;
-        float rayZ = zOrigin + distM * tanEl;
-        float terrainZ = sampleDemSmooth(sampleUv);
-        float clearance = rayZ - terrainZ;
-        if (distM > 45.0 && clearance < minClearance) {
-          minClearance = clearance;
-          closestOccluderDist = distM;
-        }
-        float penumbraHalf = max(1.4, distM * 0.0085);
-        float ratio = clearance / penumbraHalf;
-        if (ratio < minPenumbraRatio) {
-          minPenumbraRatio = ratio;
-        }
-        if (ratio < -1.0) {
-          lit = 0.0;
-          break;
-        }
-      }
-      if (lit > 0.0 && minPenumbraRatio < 1.0) {
-        lit = smoothstep(-1.0, 1.0, minPenumbraRatio);
-      }
-    }
-    float topoLit = lit;
+    // 1. O(1) Lookup from GPU-Baked Topographic Soft-Penumbra Shadow & Grazing Clearance LUT (uTerrainBakeTex)
+    //    Re-baked ONLY when solar angle, target coordinate, or DEM changes (replaces 165 ray steps per Retina pixel!)
+    vec4 bakedTopo = texture2D(uTerrainBakeTex, vUv);
+    float topoLit = (uSunDirENU.z <= -0.01 || ndotl <= 0.002) ? 0.0 : bakedTopo.r;
+    float minClearance = bakedTopo.g;
+    float closestOccluderDist = bakedTopo.b;
+    float bakedViewshedLos = bakedTopo.a;
 
     // 2. Base Surface Material according to selected uSurfaceStyle
     vec3 valleyForest = vec3(0.10, 0.17, 0.15);
@@ -590,74 +557,60 @@ const TERRAIN_FRAGMENT_SHADER = /* glsl */ `
     float distToTarget = length(posEN - uTargetEN);
     float targetMask = 1.0 - smoothstep(220.0, 920.0, distToTarget);
 
-    // 3D Multi-Altitude Beer-Lambert Volumetric Cloud Ray-Marching & Coaxial Crepuscular Cloud-Gap Spotlights
-    // Uses the shared coaxial slant factor (CLOUD_SLANT = 1.65) so every 3D hole in the cloud deck casts a
-    // diagonal 3D sunbeam shaft that lands at the EXACT same ground/ocean pixel as this shader's spotlight!
+    // 3D Volumetric Cloud Shadow Projection & Coaxial Crepuscular Cloud-Gap Spotlights
     vec2 spUv = clamp(posEN / max(uSpatialSpanM, 1000.0) + 0.5, 0.02, 0.98);
     vec4 scHere = texture2D(uSpatialCloudTex, spUv);
     vec2 horizSun = normalize(uSunDirENU.xy + vec2(1e-5));
     const float CLOUD_SLANT = 1.65;
 
-    // 1. Ray intercept through Marine Stratus / Valley Fog slab (uFogBaseM .. localFogTop)
-    float localFogTopEst = scHere.g > 0.01 ? mix(uFogTopM, scHere.g * 2500.0, 0.78) : uFogTopM;
-    float stratusMidZ = max(z + 25.0, (uFogBaseM + localFogTopEst) * 0.5);
-    vec2 windDriftEN = uWindDirENU * (uCloudTime * 18.0);
-    vec2 stratusHitEN = posEN + horizSun * ((stratusMidZ - z) * CLOUD_SLANT) - windDriftEN;
-    vec2 spStratusUv = clamp(stratusHitEN / max(uSpatialSpanM, 1000.0) + 0.5, 0.02, 0.98);
-    vec4 scStratus = texture2D(uSpatialCloudTex, spStratusUv);
-    float stratusRayCov = scStratus.r * step(z, localFogTopEst + 80.0);
-    float stratusMacro = rockFbm(stratusHitEN * 0.00075 + vec2(1.4, -0.9));
-    float stratusFine1m = rockFbm(stratusHitEN * 0.032 + vec2(stratusMacro * 3.2, -1.7));
-    float stratusCellNoise = clamp(stratusMacro + (stratusFine1m - 0.48) * 0.34, 0.0, 1.0);
-    float tauStratus = max(0.0, stratusRayCov - 0.14) * (0.42 + 0.58 * smoothstep(0.22, 0.70, stratusCellNoise)) * 1.48;
-
-    // 2. Ray intercept through Main 850 hPa Cumulus / Stratocumulus Deck (matches 3D gap height)
-    float cumLayerZ = uMinZ + (uMinZ < 200.0 ? 640.0 : 580.0);
-    vec2 cumHitEN = posEN + horizSun * (max(60.0, cumLayerZ - z) * CLOUD_SLANT) - windDriftEN * 1.25;
-    vec2 spCumUv = clamp(cumHitEN / max(uSpatialSpanM, 1000.0) + 0.5, 0.02, 0.98);
-    vec4 scCum = texture2D(uSpatialCloudTex, spCumUv);
-    float cumRayCov = scCum.b;
-    float cumMacro = rockFbm(cumHitEN * 0.00085 + vec2(2.3, -1.4));
-    float cumTurret = 1.0 - abs(rockFbm(cumHitEN * 0.0042 + vec2(cumMacro * 2.5)) * 2.0 - 1.0);
-    float cumWisp1m = rockFbm(cumHitEN * 0.055 - vec2(cumTurret * 2.2));
-    float cumBillowNoise = clamp(mix(cumMacro, cumTurret, 0.55) + (cumWisp1m - 0.48) * 0.28, 0.0, 1.0);
-    float tauCumulus = max(0.0, cumRayCov - 0.14) * (0.45 + 0.55 * smoothstep(0.24, 0.72, cumBillowNoise)) * 1.68;
-
-    // 3. Direct 12-level vertical optical depth tau encoded in uSpatialCloudTex.a (0..6.5)
-    float encodedTau = scCum.a * 6.5 * (0.68 + 0.44 * cumBillowNoise);
-    float totalCloudTau = max(tauStratus + tauCumulus, encodedTau);
-
-    // 4. Coaxial 3D Crepuscular Cloud-Gap Fenestrations with ragged wind-torn 1m fractal spotlight edges!
     float gapSpotlight = 0.0;
     float gapCoreBeam = 0.0;
-    for (int g = 0; g < 6; g++) {
-      if (float(g) >= uNumCloudGaps) break;
-      vec4 gap = uCloudGaps[g];
-      if (gap.w > 10.0) {
-        float gapZ = max(z + 60.0, gap.z);
-        vec2 rayAtGapEN = posEN + horizSun * ((gapZ - z) * CLOUD_SLANT);
-        vec2 deltaG = rayAtGapEN - gap.xy;
-        float alongW = dot(deltaG, uWindDirENU);
-        float crossW = dot(deltaG, vec2(-uWindDirENU.y, uWindDirENU.x));
-        float anisoDist = length(vec2(alongW * 0.80, crossW * 1.15));
-        float raggedWarp = (cumTurret - 0.48) * gap.w * 0.45 + (cumWisp1m - 0.5) * 52.0;
-        float dGap = anisoDist + raggedWarp;
-        float spot = 1.0 - smoothstep(gap.w * 0.24, gap.w * 0.98, dGap);
-        float core = 1.0 - smoothstep(0.0, gap.w * 0.50, dGap);
-        gapSpotlight = max(gapSpotlight, spot);
-        gapCoreBeam = max(gapCoreBeam, core);
+    if (uNumCloudGaps > 0.5) {
+      vec2 windDriftEN = uWindDirENU * (uCloudTime * 18.0);
+      float cumLayerZ = uMinZ + (uMinZ < 200.0 ? 640.0 : 580.0);
+      vec2 cumHitEN = posEN + horizSun * (max(60.0, cumLayerZ - z) * CLOUD_SLANT) - windDriftEN * 1.25;
+      float cumMacro = rockFbm(cumHitEN * 0.00085 + vec2(2.3, -1.4));
+      float cumTurret = 1.0 - abs(rockFbm(cumHitEN * 0.0042 + vec2(cumMacro * 2.5)) * 2.0 - 1.0);
+      float cumWisp1m = rockFbm(cumHitEN * 0.055 - vec2(cumTurret * 2.2));
+
+      for (int g = 0; g < 6; g++) {
+        if (float(g) >= uNumCloudGaps) break;
+        vec4 gap = uCloudGaps[g];
+        if (gap.w > 10.0) {
+          float gapZ = max(z + 60.0, gap.z);
+          vec2 rayAtGapEN = posEN + horizSun * ((gapZ - z) * CLOUD_SLANT);
+          vec2 deltaG = rayAtGapEN - gap.xy;
+          float alongW = dot(deltaG, uWindDirENU);
+          float crossW = dot(deltaG, vec2(-uWindDirENU.y, uWindDirENU.x));
+          float anisoDist = length(vec2(alongW * 0.80, crossW * 1.15));
+          float raggedWarp = (cumTurret - 0.48) * gap.w * 0.45 + (cumWisp1m - 0.5) * 52.0;
+          float dGap = anisoDist + raggedWarp;
+          float spot = 1.0 - smoothstep(gap.w * 0.24, gap.w * 0.98, dGap);
+          float core = 1.0 - smoothstep(0.0, gap.w * 0.50, dGap);
+          gapSpotlight = max(gapSpotlight, spot);
+          gapCoreBeam = max(gapCoreBeam, core);
+        }
       }
     }
 
-    // Beer-Lambert Transmittance T = exp(-0.72 * tau):
-    // Under a thick overcast deck (tau ~ 3.5-5.5), transmittance drops to ~0.04-0.08 (deep storm-cloud shadow),
-    // EXCEPT directly inside the coaxial 3D crepuscular sunbeam footprints where sunlight punches through!
-    totalCloudTau *= (1.0 - gapSpotlight * 0.94);
-    float cloudTransmittance = mix(exp(-clamp(totalCloudTau * 0.72, 0.0, 4.0)), 0.98, gapSpotlight);
+    float cloudTransmittance = 1.0;
     if (uUseFluidShadows > 0.5) {
+      // Direct O(1) lookup from the 256x256 GPU 3D Navier-Stokes cloud shadow map (uCloudShadowTex)
       vec2 fluidShadowUv = fract(posEN / max(uCloudDomainM, 1000.0) + 0.5);
       float fluidShadowTrans = texture2D(uCloudShadowTex, fluidShadowUv).r;
-      cloudTransmittance = mix(cloudTransmittance, fluidShadowTrans, 0.78);
+      cloudTransmittance = mix(fluidShadowTrans, 0.98, gapSpotlight);
+    } else {
+      float localFogTopEst = scHere.g > 0.01 ? mix(uFogTopM, scHere.g * 2500.0, 0.78) : uFogTopM;
+      float stratusMidZ = max(z + 25.0, (uFogBaseM + localFogTopEst) * 0.5);
+      vec2 windDriftEN = uWindDirENU * (uCloudTime * 18.0);
+      vec2 stratusHitEN = posEN + horizSun * ((stratusMidZ - z) * CLOUD_SLANT) - windDriftEN;
+      vec2 spStratusUv = clamp(stratusHitEN / max(uSpatialSpanM, 1000.0) + 0.5, 0.02, 0.98);
+      vec4 scStratus = texture2D(uSpatialCloudTex, spStratusUv);
+      float stratusRayCov = scStratus.r * step(z, localFogTopEst + 80.0);
+      float stratusMacro = rockFbm(stratusHitEN * 0.00075 + vec2(1.4, -0.9));
+      float tauStratus = max(0.0, stratusRayCov - 0.14) * (0.42 + 0.58 * stratusMacro) * 1.48;
+      float totalCloudTau = max(tauStratus, scHere.a * 4.5) * (1.0 - gapSpotlight * 0.94);
+      cloudTransmittance = mix(exp(-clamp(totalCloudTau * 0.72, 0.0, 4.0)), 0.98, gapSpotlight);
     }
     float isThickOvercast = smoothstep(1.25, 2.6, uMeanCloudTau);
     float ambientFloor = mix(0.38, 0.16, isThickOvercast);
@@ -782,31 +735,13 @@ const TERRAIN_FRAGMENT_SHADER = /* glsl */ `
       finalColor = mix(finalColor, fogLitCol * 1.06, topShore * localFogStr * 0.22);
     }
 
-    // 3. Real-Time GPU 360° Viewshed Heatmap Overlay (80-step Line-of-Sight from every terrain pixel to Target Upper Face)
+    // 3. GPU-Baked 360-deg Viewshed Heatmap Overlay (bakedViewshedLos from uTerrainBakeTex — 1 fetch vs 77 steps!)
     if (uShowViewshed > 0.5 && distToTarget > 260.0) {
-      vec2 targetUv = (uTargetEN + vec2(uSpanM * 0.5)) / uSpanM;
-      float startZ = z + 1.8;
-      float endZ = uTargetUpperZ + 6.0;
-      float losClear = 1.0;
-
-      for (int j = 2; j <= 78; j++) {
-        float frac = float(j) / 80.0;
-        vec2 sampleUv = mix(vUv, targetUv, frac);
-        float rayZ = mix(startZ, endZ, frac);
-        float tZ = texture2D(uHeightTex, sampleUv).r;
-        if (tZ > rayZ + 3.0) {
-          losClear = 0.0;
-          break;
-        }
-      }
-
-      if (losClear > 0.5) {
-        // Unobstructed line of sight to Landmark
+      if (bakedViewshedLos > 0.5) {
         vec3 viewshedCyan = vec3(0.06, 0.82, 0.62);
         float pulse = 0.36 + 0.18 * smoothstep(0.2, 0.8, relZ);
         finalColor = mix(finalColor, viewshedCyan, pulse);
       } else {
-        // Occluded by intervening ridge
         finalColor *= 0.68;
       }
     }
@@ -873,6 +808,77 @@ function sampleLocalTerrainY(eastM, northM) {
   return z - patch.min_elevation_m;
 }
 
+const _terrainBox = new THREE.Box3();
+const _rayEntryPt = new THREE.Vector3();
+const _rayExitPt = new THREE.Vector3();
+
+/**
+ * Sub-0.015 ms analytical ray-heightfield intersection (replaces 720,000-triangle CPU
+ * `THREE.Raycaster.intersectObject` so `terrainMesh` stays 100% GPU-displaced!).
+ */
+function intersectTerrainHeightfield(ray) {
+  const patch = state.terrainPatch;
+  if (!patch) return null;
+  const half = patch.span_m * 0.5;
+  const maxLocalY = Math.max(20.0, patch.max_elevation_m - patch.min_elevation_m + 15.0);
+  _terrainBox.min.set(-half, -10.0, -half);
+  _terrainBox.max.set(half, maxLocalY, half);
+
+  let tMin = 0.0;
+  if (!_terrainBox.containsPoint(ray.origin)) {
+    const hitEntry = ray.intersectBox(_terrainBox, _rayEntryPt);
+    if (!hitEntry) return null;
+    tMin = ray.origin.distanceTo(_rayEntryPt);
+  }
+
+  // Compute exit distance along ray inside bounding box
+  let tMax = tMin + patch.span_m * 1.6;
+  const invDx = Math.abs(ray.direction.x) > 1e-6 ? 1.0 / ray.direction.x : 1e9;
+  const invDy = Math.abs(ray.direction.y) > 1e-6 ? 1.0 / ray.direction.y : 1e9;
+  const invDz = Math.abs(ray.direction.z) > 1e-6 ? 1.0 / ray.direction.z : 1e9;
+  const tx1 = (-half - ray.origin.x) * invDx;
+  const tx2 = (half - ray.origin.x) * invDx;
+  const ty1 = (-10.0 - ray.origin.y) * invDy;
+  const ty2 = (maxLocalY - ray.origin.y) * invDy;
+  const tz1 = (-half - ray.origin.z) * invDz;
+  const tz2 = (half - ray.origin.z) * invDz;
+  const boxExit = Math.min(Math.max(tx1, tx2), Math.max(ty1, ty2), Math.max(tz1, tz2));
+  if (boxExit > tMin) tMax = Math.min(tMax, boxExit);
+
+  const STEPS = 140;
+  const dt = (tMax - tMin) / STEPS;
+  let prevT = tMin;
+  for (let i = 0; i <= STEPS; i++) {
+    const t = tMin + i * dt;
+    const px = ray.origin.x + ray.direction.x * t;
+    const py = ray.origin.y + ray.direction.y * t;
+    const pz = ray.origin.z + ray.direction.z * t;
+    if (Math.abs(px) <= half && Math.abs(pz) <= half) {
+      const terrY = sampleLocalTerrainY(px, -pz);
+      if (py <= terrY) {
+        let lo = prevT;
+        let hi = t;
+        for (let b = 0; b < 7; b++) {
+          const mid = 0.5 * (lo + hi);
+          const mx = ray.origin.x + ray.direction.x * mid;
+          const my = ray.origin.y + ray.direction.y * mid;
+          const mz = ray.origin.z + ray.direction.z * mid;
+          if (my <= sampleLocalTerrainY(mx, -mz)) hi = mid;
+          else lo = mid;
+        }
+        const hitT = 0.5 * (lo + hi);
+        const hx = ray.origin.x + ray.direction.x * hitT;
+        const hz = ray.origin.z + ray.direction.z * hitT;
+        const hy = sampleLocalTerrainY(hx, -hz);
+        _rayExitPt.set(hx, hy, hz);
+        return { point: _rayExitPt.clone(), distance: hitT };
+      }
+    }
+    prevT = t;
+  }
+  return null;
+}
+
 function makeTextSprite(text, bgColor = "#0f172a", borderColor = "#f59e0b", textColor = "#f8fafc") {
   const cacheKey = `${text}|${bgColor}|${borderColor}|${textColor}`;
   let tex = spriteTextureCache.get(cacheKey);
@@ -913,14 +919,26 @@ function makeTextSprite(text, bgColor = "#0f172a", borderColor = "#f59e0b", text
   return sprite;
 }
 
+// Cached flat PlaneGeometry reused across scenarios — displaced 100% in `TERRAIN_VERTEX_SHADER` on GPU!
+let cachedTerrainPlaneKey = "";
+let cachedTerrainPlaneGeo = null;
+
 // ============================================================================
-// Build High-Density 600x600 3D Terrain Mesh + Sync DEM to Rust WASM Fluid Solver
+// Build High-Density 600x600 GPU-Displaced Terrain Mesh + Sync DEM to GPU Fluid Solver
 // ============================================================================
 function buildTerrainMesh() {
-  if (terrainShaderMaterial?.uniforms?.uHeightTex?.value) {
-    terrainShaderMaterial.uniforms.uHeightTex.value.dispose?.();
+  if (terrainShaderMaterial) {
+    terrainShaderMaterial.uniforms?.uHeightTex?.value?.dispose?.();
+    if (
+      terrainShaderMaterial.uniforms?.uOrthoTex?.value &&
+      terrainShaderMaterial.uniforms.uOrthoTex.value !== dummyWhiteTex
+    ) {
+      terrainShaderMaterial.uniforms.uOrthoTex.value.dispose?.();
+    }
+    terrainShaderMaterial.dispose();
+    terrainShaderMaterial = null;
   }
-  disposeObjectTree(terrainGroup);
+  terrainGroup.clear();
   terrainMeshRef = null;
 
   const patch = state.terrainPatch;
@@ -948,21 +966,17 @@ function buildTerrainMesh() {
   heightTex.minFilter = THREE.LinearFilter;
   heightTex.needsUpdate = true;
 
-  const geom = new THREE.PlaneGeometry(spanM, spanM, n - 1, n - 1);
-  geom.rotateX(-Math.PI / 2);
-
-  const posAttr = geom.attributes.position;
-  const uvAttr = geom.attributes.uv;
-
-  for (let i = 0; i < posAttr.count; i++) {
-    const u = uvAttr.getX(i);
-    const v = uvAttr.getY(i);
-    const ix = Math.min(n - 1, Math.max(0, Math.round(u * (n - 1))));
-    const iy = Math.min(n - 1, Math.max(0, Math.round(v * (n - 1))));
-    const zM = floatData[iy * n + ix];
-    posAttr.setY(i, zM - minZ);
+  const geoKey = `${n}_${spanM}`;
+  if (cachedTerrainPlaneKey !== geoKey || !cachedTerrainPlaneGeo) {
+    cachedTerrainPlaneGeo?.dispose?.();
+    cachedTerrainPlaneGeo = new THREE.PlaneGeometry(spanM, spanM, n - 1, n - 1);
+    cachedTerrainPlaneGeo.rotateX(-Math.PI / 2);
+    cachedTerrainPlaneGeo.boundingSphere = new THREE.Sphere(
+      new THREE.Vector3(0, 1500, 0),
+      spanM * 0.9
+    );
+    cachedTerrainPlaneKey = geoKey;
   }
-  geom.computeVertexNormals();
 
   const lm = state.shootReport?.target_landmark;
   const upperZ = lm ? lm.upper_face_z_m : maxZ * 0.9;
@@ -972,6 +986,7 @@ function buildTerrainMesh() {
     fragmentShader: TERRAIN_FRAGMENT_SHADER,
     uniforms: {
       uHeightTex: { value: heightTex },
+      uTerrainBakeTex: { value: volumetricEngine.getTerrainBakeTexture() },
       uOrthoTex: { value: dummyWhiteTex },
       uSpatialCloudTex: { value: spatialCloudTex },
       uCloudShadowTex: { value: volumetricEngine.getShadowMapTexture() },
@@ -1000,7 +1015,7 @@ function buildTerrainMesh() {
     },
   });
 
-  // Couple the high-res USGS 3DEP DEM into the Rust WASM 3D Navier-Stokes & Cirrus solver + GPU raymarcher!
+  // Couple the high-res USGS 3DEP DEM directly into the GPU 128x128x48 Navier-Stokes & Cirrus solver + DEM Baker!
   volumetricEngine.setTerrainDem(
     floatData,
     n,
@@ -1008,12 +1023,23 @@ function buildTerrainMesh() {
     minZ,
     patch.center_lat,
     patch.center_lon,
-    heightTex
+    heightTex,
+    maxZ
   );
+  volumetricEngine.updateTerrainBakeUniforms({
+    sunDirENU: terrainShaderMaterial.uniforms.uSunDirENU.value,
+    targetEN: terrainShaderMaterial.uniforms.uTargetEN.value,
+    targetUpperZ: upperZ,
+    showViewshed: state.showViewshed,
+  });
 
-  const mesh = new THREE.Mesh(geom, terrainShaderMaterial);
+  const mesh = new THREE.Mesh(cachedTerrainPlaneGeo, terrainShaderMaterial);
+  mesh.frustumCulled = false;
   terrainMeshRef = mesh;
   terrainGroup.add(mesh);
+
+  // Sync new heightTex to GPU Light-Field & GPU Monolith Grazing Sunbeam shaders if already initialized
+  syncGpuLightOverlaysDem(heightTex, n, spanM, minZ);
 
   // Asynchronously load USGS National Map Orthoimagery texture for this patch
   const orthoUrl = `/api/usgs-ortho?lat=${patch.center_lat}&lon=${patch.center_lon}&span_m=${patch.span_m}`;
@@ -1055,6 +1081,10 @@ function buildTrailsAndSightlines() {
   if (terrainShaderMaterial) {
     terrainShaderMaterial.uniforms.uTargetEN.value.set(summitPos.x, -summitPos.z);
     terrainShaderMaterial.uniforms.uTargetUpperZ.value = lm.upper_face_z_m;
+    volumetricEngine.updateTerrainBakeUniforms({
+      targetEN: terrainShaderMaterial.uniforms.uTargetEN.value,
+      targetUpperZ: lm.upper_face_z_m,
+    });
   }
 
   // Target Landmark Crown Beacon + Label
@@ -1597,479 +1627,579 @@ function integrateSolarCloudTransmittance(worldX, worldY, worldZ, sunDirWorld, c
 // ============================================================================
 // Valley-Wide 3D Solar Light Field (Full-View Terrain + 3D Cloud Beer-Lambert Lattice)
 // ============================================================================
-function updateValleyLightField(sunDirWorld, elevationDeg) {
-  activeGodRayMaterials = [];
-  disposeObjectTree(lightFieldGroup);
+// ============================================================================
+// Persistent GPU Vertex-Shader Raymarched Valley Light-Field & Monolith Grazing Sunbeams
+// Eliminates thousands of per-frame CPU raymarch steps & BufferGeometry GC churn!
+// ============================================================================
+const GPU_VALLEY_LIGHT_VERTEX_SHADER = /* glsl */ `
+  uniform sampler2D uHeightTex;
+  uniform sampler2D uCloudShadowTex;
+  uniform float uGridSize;
+  uniform float uSpanM;
+  uniform float uMinZ;
+  uniform float uCloudDomainM;
+  uniform float uUseFluidShadows;
+  uniform vec3 uSunDirWorld;
+  uniform vec3 uBaseColor;
+  uniform vec3 uGrazeColor;
+  uniform float uIsOvercast;
 
+  varying vec4 vColor;
+
+  float sampleLocalY(vec2 xz, out bool inside) {
+    float halfSpan = uSpanM * 0.5;
+    vec2 uv = vec2((xz.x + halfSpan) / uSpanM, (-xz.y + halfSpan) / uSpanM);
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+      inside = false;
+      return 0.0;
+    }
+    inside = true;
+    float n = max(uGridSize, 240.0);
+    vec2 tcUv = uv * ((n - 1.0) / n) + vec2(0.5 / n);
+    return texture2D(uHeightTex, tcUv).r - uMinZ;
+  }
+
+  void main() {
+    // position.x = latOff (-4080..+4080), position.y = dFrac (-0.92..+0.92), position.z = role (0..5)
+    float latOff = position.x;
+    float dFrac = position.y;
+    float role = position.z;
+
+    vec3 propDir = normalize(-uSunDirWorld);
+    vec3 rightVec = normalize(vec3(-uSunDirWorld.z, 0.0, uSunDirWorld.x) + vec3(1e-5, 0.0, 0.0));
+    float halfSpan = uSpanM * 0.475;
+    float stepD = (halfSpan * 1.88) / 36.0;
+    float d = dFrac * halfSpan;
+
+    vec3 laneCenter = rightVec * latOff;
+    bool inC = false, inM1 = false, inM2 = false, inP1 = false, inP2 = false;
+    vec3 pC  = laneCenter + propDir * d;
+    vec3 pM1 = laneCenter + propDir * (d - stepD);
+    vec3 pM2 = laneCenter + propDir * (d - 2.0 * stepD);
+    vec3 pP1 = laneCenter + propDir * (d + stepD);
+    vec3 pP2 = laneCenter + propDir * (d + 2.0 * stepD);
+
+    float yC  = sampleLocalY(pC.xz, inC);
+    float yM1 = sampleLocalY(pM1.xz, inM1);
+    float yM2 = sampleLocalY(pM2.xz, inM2);
+    float yP1 = sampleLocalY(pP1.xz, inP1);
+    float yP2 = sampleLocalY(pP2.xz, inP2);
+
+    float rC  = yC  - d * propDir.y;
+    float rM1 = yM1 - (d - stepD) * propDir.y;
+    float rM2 = yM2 - (d - 2.0 * stepD) * propDir.y;
+    float rP1 = yP1 - (d + stepD) * propDir.y;
+    float rP2 = yP2 - (d + 2.0 * stepD) * propDir.y;
+
+    bool isCrest = inC && inP2 && (rC > rM1) && (rC >= rM2) && (rC >= rP1) && (rC > rP2) && ((yC - yP2) > 24.0);
+    if (!isCrest) {
+      vColor = vec4(0.0);
+      gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+      return;
+    }
+
+    vec2 crestEN = vec2(pC.x, -pC.z);
+    float cloudTrans = 1.0;
+    if (uUseFluidShadows > 0.5) {
+      vec2 shadowUv = fract(crestEN / max(uCloudDomainM, 1000.0) + 0.5);
+      cloudTrans = texture2D(uCloudShadowTex, shadowUv).r;
+    }
+    if (uIsOvercast > 0.5 && cloudTrans < 0.16) {
+      vColor = vec4(0.0);
+      gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+      return;
+    }
+
+    vec3 crestOrigin = vec3(pC.x, yC + 5.0, pC.z);
+    vec3 endPos = crestOrigin + propDir * 3200.0;
+    float endDist = 3200.0;
+    for (int m = 1; m <= 16; m++) {
+      float md = float(m) * 200.0;
+      vec3 mp = crestOrigin + propDir * md;
+      bool inM = false;
+      float gy = sampleLocalY(mp.xz, inM);
+      if (!inM) {
+        endPos = mp;
+        endDist = md;
+        break;
+      }
+      if (mp.y <= gy + 2.5) {
+        endPos = vec3(mp.x, gy + 2.8, mp.z);
+        endDist = md;
+        break;
+      }
+    }
+
+    float ribbonH = 68.0;
+    vec3 worldPt = crestOrigin;
+    vec3 col = uGrazeColor;
+    float alpha = 0.0;
+
+    if (role < 0.5) {
+      // 0: Sunward feeder start
+      worldPt = crestOrigin - propDir * 850.0;
+      col = uBaseColor;
+      alpha = 0.05 * cloudTrans;
+    } else if (role < 1.5) {
+      // 1: Crest origin (line)
+      worldPt = crestOrigin;
+      col = uGrazeColor;
+      alpha = 0.44 * cloudTrans;
+    } else if (role < 2.5) {
+      // 2: Leeward end (line)
+      worldPt = endPos;
+      col = uGrazeColor;
+      alpha = 0.30 * (1.0 - endDist / 4200.0) * cloudTrans;
+    } else if (role < 3.5) {
+      // 3: Quad bottom-crest
+      worldPt = crestOrigin;
+      col = uGrazeColor;
+      alpha = 0.16 * cloudTrans;
+    } else if (role < 4.5) {
+      // 4: Quad bottom-leeward
+      worldPt = endPos;
+      col = uGrazeColor;
+      alpha = 0.11 * cloudTrans;
+    } else if (role < 5.5) {
+      // 5: Quad top-leeward
+      worldPt = endPos + vec3(0.0, ribbonH * 0.48, 0.0);
+      col = uBaseColor;
+      alpha = 0.012 * cloudTrans;
+    } else {
+      // 6: Quad top-crest
+      worldPt = crestOrigin + vec3(0.0, ribbonH, 0.0);
+      col = uBaseColor;
+      alpha = 0.02 * cloudTrans;
+    }
+
+    vColor = vec4(col * alpha, alpha);
+    gl_Position = projectionMatrix * viewMatrix * vec4(worldPt, 1.0);
+  }
+`;
+
+const GPU_OVERLAY_FRAGMENT_SHADER = /* glsl */ `
+  precision highp float;
+  varying vec4 vColor;
+  void main() {
+    if (vColor.a <= 0.001) discard;
+    gl_FragColor = vec4(vColor.rgb, 1.0);
+  }
+`;
+
+const GPU_MONOLITH_GRAZING_VERTEX_SHADER = /* glsl */ `
+  uniform sampler2D uHeightTex;
+  uniform sampler2D uCloudShadowTex;
+  uniform float uGridSize;
+  uniform float uSpanM;
+  uniform float uMinZ;
+  uniform float uCloudDomainM;
+  uniform float uUseFluidShadows;
+  uniform vec3 uSunDirWorld;
+  uniform vec3 uTargetWorld;
+  uniform vec3 uBeamColor;
+  uniform vec3 uEdgeColor;
+  uniform float uIsOvercast;
+
+  varying vec4 vColor;
+
+  float sampleLocalY(vec2 xz, out bool inside) {
+    float halfSpan = uSpanM * 0.5;
+    vec2 uv = vec2((xz.x + halfSpan) / uSpanM, (-xz.y + halfSpan) / uSpanM);
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+      inside = false;
+      return 0.0;
+    }
+    inside = true;
+    float n = max(uGridSize, 240.0);
+    vec2 tcUv = uv * ((n - 1.0) / n) + vec2(0.5 / n);
+    return texture2D(uHeightTex, tcUv).r - uMinZ;
+  }
+
+  void solveSlice(float latOff, out vec3 grazeOrigin, out vec3 leewardEnd, out float cloudTrans) {
+    vec3 propDir = normalize(-uSunDirWorld);
+    vec3 rightVec = normalize(vec3(-uSunDirWorld.z, 0.0, uSunDirWorld.x) + vec3(1e-5, 0.0, 0.0));
+    vec3 sliceBase = uTargetWorld + rightVec * latOff;
+    float bestScore = -1e9;
+    vec3 crestPt = sliceBase;
+
+    for (int i = -16; i <= 16; i++) {
+      float d = float(i) * 40.0;
+      vec3 sp = sliceBase + propDir * d;
+      bool inS = false;
+      float ty = sampleLocalY(sp.xz, inS);
+      if (inS) {
+        float rel = ty - d * propDir.y;
+        if (rel > bestScore) {
+          bestScore = rel;
+          crestPt = vec3(sp.x, ty, sp.z);
+        }
+      }
+    }
+
+    grazeOrigin = crestPt + vec3(0.0, 7.0, 0.0);
+    leewardEnd = grazeOrigin + propDir * 4200.0;
+    for (int m = 1; m <= 35; m++) {
+      float md = float(m) * 120.0;
+      vec3 mp = grazeOrigin + propDir * md;
+      bool inM = false;
+      float gy = sampleLocalY(mp.xz, inM);
+      if (!inM) {
+        leewardEnd = mp;
+        break;
+      }
+      if (mp.y <= gy + 2.5) {
+        leewardEnd = vec3(mp.x, gy + 3.0, mp.z);
+        break;
+      }
+    }
+
+    cloudTrans = 1.0;
+    if (uUseFluidShadows > 0.5) {
+      vec2 en = vec2(grazeOrigin.x, -grazeOrigin.z);
+      vec2 suv = fract(en / max(uCloudDomainM, 1000.0) + 0.5);
+      cloudTrans = texture2D(uCloudShadowTex, suv).r;
+    }
+  }
+
+  void main() {
+    // position.x = sliceLatOff, position.y = role, position.z = auxParam
+    float latOff = position.x;
+    float role = position.y;
+    float aux = position.z;
+
+    vec3 crest, leeEnd;
+    float rawCt;
+    solveSlice(latOff, crest, leeEnd, rawCt);
+    float ct = uIsOvercast > 0.5 ? rawCt : (0.25 + 0.75 * rawCt);
+
+    vec3 worldPt = crest;
+    vec3 col = uBeamColor;
+    float alpha = 0.0;
+
+    if (role < 0.5) {
+      // 0: Edge line start (crest)
+      worldPt = crest;
+      col = aux > 0.5 ? uEdgeColor : uBeamColor;
+      alpha = (aux > 0.5 ? 0.82 : 0.48) * ct;
+    } else if (role < 1.5) {
+      // 1: Edge line end (leewardEnd)
+      worldPt = leeEnd;
+      col = aux > 0.5 ? uEdgeColor : uBeamColor;
+      alpha = (aux > 0.5 ? 0.72 : 0.40) * ct;
+    } else if (role < 2.5) {
+      // 2: Silhouette rim vertex
+      worldPt = crest;
+      col = vec3(0.984, 0.749, 0.141);
+      alpha = 0.90;
+    } else if (role < 3.5) {
+      // 3: Ground terminator vertex
+      worldPt = leeEnd;
+      col = vec3(0.961, 0.620, 0.043);
+      alpha = 0.82;
+    } else if (role < 4.5) {
+      // 4: 34km Sunward feeder shaft start
+      worldPt = crest + normalize(uSunDirWorld) * 34000.0;
+      col = uBeamColor;
+      alpha = 0.18 * ct;
+    } else if (role < 5.5) {
+      // 5: Vertical curtain bottom (crest or leeEnd via aux: 0=crest, 1=leeEnd)
+      worldPt = aux < 0.5 ? crest : leeEnd;
+      col = uEdgeColor;
+      alpha = 0.19 * ct;
+    } else if (role < 6.5) {
+      // 6: Vertical curtain top (aux: 0=crest+85m, 1=leeEnd+46m)
+      worldPt = (aux < 0.5 ? crest + vec3(0.0, 85.0, 0.0) : leeEnd + vec3(0.0, 46.0, 0.0));
+      col = uBeamColor;
+      alpha = 0.03 * ct;
+    } else {
+      // 7: Ribbon sheet vertex (aux: 0=crest, 1=leeEnd)
+      worldPt = aux < 0.5 ? crest : leeEnd;
+      col = uBeamColor;
+      alpha = (aux < 0.5 ? 0.25 : 0.16) * ct;
+    }
+
+    vColor = vec4(col * alpha, alpha);
+    gl_Position = projectionMatrix * viewMatrix * vec4(worldPt, 1.0);
+  }
+`;
+
+let gpuValleyLightMat = null;
+let gpuValleyPersistentGroup = null;
+let gpuValleyGapsGroup = null;
+let _lastValleyGapsKey = "";
+
+let gpuMonolithGrazingMat = null;
+let gpuMonolithPersistentGroup = null;
+let sunBeamsDynamicExtrasGroup = null;
+let _lastSunBeamsExtrasKey = "";
+
+function ensureGpuValleyLightField() {
+  if (gpuValleyPersistentGroup) return;
+  gpuValleyPersistentGroup = new THREE.Group();
+  gpuValleyGapsGroup = new THREE.Group();
+  lightFieldGroup.add(gpuValleyPersistentGroup);
+  lightFieldGroup.add(gpuValleyGapsGroup);
+
+  gpuValleyLightMat = new THREE.ShaderMaterial({
+    vertexShader: GPU_VALLEY_LIGHT_VERTEX_SHADER,
+    fragmentShader: GPU_OVERLAY_FRAGMENT_SHADER,
+    uniforms: {
+      uHeightTex: { value: terrainShaderMaterial?.uniforms?.uHeightTex?.value || dummyWhiteTex },
+      uCloudShadowTex: { value: volumetricEngine.getShadowMapTexture() },
+      uGridSize: { value: state.terrainPatch?.grid_size || 600 },
+      uSpanM: { value: state.terrainPatch?.span_m || 9200 },
+      uMinZ: { value: state.terrainPatch?.min_elevation_m || 0 },
+      uCloudDomainM: { value: volumetricEngine.telemetry.domainXyM || 18000 },
+      uUseFluidShadows: { value: 1.0 },
+      uSunDirWorld: { value: new THREE.Vector3(-0.85, 0.15, 0.2).normalize() },
+      uBaseColor: { value: new THREE.Color(0.99, 0.76, 0.30) },
+      uGrazeColor: { value: new THREE.Color(1.0, 0.80, 0.32) },
+      uIsOvercast: { value: 0.0 },
+    },
+    transparent: true,
+    side: THREE.DoubleSide,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+  });
+
+  const lineVerts = [];
+  const quadVerts = [];
+  for (let latOff = -4080; latOff <= 4080; latOff += 240) {
+    for (let s = 2; s <= 34; s++) {
+      const dFrac = -0.94 + (s / 36.0) * 1.88;
+      // Feeder line (0 -> 1) + Leeward ray line (1 -> 2)
+      lineVerts.push(latOff, dFrac, 0, latOff, dFrac, 1);
+      lineVerts.push(latOff, dFrac, 1, latOff, dFrac, 2);
+      // Vertical sunlit area quad (3, 4, 5) + (3, 5, 6)
+      quadVerts.push(
+        latOff, dFrac, 3,
+        latOff, dFrac, 4,
+        latOff, dFrac, 5,
+        latOff, dFrac, 3,
+        latOff, dFrac, 5,
+        latOff, dFrac, 6
+      );
+    }
+  }
+
+  const lineGeo = new THREE.BufferGeometry();
+  lineGeo.setAttribute("position", new THREE.Float32BufferAttribute(lineVerts, 3));
+  const lineMesh = new THREE.LineSegments(lineGeo, gpuValleyLightMat);
+  lineMesh.frustumCulled = false;
+  gpuValleyPersistentGroup.add(lineMesh);
+
+  const quadGeo = new THREE.BufferGeometry();
+  quadGeo.setAttribute("position", new THREE.Float32BufferAttribute(quadVerts, 3));
+  const quadMesh = new THREE.Mesh(quadGeo, gpuValleyLightMat);
+  quadMesh.frustumCulled = false;
+  gpuValleyPersistentGroup.add(quadMesh);
+}
+
+function ensureGpuMonolithGrazing() {
+  if (gpuMonolithPersistentGroup) return;
+  gpuMonolithPersistentGroup = new THREE.Group();
+  sunBeamsDynamicExtrasGroup = new THREE.Group();
+  sunBeamsGroup.add(gpuMonolithPersistentGroup);
+  sunBeamsGroup.add(sunBeamsDynamicExtrasGroup);
+
+  gpuMonolithGrazingMat = new THREE.ShaderMaterial({
+    vertexShader: GPU_MONOLITH_GRAZING_VERTEX_SHADER,
+    fragmentShader: GPU_OVERLAY_FRAGMENT_SHADER,
+    uniforms: {
+      uHeightTex: { value: terrainShaderMaterial?.uniforms?.uHeightTex?.value || dummyWhiteTex },
+      uCloudShadowTex: { value: volumetricEngine.getShadowMapTexture() },
+      uGridSize: { value: state.terrainPatch?.grid_size || 600 },
+      uSpanM: { value: state.terrainPatch?.span_m || 9200 },
+      uMinZ: { value: state.terrainPatch?.min_elevation_m || 0 },
+      uCloudDomainM: { value: volumetricEngine.telemetry.domainXyM || 18000 },
+      uUseFluidShadows: { value: 1.0 },
+      uSunDirWorld: { value: new THREE.Vector3(-0.85, 0.15, 0.2).normalize() },
+      uTargetWorld: { value: new THREE.Vector3(0, 400, 0) },
+      uBeamColor: { value: new THREE.Color(0xfbbf24) },
+      uEdgeColor: { value: new THREE.Color(0xf59e0b) },
+      uIsOvercast: { value: 0.0 },
+    },
+    transparent: true,
+    side: THREE.DoubleSide,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+  });
+
+  const slices = [];
+  for (let s = -1260; s <= 1260; s += 70) slices.push(s);
+
+  const lineVerts = [];
+  const quadVerts = [];
+  slices.forEach((latOff, idx) => {
+    const isCenterOrFlank = idx % 2 === 0 || Math.abs(latOff) <= 280 ? 1 : 0;
+    // Sharp post-occlusion edge line
+    lineVerts.push(latOff, 0, isCenterOrFlank, latOff, 1, isCenterOrFlank);
+    // 34 km sunward shaft every 3rd slice
+    if (idx % 3 === 0) {
+      lineVerts.push(latOff, 4, 0, latOff, 0, 1);
+    }
+    // Vertical sunlit curtain every 2nd slice
+    if (idx % 2 === 0) {
+      quadVerts.push(
+        latOff, 5, 0,
+        latOff, 5, 1,
+        latOff, 6, 1,
+        latOff, 5, 0,
+        latOff, 6, 1,
+        latOff, 6, 0
+      );
+    }
+    // Continuous inter-slice ribbon sheet + silhouette rim + ground shadow terminator
+    if (idx > 0) {
+      const prevOff = slices[idx - 1];
+      lineVerts.push(prevOff, 2, 0, latOff, 2, 0);
+      lineVerts.push(prevOff, 3, 0, latOff, 3, 0);
+      quadVerts.push(
+        prevOff, 7, 0,
+        latOff, 7, 0,
+        latOff, 7, 1,
+        prevOff, 7, 0,
+        latOff, 7, 1,
+        prevOff, 7, 1
+      );
+    }
+  });
+
+  const lineGeo = new THREE.BufferGeometry();
+  lineGeo.setAttribute("position", new THREE.Float32BufferAttribute(lineVerts, 3));
+  const lineMesh = new THREE.LineSegments(lineGeo, gpuMonolithGrazingMat);
+  lineMesh.frustumCulled = false;
+  gpuMonolithPersistentGroup.add(lineMesh);
+
+  const quadGeo = new THREE.BufferGeometry();
+  quadGeo.setAttribute("position", new THREE.Float32BufferAttribute(quadVerts, 3));
+  const quadMesh = new THREE.Mesh(quadGeo, gpuMonolithGrazingMat);
+  quadMesh.frustumCulled = false;
+  gpuMonolithPersistentGroup.add(quadMesh);
+}
+
+function syncGpuLightOverlaysDem(heightTex, gridSize, spanM, minZ) {
+  if (gpuValleyLightMat) {
+    gpuValleyLightMat.uniforms.uHeightTex.value = heightTex;
+    gpuValleyLightMat.uniforms.uGridSize.value = gridSize;
+    gpuValleyLightMat.uniforms.uSpanM.value = spanM;
+    gpuValleyLightMat.uniforms.uMinZ.value = minZ;
+  }
+  if (gpuMonolithGrazingMat) {
+    gpuMonolithGrazingMat.uniforms.uHeightTex.value = heightTex;
+    gpuMonolithGrazingMat.uniforms.uGridSize.value = gridSize;
+    gpuMonolithGrazingMat.uniforms.uSpanM.value = spanM;
+    gpuMonolithGrazingMat.uniforms.uMinZ.value = minZ;
+  }
+  _lastValleyGapsKey = "";
+  _lastSunBeamsExtrasKey = "";
+}
+
+function updateValleyLightField(sunDirWorld, elevationDeg) {
   if (!state.terrainPatch || !state.showLightField || elevationDeg <= -2.5) {
     lightFieldGroup.visible = false;
     return;
   }
   lightFieldGroup.visible = true;
+  ensureGpuValleyLightField();
 
-  const propDir = sunDirWorld.clone().negate(); // Sun -> Valley propagation vector
-  const rightVec = new THREE.Vector3(-sunDirWorld.z, 0, sunDirWorld.x).normalize();
-  const halfSpan = state.terrainPatch.span_m * 0.475;
   const isOvercastWithGaps = state.showAtmosphere && activeMeanCloudTau >= 1.35;
-
-  // Color palette shifts smoothly from Dawn/Dusk Blue-Hour Cyan-Amber -> Golden Hour Gold -> Daylight Warm White
   const isBlueHour = elevationDeg < 1.2;
   const isGolden = elevationDeg <= 13.0;
-  const baseR = isBlueHour ? 0.56 : isGolden ? 0.99 : 0.98;
-  const baseG = isBlueHour ? 0.74 : isGolden ? 0.76 : 0.93;
-  const baseB = isBlueHour ? 0.98 : isGolden ? 0.30 : 0.68;
 
-  const grazeR = isBlueHour ? 0.96 : 1.0;
-  const grazeG = isBlueHour ? 0.58 : 0.80;
-  const grazeB = isBlueHour ? 0.36 : 0.32;
-
-  const positions = [];
-  const colors = [];
-  const areaPositions = [];
-  const areaColors = [];
-
-  const pushSegment = (ax, ay, az, ar, ag, ab, aa, bx, by, bz, br, bg, bb, ba) => {
-    positions.push(ax, ay, az, bx, by, bz);
-    colors.push(ar * aa, ag * aa, ab * aa, br * ba, bg * ba, bb * ba);
-  };
-
-  const pushAreaQuad = (
-    ax, ay, az, ar, ag, ab, aa,
-    bx, by, bz, br, bg, bb, ba,
-    cx, cy, cz, cr, cg, cb, ca,
-    dx, dy, dz, dr, dg, db, da
-  ) => {
-    areaPositions.push(
-      ax, ay, az, bx, by, bz, cx, cy, cz,
-      ax, ay, az, cx, cy, cz, dx, dy, dz
-    );
-    areaColors.push(
-      ar * aa, ag * aa, ab * aa,
-      br * ba, bg * ba, bb * ba,
-      cr * ca, cg * ca, cb * ca,
-      ar * aa, ag * aa, ab * aa,
-      cr * ca, cg * ca, cb * ca,
-      dr * da, dg * da, db * da
-    );
-  };
-
-  let prevLaneCrests = [];
-
-  // 35 high-density lateral lanes spanning the entire 8.2 km width of the terrain patch (-4080m to +4080m)
-  for (let latOff = -4080; latOff <= 4080; latOff += 240) {
-    const laneCenter = rightVec.clone().multiplyScalar(latOff);
-    const currLaneCrests = [];
-
-    // Part 1: Detect EVERY shadow-producing ridge/bluff crest along this solar lane across the ENTIRE DEM
-    // and light up every shadow-producing ray BY AREA (modulated by 3D cloud transmittance so solid clouds
-    // physically occlude rays except where a crepuscular cloud hole illuminates the ridge!)
-    const numSamples = 76;
-    const stepD = (halfSpan * 1.92) / numSamples;
-    const dStart = -halfSpan * 0.96;
-    const heights = [];
-    const relScores = [];
-
-    for (let i = 0; i <= numSamples; i++) {
-      const d = dStart + i * stepD;
-      const sx = laneCenter.x + propDir.x * d;
-      const sz = laneCenter.z + propDir.z * d;
-      const ty = sampleLocalTerrainY(sx, -sz);
-      heights.push({ d, sx, sz, ty });
-      relScores.push(ty - d * propDir.y);
-    }
-
-    let runningMaxRel = -Infinity;
-    for (let i = 2; i < numSamples - 2; i++) {
-      const r = relScores[i];
-      const isLocalCrest =
-        r > relScores[i - 1] &&
-        r >= relScores[i - 2] &&
-        r >= relScores[i + 1] &&
-        r > relScores[i + 2];
-      const clearShadowDropBehind = heights[i].ty - heights[i + 2].ty > 26;
-
-      if (isLocalCrest && clearShadowDropBehind && r > runningMaxRel - 18) {
-        runningMaxRel = Math.max(runningMaxRel, r);
-        const crest = heights[i];
-        const originY = crest.ty + 5.0;
-
-        // Incoming Beer-Lambert transmittance through 3D clouds to this ridge crest
-        const crestCloudTrans = integrateSolarCloudTransmittance(
-          crest.sx,
-          originY,
-          crest.sz,
-          sunDirWorld,
-          false
-        );
-
-        // Under thick overcast, if a ridge crest is completely in deep cloud shadow (< 0.16),
-        // the sun ray was physically stopped by the 3D cloud deck above!
-        if (isOvercastWithGaps && crestCloudTrans < 0.16) {
-          continue;
-        }
-
-        const upDist = 850;
-        const upX = crest.sx - propDir.x * upDist;
-        const upY = originY - propDir.y * upDist;
-        const upZ = crest.sz - propDir.z * upDist;
-        pushSegment(
-          upX, upY, upZ, baseR, baseG, baseB, 0.05 * crestCloudTrans,
-          crest.sx, originY, crest.sz, grazeR, grazeG, grazeB, 0.44 * crestCloudTrans
-        );
-
-        let prevX = crest.sx;
-        let prevY = originY;
-        let prevZ = crest.sz;
-        let prevAlpha = 0.44 * crestCloudTrans;
-        let rayCloudTau = 0.0;
-        let endX = crest.sx;
-        let endY = originY;
-        let endZ = crest.sz;
-        const ribbonHeightM = 68.0;
-
-        for (let marchD = 140; marchD <= 3600; marchD += 140) {
-          const nx = crest.sx + propDir.x * marchD;
-          const ny = originY + propDir.y * marchD;
-          const nz = crest.sz + propDir.z * marchD;
-          if (Math.abs(nx) > halfSpan || Math.abs(nz) > halfSpan) break;
-
-          const localSigma = sample3DCloudExtinction(nx, ny, nz);
-          rayCloudTau += localSigma * 0.14;
-          const beerLambert = Math.exp(-rayCloudTau);
-          const mieBoost = localSigma > 0.15 && rayCloudTau < 0.85 ? 1.32 : 1.0;
-
-          const groundY = sampleLocalTerrainY(nx, -nz);
-          const clearance = ny - groundY;
-          if (clearance <= 2.5) {
-            endX = nx;
-            endY = groundY + 2.5;
-            endZ = nz;
-            const hitAlpha = 0.36 * crestCloudTrans * beerLambert;
-            pushSegment(
-              prevX, prevY, prevZ, grazeR, grazeG, grazeB, prevAlpha,
-              endX, endY, endZ, grazeR, grazeG, grazeB, hitAlpha
-            );
-            pushAreaQuad(
-              prevX, prevY, prevZ, grazeR, grazeG, grazeB, prevAlpha * 0.36,
-              endX, endY, endZ, grazeR, grazeG, grazeB, hitAlpha * 0.36,
-              endX, endY + ribbonHeightM * 0.45, endZ, baseR, baseG, baseB, 0.01,
-              prevX, prevY + ribbonHeightM, prevZ, baseR, baseG, baseB, 0.02
-            );
-            break;
-          }
-
-          endX = nx;
-          endY = ny;
-          endZ = nz;
-          const fade = Math.max(0.04, 0.38 * (1.0 - marchD / 3800) * crestCloudTrans * beerLambert * mieBoost);
-          pushSegment(
-            prevX, prevY, prevZ, grazeR, grazeG, grazeB, prevAlpha,
-            nx, ny, nz, grazeR, grazeG, grazeB, fade
-          );
-          pushAreaQuad(
-            prevX, prevY, prevZ, grazeR, grazeG, grazeB, prevAlpha * 0.34,
-            nx, ny, nz, grazeR, grazeG, grazeB, fade * 0.34,
-            nx, ny + ribbonHeightM, nz, baseR, baseG, baseB, 0.015,
-            prevX, prevY + ribbonHeightM, prevZ, baseR, baseG, baseB, 0.015
-          );
-
-          prevX = nx;
-          prevY = ny;
-          prevZ = nz;
-          prevAlpha = fade;
-          if (beerLambert < 0.08) break;
-        }
-
-        const cRec = {
-          d: crest.d,
-          sx: crest.sx,
-          sy: originY,
-          sz: crest.sz,
-          ex: endX,
-          ey: endY,
-          ez: endZ,
-          trans: crestCloudTrans,
-        };
-        currLaneCrests.push(cRec);
-
-        for (const pRec of prevLaneCrests) {
-          if (Math.abs(pRec.d - cRec.d) < 560 && Math.abs(pRec.sy - cRec.sy) < 185) {
-            const sheetAlpha = 0.16 * Math.min(pRec.trans, cRec.trans);
-            const endAlpha = 0.08 * Math.min(pRec.trans, cRec.trans);
-            pushAreaQuad(
-              pRec.sx, pRec.sy, pRec.sz, grazeR, grazeG, grazeB, sheetAlpha,
-              cRec.sx, cRec.sy, cRec.sz, grazeR, grazeG, grazeB, sheetAlpha,
-              cRec.ex, cRec.ey, cRec.ez, baseR, baseG, baseB, endAlpha,
-              pRec.ex, pRec.ey, pRec.ez, baseR, baseG, baseB, endAlpha
-            );
-            pushSegment(
-              pRec.sx, pRec.sy, pRec.sz, grazeR, grazeG, grazeB, 0.52 * pRec.trans,
-              cRec.sx, cRec.sy, cRec.sz, grazeR, grazeG, grazeB, 0.52 * cRec.trans
-            );
-            pushSegment(
-              pRec.ex, pRec.ey, pRec.ez, grazeR, grazeG, grazeB, 0.44 * pRec.trans,
-              cRec.ex, cRec.ey, cRec.ez, grazeR, grazeG, grazeB, 0.44 * cRec.trans
-            );
-            break;
-          }
-        }
-      }
-    }
-    prevLaneCrests = currLaneCrests;
-
-    // Part 2: Upper-atmosphere solar rays hitting the TOP of the 3D cloud deck and being occluded by cloud opacity!
-    if (Math.abs(latOff) % 720 === 0) {
-      const startY = 1350;
-      let prevX = laneCenter.x + propDir.x * dStart;
-      let prevZ = laneCenter.z + propDir.z * dStart;
-      let prevY = startY - propDir.y * dStart * 0.35;
-      let streamTau = 0.0;
-
-      for (let i = 1; i <= numSamples; i++) {
-        const d = dStart + i * stepD;
-        const nx = laneCenter.x + propDir.x * d;
-        const nz = laneCenter.z + propDir.z * d;
-        const ny = prevY + propDir.y * stepD;
-        if (Math.abs(nx) > halfSpan || Math.abs(nz) > halfSpan) break;
-
-        const sigma = sample3DCloudExtinction(nx, ny, nz);
-        const enteringCloud = sigma > 0.32 && streamTau < 0.22;
-        streamTau += sigma * (stepD / 1000.0) * (isOvercastWithGaps ? 2.4 : 1.0);
-        const trans = Math.exp(-streamTau);
-
-        const ty = sampleLocalTerrainY(nx, -nz);
-        if (ny <= ty + 3.0) {
-          pushSegment(
-            prevX, prevY, prevZ, baseR, baseG, baseB, 0.06 * trans,
-            nx, ty + 3.0, nz, grazeR, grazeG, grazeB, 0.14 * trans
-          );
-          break;
-        }
-
-        const segAlpha = (enteringCloud ? 0.24 : 0.045) * trans;
-        const segR = enteringCloud ? grazeR : baseR;
-        const segG = enteringCloud ? grazeG : baseG;
-        const segB = enteringCloud ? grazeB : baseB;
-        pushSegment(
-          prevX, prevY, prevZ, segR, segG, segB, segAlpha,
-          nx, ny, nz, segR, segG, segB, segAlpha
-        );
-        prevX = nx;
-        prevY = ny;
-        prevZ = nz;
-        if (trans < 0.05) break; // Ray is physically occluded inside the 3D cloud volume!
-      }
-    }
+  // Update GPU Valley Light-Field uniforms in O(1) (0.002 ms CPU, zero geometry rebuild!)
+  const u = gpuValleyLightMat.uniforms;
+  if (terrainShaderMaterial?.uniforms?.uHeightTex?.value) {
+    u.uHeightTex.value = terrainShaderMaterial.uniforms.uHeightTex.value;
   }
+  u.uGridSize.value = state.terrainPatch.grid_size;
+  u.uSpanM.value = state.terrainPatch.span_m;
+  u.uMinZ.value = state.terrainPatch.min_elevation_m;
+  u.uCloudDomainM.value = volumetricEngine.telemetry.domainXyM || 18000.0;
+  u.uUseFluidShadows.value = state.showAtmosphere ? 1.0 : 0.0;
+  u.uSunDirWorld.value.copy(sunDirWorld);
+  u.uBaseColor.value.setRGB(
+    isBlueHour ? 0.56 : isGolden ? 0.99 : 0.98,
+    isBlueHour ? 0.74 : isGolden ? 0.76 : 0.93,
+    isBlueHour ? 0.98 : isGolden ? 0.30 : 0.68
+  );
+  u.uGrazeColor.value.setRGB(
+    isBlueHour ? 0.96 : 1.0,
+    isBlueHour ? 0.58 : 0.80,
+    isBlueHour ? 0.36 : 0.32
+  );
+  u.uIsOvercast.value = isOvercastWithGaps ? 1.0 : 0.0;
 
-  // Part 3: True 3D Crepuscular "God Rays" Peeking Through Carved 3D Cloud Holes (activeCloudGaps)
-  // Every 3D hole in the thick cloud deck emits a focused bundle of volumetric sunbeam cones, area-lit curtains,
-  // sharp boundary rays, and a glowing golden spotlight ring on the ocean/terrain at the EXACT coaxial slant angle!
-  if (state.showAtmosphere && activeCloudGaps.length > 0 && elevationDeg > -1.5) {
-    const horizLen = Math.max(0.01, Math.hypot(sunDirWorld.x, sunDirWorld.z));
-    const slantDx = (-sunDirWorld.x / horizLen) * CLOUD_SLANT_FACTOR;
-    const slantDz = (-sunDirWorld.z / horizLen) * CLOUD_SLANT_FACTOR;
-    const perpX = -slantDz / CLOUD_SLANT_FACTOR;
-    const perpZ = slantDx / CLOUD_SLANT_FACTOR;
+  // Rebuild discrete 3D Crepuscular Cloud-Gap cones ONLY when gaps/azimuth quantized key changes
+  const showGaps = state.showAtmosphere && activeCloudGaps.length > 0 && elevationDeg > -1.5;
+  if (!showGaps) {
+    gpuValleyGapsGroup.visible = false;
+    return;
+  }
+  gpuValleyGapsGroup.visible = true;
 
-    activeCloudGaps.forEach((gap, gIdx) => {
-      const gapOrigin = new THREE.Vector3(gap.wx, gap.wy, gap.wz);
-      const estGroundY = sampleLocalTerrainY(
-        gap.wx + slantDx * gap.wy,
-        -(gap.wz + slantDz * gap.wy)
+  const gapsKey = `${activeCloudGaps.length}_${activeCloudGaps[0]?.eastM}_${sunDirWorld.x.toFixed(2)}_${sunDirWorld.z.toFixed(2)}_${isGolden ? 1 : 0}_${isOvercastWithGaps ? 1 : 0}`;
+  if (gapsKey === _lastValleyGapsKey) {
+    return;
+  }
+  _lastValleyGapsKey = gapsKey;
+
+  activeGodRayMaterials = [];
+  disposeObjectTree(gpuValleyGapsGroup);
+
+  const horizLen = Math.max(0.01, Math.hypot(sunDirWorld.x, sunDirWorld.z));
+  const slantDx = (-sunDirWorld.x / horizLen) * CLOUD_SLANT_FACTOR;
+  const slantDz = (-sunDirWorld.z / horizLen) * CLOUD_SLANT_FACTOR;
+  const nowSec = performance.now() * 0.001;
+
+  activeCloudGaps.forEach((gap, gIdx) => {
+    const gapOrigin = new THREE.Vector3(gap.wx, gap.wy, gap.wz);
+    const estGroundY = sampleLocalTerrainY(gap.wx + slantDx * gap.wy, -(gap.wz + slantDz * gap.wy));
+    const dropY = Math.max(80, gap.wy - (estGroundY + 3.0));
+    const landX = gap.wx + slantDx * dropY;
+    const landZ = gap.wz + slantDz * dropY;
+    const landY = sampleLocalTerrainY(landX, -landZ) + 3.0;
+    const landPt = new THREE.Vector3(landX, landY, landZ);
+    const beamVec = landPt.clone().sub(gapOrigin);
+    const beamLen = beamVec.length();
+
+    if (beamLen > 60) {
+      const topR = Math.max(120, gap.radiusM * 0.34);
+      const botR = Math.max(240, gap.radiusM * 0.76);
+      const coneGeo = new THREE.CylinderGeometry(topR, botR, beamLen, 24, 1, true);
+      const coneMat = new THREE.ShaderMaterial({
+        vertexShader: GODRAY_VERTEX_SHADER,
+        fragmentShader: GODRAY_FRAGMENT_SHADER,
+        uniforms: {
+          uBeamColor: { value: new THREE.Color(isGolden ? 0xfbbf24 : 0xfde047) },
+          uBaseOpacity: { value: isOvercastWithGaps ? 0.30 : 0.18 },
+          uCloudTime: { value: nowSec },
+          uWindDirENU: { value: activeWindDirENU.clone() },
+        },
+        transparent: true,
+        side: THREE.DoubleSide,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      });
+      activeGodRayMaterials.push(coneMat);
+      const coneMesh = new THREE.Mesh(coneGeo, coneMat);
+      coneMesh.position.copy(gapOrigin).addScaledVector(beamVec, 0.5);
+      coneMesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, -1, 0), beamVec.clone().normalize());
+      gpuValleyGapsGroup.add(coneMesh);
+    }
+
+    if (gIdx < 2) {
+      const gapBadge = makeTextSprite(
+        `☀️ CLOUD BREAK #${gIdx + 1} (${gap.transmittancePct}% Ray Pass • τ=${gap.tau})`,
+        "#0f172a",
+        "#fbbf24",
+        "#fef3c7"
       );
-      const dropY = Math.max(80, gap.wy - (estGroundY + 3.0));
-      const landX = gap.wx + slantDx * dropY;
-      const landZ = gap.wz + slantDz * dropY;
-      const landY = sampleLocalTerrainY(landX, -landZ) + 3.0;
-      const landPt = new THREE.Vector3(landX, landY, landZ);
-
-      // 1. Incoming upper solar feeder ray from the Sun striking into the top of the 3D cloud hole
-      const upperEntry = gapOrigin.clone().addScaledVector(sunDirWorld, 2400);
-      pushSegment(
-        upperEntry.x, upperEntry.y, upperEntry.z, baseR, baseG, baseB, 0.14,
-        gapOrigin.x, gapOrigin.y, gapOrigin.z, grazeR, grazeG, grazeB, 0.72
-      );
-
-      // 2. Volumetric 3D Crepuscular Sunbeam Cone punching down from the 3D cloud hole to the ocean/headland spotlight
-      const beamVec = landPt.clone().sub(gapOrigin);
-      const beamLen = beamVec.length();
-      if (beamLen > 60) {
-        const topR = Math.max(120, gap.radiusM * 0.34);
-        const botR = Math.max(240, gap.radiusM * 0.76);
-        const nowSec = performance.now() * 0.001;
-        const windVec = activeWindDirENU;
-
-        const coneGeo = new THREE.CylinderGeometry(topR, botR, beamLen, 24, 1, true);
-        const coneMat = new THREE.ShaderMaterial({
-          vertexShader: GODRAY_VERTEX_SHADER,
-          fragmentShader: GODRAY_FRAGMENT_SHADER,
-          uniforms: {
-            uBeamColor: { value: new THREE.Color(isGolden ? 0xfbbf24 : 0xfde047) },
-            uBaseOpacity: { value: isOvercastWithGaps ? 0.30 : 0.18 },
-            uCloudTime: { value: nowSec },
-            uWindDirENU: { value: windVec.clone() },
-          },
-          transparent: true,
-          side: THREE.DoubleSide,
-          blending: THREE.AdditiveBlending,
-          depthWrite: false,
-        });
-        activeGodRayMaterials.push(coneMat);
-        const coneMesh = new THREE.Mesh(coneGeo, coneMat);
-        coneMesh.position.copy(gapOrigin).addScaledVector(beamVec, 0.5);
-        coneMesh.quaternion.setFromUnitVectors(
-          new THREE.Vector3(0, -1, 0),
-          beamVec.clone().normalize()
-        );
-        lightFieldGroup.add(coneMesh);
-
-        // Inner high-intensity core shaft inside the crepuscular cloud-gap cone
-        const coreGeo = new THREE.CylinderGeometry(topR * 0.42, botR * 0.46, beamLen, 20, 1, true);
-        const coreMat = new THREE.ShaderMaterial({
-          vertexShader: GODRAY_VERTEX_SHADER,
-          fragmentShader: GODRAY_FRAGMENT_SHADER,
-          uniforms: {
-            uBeamColor: { value: new THREE.Color(0xfef08a) },
-            uBaseOpacity: { value: isOvercastWithGaps ? 0.38 : 0.22 },
-            uCloudTime: { value: nowSec },
-            uWindDirENU: { value: windVec.clone() },
-          },
-          transparent: true,
-          side: THREE.DoubleSide,
-          blending: THREE.AdditiveBlending,
-          depthWrite: false,
-        });
-        activeGodRayMaterials.push(coreMat);
-        const coreMesh = new THREE.Mesh(coreGeo, coreMat);
-        coreMesh.position.copy(coneMesh.position);
-        coreMesh.quaternion.copy(coneMesh.quaternion);
-        lightFieldGroup.add(coreMesh);
-      }
-
-      // 3. Fan of 9 terrain-checked crepuscular rays + lit area curtains across the cloud hole diameter
-      let prevRayTop = null;
-      let prevRayBot = null;
-      for (let s = -4; s <= 4; s++) {
-        const frac = s / 4.0;
-        const topOff = frac * gap.radiusM * 0.42;
-        const botOff = frac * gap.radiusM * 0.78;
-        const rTop = new THREE.Vector3(
-          gap.wx + perpX * topOff,
-          gap.wy,
-          gap.wz + perpZ * topOff
-        );
-        let rBot = new THREE.Vector3(
-          landX + perpX * botOff,
-          landY,
-          landZ + perpZ * botOff
-        );
-
-        // Check if this individual ray in the crepuscular fan hits an intervening bluff/ridge on the way down
-        for (let step = 1; step <= 18; step++) {
-          const t = step / 18.0;
-          const sx = rTop.x + (rBot.x - rTop.x) * t;
-          const sy = rTop.y + (rBot.y - rTop.y) * t;
-          const sz = rTop.z + (rBot.z - rTop.z) * t;
-          if (Math.abs(sx) <= halfSpan && Math.abs(sz) <= halfSpan) {
-            const ty = sampleLocalTerrainY(sx, -sz);
-            if (sy <= ty + 3.0) {
-              rBot = new THREE.Vector3(sx, ty + 3.0, sz);
-              break;
-            }
-          }
-        }
-
-        const edgeBoost = Math.abs(s) === 4 || s === 0 ? 0.86 : 0.54;
-        pushSegment(
-          rTop.x, rTop.y, rTop.z, grazeR, grazeG, grazeB, edgeBoost,
-          rBot.x, rBot.y, rBot.z, grazeR, grazeG, grazeB, edgeBoost * 0.88
-        );
-
-        if (prevRayTop && prevRayBot) {
-          pushAreaQuad(
-            prevRayTop.x, prevRayTop.y, prevRayTop.z, grazeR, grazeG, grazeB, 0.26,
-            rTop.x, rTop.y, rTop.z, grazeR, grazeG, grazeB, 0.26,
-            rBot.x, rBot.y, rBot.z, baseR, baseG, baseB, 0.18,
-            prevRayBot.x, prevRayBot.y, prevRayBot.z, baseR, baseG, baseB, 0.18
-          );
-        }
-        prevRayTop = rTop;
-        prevRayBot = rBot;
-      }
-
-      // 4. Glowing golden spotlight perimeter ring on the ocean/terrain surface + 3D Cloud-Hole Rim Ring
-      const ringPts = [];
-      const holePts = [];
-      const spotR = Math.max(240, gap.radiusM * 0.76);
-      const holeR = Math.max(150, gap.radiusM * 0.45);
-      for (let a = 0; a <= 28; a++) {
-        const ang = (a / 28) * Math.PI * 2;
-        const cx = landX + Math.cos(ang) * spotR;
-        const cz = landZ + Math.sin(ang) * spotR;
-        const cy = sampleLocalTerrainY(cx, -cz) + 4.5;
-        ringPts.push(new THREE.Vector3(cx, cy, cz));
-        holePts.push(
-          new THREE.Vector3(
-            gap.wx + Math.cos(ang) * holeR,
-            gap.wy - 12,
-            gap.wz + Math.sin(ang) * holeR
-          )
-        );
-      }
-      for (let a = 0; a < 28; a++) {
-        pushSegment(
-          ringPts[a].x, ringPts[a].y, ringPts[a].z, grazeR, grazeG, grazeB, 0.78,
-          ringPts[a + 1].x, ringPts[a + 1].y, ringPts[a + 1].z, grazeR, grazeG, grazeB, 0.78
-        );
-        pushSegment(
-          holePts[a].x, holePts[a].y, holePts[a].z, 1.0, 0.85, 0.38, 0.82,
-          holePts[a + 1].x, holePts[a + 1].y, holePts[a + 1].z, 1.0, 0.85, 0.38, 0.82
-        );
-      }
-
-      if (gIdx < 2) {
-        const gapBadge = makeTextSprite(
-          `☀️ CLOUD BREAK #${gIdx + 1} (${gap.transmittancePct}% Ray Pass • τ=${gap.tau})`,
-          "#0f172a",
-          "#fbbf24",
-          "#fef3c7"
-        );
-        gapBadge.scale.set(440, 88, 1);
-        gapBadge.position.set(gap.wx, gap.wy + 170, gap.wz);
-        lightFieldGroup.add(gapBadge);
-      }
-    });
-  }
-
-  if (areaPositions.length > 0) {
-    const areaGeo = new THREE.BufferGeometry();
-    areaGeo.setAttribute("position", new THREE.Float32BufferAttribute(areaPositions, 3));
-    areaGeo.setAttribute("color", new THREE.Float32BufferAttribute(areaColors, 3));
-    const areaMat = new THREE.MeshBasicMaterial({
-      vertexColors: true,
-      transparent: true,
-      opacity: 1.0,
-      side: THREE.DoubleSide,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-    });
-    lightFieldGroup.add(new THREE.Mesh(areaGeo, areaMat));
-  }
-
-  if (positions.length > 0) {
-    const fieldGeo = new THREE.BufferGeometry();
-    fieldGeo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-    fieldGeo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
-    const fieldMat = new THREE.LineBasicMaterial({
-      vertexColors: true,
-      transparent: true,
-      opacity: 1.0,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-    });
-    lightFieldGroup.add(new THREE.LineSegments(fieldGeo, fieldMat));
-  }
+      gapBadge.scale.set(440, 88, 1);
+      gapBadge.position.set(gap.wx, gap.wy + 170, gap.wz);
+      gpuValleyGapsGroup.add(gapBadge);
+    }
+  });
 }
 
 // ============================================================================
@@ -2202,6 +2332,10 @@ function updateSunRaysAndShader() {
     terrainShaderMaterial.uniforms.uHighlightZone.value = state.highlightLandingZone ? 1.0 : 0.0;
     terrainShaderMaterial.uniforms.uShowViewshed.value = state.showViewshed ? 1.0 : 0.0;
     terrainShaderMaterial.uniforms.uSurfaceStyle.value = state.surfaceStyle;
+    volumetricEngine.updateTerrainBakeUniforms({
+      sunDirENU: terrainShaderMaterial.uniforms.uSunDirENU.value,
+      showViewshed: state.showViewshed,
+    });
   }
 
   // Compute Lunar Ephemeris Vector for Nocturnal Cloud Scattering & Sky Dome Lunar Disk
@@ -2294,476 +2428,277 @@ function updateSunRaysAndShader() {
     scene.fog.color.setHex(0x4a72a8);
   }
 
-  // Rebuild Valley-Wide 3D Solar Light Field when enabled
+  // Update Valley-Wide 3D Solar Light Field on GPU when enabled
   updateValleyLightField(sunDirWorld, elevationDeg);
 
-  // Rebuild optional analytical sun-ray shafts & sky corridor gates (only when visible!)
-  disposeObjectTree(sunBeamsGroup);
+  // Update GPU-driven Monolith Grazing Crepuscular Silhouettes & Sky Corridor Gates
+  ensureGpuMonolithGrazing();
 
   const astroDisclosureEl = document.getElementById("astro-disclosure");
   const shouldBuildSunBeams =
     state.showSunBeams || Boolean(weatherDisclosure?.open) || Boolean(astroDisclosureEl?.open);
 
-  if (shouldBuildSunBeams && state.shootReport && state.terrainPatch && elevationDeg > -1.0) {
+  const hasDaySunBeams = Boolean(
+    shouldBuildSunBeams && state.shootReport && state.terrainPatch && elevationDeg > -1.0
+  );
+  gpuMonolithPersistentGroup.visible = hasDaySunBeams;
+
+  if (hasDaySunBeams) {
     const lm = state.shootReport.target_landmark;
     const targetWorld = latLonElevToWorld(lm.upper_face_lat, lm.upper_face_lon, lm.upper_face_z_m);
-    const SUN_DIST_M = 34000;
     const isGolden = elevationDeg <= 12.5;
-
-    // Terrain-Occluded Crepuscular Ray-Caster (analytical diagnostic overlay)
-    const propDir = sunDirWorld.clone().negate();
-    const rightVec = new THREE.Vector3(-sunDirWorld.z, 0, sunDirWorld.x).normalize();
-    const halfSpan = state.terrainPatch.span_m * 0.485;
-    const beamColorHex = isGolden ? 0xfbbf24 : 0xfde047;
-    const edgeColorHex = isGolden ? 0xf59e0b : 0xfef08a;
-
     const isOvercast = state.showAtmosphere && activeMeanCloudTau >= 1.35;
 
-    // A. Blocked rays that originate at the distant 34 km Sun:
-    //    When thick 3D clouds are present, these rays physically terminate on the TOP surface of the 3D cloud deck!
-    const blockedLateralOffsets = [-160, 0, 160];
-    blockedLateralOffsets.forEach((latOff) => {
-      const aimPt = targetWorld
-        .clone()
-        .addScaledVector(rightVec, latOff)
-        .add(new THREE.Vector3(0, isOvercast ? 680 : -145, 0));
-      const srcPt = aimPt.clone().addScaledVector(sunDirWorld, SUN_DIST_M);
-      let impactPt = aimPt.clone();
-      if (!isOvercast) {
-        for (let d = -1200; d <= 200; d += 25) {
-          const p = aimPt.clone().addScaledVector(propDir, d);
-          const ty = sampleLocalTerrainY(p.x, -p.z);
-          if (p.y <= ty + 3.0) {
-            impactPt = new THREE.Vector3(p.x, ty + 3.0, p.z);
-            break;
-          }
-        }
-      }
-      const blockedCurve = new THREE.LineCurve3(srcPt, impactPt);
-      const blockedGeo = new THREE.TubeGeometry(blockedCurve, 8, 9, 8, false);
-      const blockedMat = new THREE.MeshBasicMaterial({
-        color: beamColorHex,
-        transparent: true,
-        opacity: isOvercast ? 0.11 : 0.16,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-      });
-      sunBeamsGroup.add(new THREE.Mesh(blockedGeo, blockedMat));
-    });
-
-    // B. Sample 37 high-density lateral slices across the monolith & flanking ridges to find the exact 3D grazing silhouette
-    const sliceOffsets = [];
-    for (let s = -1260; s <= 1260; s += 70) {
-      sliceOffsets.push(s);
+    const mu = gpuMonolithGrazingMat.uniforms;
+    if (terrainShaderMaterial?.uniforms?.uHeightTex?.value) {
+      mu.uHeightTex.value = terrainShaderMaterial.uniforms.uHeightTex.value;
     }
-
-    const grazingSlices = sliceOffsets.map((latOff) => {
-      const sliceBase = targetWorld.clone().addScaledVector(rightVec, latOff);
-      let bestRelativeScore = -Infinity;
-      let crestPt = sliceBase.clone();
-
-      // Search along the solar ray path near the monolith (-650m to +650m) for the highest horizon-occluding edge
-      for (let d = -650; d <= 650; d += 32) {
-        const samplePos = sliceBase.clone().addScaledVector(propDir, d);
-        if (Math.abs(samplePos.x) > halfSpan || Math.abs(samplePos.z) > halfSpan) continue;
-        const ty = sampleLocalTerrainY(samplePos.x, -samplePos.z);
-        // Score relative to the sloping solar ray plane so we find the true tangency/grazing crest
-        const relScore = ty - d * propDir.y;
-        if (relScore > bestRelativeScore) {
-          bestRelativeScore = relScore;
-          crestPt = new THREE.Vector3(samplePos.x, ty, samplePos.z);
-        }
-      }
-
-      // Start the grazing ray 7m above the silhouette edge, originating from the distant 34 km Sun, and march 4,300m PAST the interfering object
-      const grazeOrigin = crestPt.clone().add(new THREE.Vector3(0, 7, 0));
-      const uprangeSource = grazeOrigin.clone().addScaledVector(sunDirWorld, SUN_DIST_M);
-      let leewardEnd = grazeOrigin.clone().addScaledVector(propDir, 4200);
-      let touchedLeewardTerrain = false;
-
-      for (let d = 60; d <= 4200; d += 40) {
-        const p = grazeOrigin.clone().addScaledVector(propDir, d);
-        if (Math.abs(p.x) > halfSpan || Math.abs(p.z) > halfSpan) {
-          leewardEnd = p;
-          break;
-        }
-        const ty = sampleLocalTerrainY(p.x, -p.z);
-        if (p.y <= ty + 2.5) {
-          leewardEnd = new THREE.Vector3(p.x, ty + 3.0, p.z);
-          touchedLeewardTerrain = true;
-          break;
-        }
-      }
-
-      const cloudTrans = integrateSolarCloudTransmittance(
-        grazeOrigin.x,
-        grazeOrigin.y,
-        grazeOrigin.z,
-        sunDirWorld,
-        false
-      );
-
-      return {
-        latOff,
-        crestPt: grazeOrigin,
-        uprangeSource,
-        leewardEnd,
-        touchedLeewardTerrain,
-        cloudTrans,
-      };
-    });
-
-    // C. Render sharp post-occlusion crepuscular lines, vertical & horizontal lit area sheets, and terminator border
-    const ribbonPositions = [];
-    const verticalCurtainPositions = [];
-    const crestLinePts = [];
-    const terminatorLinePts = [];
-    let sumCloudTrans = 0.0;
-
-    grazingSlices.forEach((slice, idx) => {
-      crestLinePts.push(slice.crestPt);
-      terminatorLinePts.push(slice.leewardEnd);
-      const rawTrans = slice.cloudTrans ?? 1.0;
-      sumCloudTrans += rawTrans;
-      const ct = isOvercast ? rawTrans : (0.25 + 0.75 * rawTrans);
-
-      // 1. Sharp crepuscular shadow-boundary line cast from the grazing rock edge into the leeward valley
-      const edgeLineGeo = new THREE.BufferGeometry().setFromPoints([
-        slice.crestPt,
-        slice.leewardEnd,
-      ]);
-      const isCenterOrFlank = idx % 2 === 0 || Math.abs(slice.latOff) <= 280;
-      const edgeLineMat = new THREE.LineBasicMaterial({
-        color: isCenterOrFlank ? edgeColorHex : beamColorHex,
-        transparent: true,
-        opacity: (isCenterOrFlank ? 0.82 : 0.48) * ct,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-      });
-      sunBeamsGroup.add(new THREE.Line(edgeLineGeo, edgeLineMat));
-
-      // 2. Vertical lit-area curtain along the shadow-producing ray (highlights the sunlit plane directly above the shadow boundary)
-      if (idx % 2 === 0 && ct > 0.14) {
-        const a = slice.crestPt;
-        const b = slice.leewardEnd;
-        const hTop = 85;
-        verticalCurtainPositions.push(
-          a.x, a.y, a.z,
-          b.x, b.y, b.z,
-          b.x, b.y + hTop * 0.55, b.z,
-          a.x, a.y, a.z,
-          b.x, b.y + hTop * 0.55, b.z,
-          a.x, a.y + hTop, a.z
-        );
-      }
-
-      // 3. Full continuous volumetric shaft (only when not blocked by solid 3D overcast deck)
-      if (idx % 3 === 0 && ct > 0.22) {
-        const fullCurve = new THREE.LineCurve3(slice.uprangeSource, slice.leewardEnd);
-        const radius = slice.latOff === 0 ? 15 : 9;
-        const shaftGeo = new THREE.TubeGeometry(fullCurve, 16, radius, 8, false);
-        const shaftMat = new THREE.MeshBasicMaterial({
-          color: beamColorHex,
-          transparent: true,
-          opacity: (slice.latOff === 0 ? 0.28 : 0.14) * ct,
-          blending: THREE.AdditiveBlending,
-          depthWrite: false,
-        });
-        sunBeamsGroup.add(new THREE.Mesh(shaftGeo, shaftMat));
-      }
-
-      // 4. Build continuous crepuscular light-boundary area sheet behind the interfering object between adjacent slices
-      if (idx > 0 && ct > 0.14) {
-        const prev = grazingSlices[idx - 1];
-        const a = prev.crestPt;
-        const b = slice.crestPt;
-        const c = slice.leewardEnd;
-        const d = prev.leewardEnd;
-        ribbonPositions.push(
-          a.x, a.y, a.z,
-          b.x, b.y, b.z,
-          c.x, c.y, c.z,
-          a.x, a.y, a.z,
-          c.x, c.y, c.z,
-          d.x, d.y, d.z
-        );
-      }
-    });
-
-    const meanSliceCt = sumCloudTrans / Math.max(1, grazingSlices.length);
-    const sheetCtScale = isOvercast ? Math.max(0.18, meanSliceCt) : 1.0;
-
-    if (ribbonPositions.length > 0) {
-      const ribbonGeo = new THREE.BufferGeometry();
-      ribbonGeo.setAttribute(
-        "position",
-        new THREE.Float32BufferAttribute(ribbonPositions, 3)
-      );
-      const ribbonMat = new THREE.MeshBasicMaterial({
-        color: beamColorHex,
-        transparent: true,
-        opacity: 0.26 * sheetCtScale,
-        side: THREE.DoubleSide,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-      });
-      sunBeamsGroup.add(new THREE.Mesh(ribbonGeo, ribbonMat));
-    }
-
-    if (verticalCurtainPositions.length > 0) {
-      const vcGeo = new THREE.BufferGeometry();
-      vcGeo.setAttribute(
-        "position",
-        new THREE.Float32BufferAttribute(verticalCurtainPositions, 3)
-      );
-      const vcMat = new THREE.MeshBasicMaterial({
-        color: edgeColorHex,
-        transparent: true,
-        opacity: 0.18 * sheetCtScale,
-        side: THREE.DoubleSide,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-      });
-      sunBeamsGroup.add(new THREE.Mesh(vcGeo, vcMat));
-    }
-
-    // D. Glowing silhouette rim line along the occluding ridge/cliff crest + sharp ground shadow-terminator line
-    if (crestLinePts.length >= 2) {
-      const rimGeo = new THREE.BufferGeometry().setFromPoints(crestLinePts);
-      const rimMat = new THREE.LineBasicMaterial({
-        color: 0xfbbf24,
-        transparent: true,
-        opacity: 0.92,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-      });
-      sunBeamsGroup.add(new THREE.Line(rimGeo, rimMat));
-    }
-
-    if (terminatorLinePts.length >= 2) {
-      const termGeo = new THREE.BufferGeometry().setFromPoints(terminatorLinePts);
-      const termMat = new THREE.LineBasicMaterial({
-        color: 0xf59e0b,
-        transparent: true,
-        opacity: 0.85,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-      });
-      sunBeamsGroup.add(new THREE.Line(termGeo, termMat));
-    }
-
-    // E. If the user clicked a custom tripod point on the terrain, trace the exact solar ray
-    //    passing over any uprange interfering object (e.g. Half Dome) toward that clicked point
-    if (!inspectorCard.hidden && state.customTripodReport) {
-      const rep = state.customTripodReport;
-      const pinWorld = latLonElevToWorld(rep.tripod_lat, rep.tripod_lon, rep.tripod_elevation_m);
-      let maxObstructionScore = -Infinity;
-      let occluderCrest = null;
-
-      // March uprange from the clicked pin toward the sun to find the highest interfering ridge/edge
-      for (let d = 80; d <= 3800; d += 30) {
-        const uPt = pinWorld.clone().addScaledVector(sunDirWorld, d);
-        if (Math.abs(uPt.x) > halfSpan || Math.abs(uPt.z) > halfSpan) break;
-        const ty = sampleLocalTerrainY(uPt.x, -uPt.z);
-        const rayHeightAtD = pinWorld.y + d * sunDirWorld.y;
-        const excess = ty - rayHeightAtD;
-        if (excess > maxObstructionScore) {
-          maxObstructionScore = excess;
-          occluderCrest = new THREE.Vector3(uPt.x, ty + 6, uPt.z);
-        }
-      }
-
-      if (occluderCrest) {
-        const grazeSrc = occluderCrest.clone().addScaledVector(sunDirWorld, SUN_DIST_M);
-        const grazePastPin = occluderCrest.clone().addScaledVector(propDir, 3600);
-        const customRayGeo = new THREE.BufferGeometry().setFromPoints([
-          grazeSrc,
-          occluderCrest,
-          grazePastPin,
-        ]);
-        const customRayMat = new THREE.LineBasicMaterial({
-          color: 0x34d399,
-          transparent: true,
-          opacity: 0.9,
-          blending: THREE.AdditiveBlending,
-          depthWrite: false,
-        });
-        sunBeamsGroup.add(new THREE.Line(customRayGeo, customRayMat));
-      }
-    }
-
-    // F. Render 3D Weather Corridor Cloud Gates (75 km Entry, 18 km Keyhole, 0 km Fog/Inversion Deck)
-    //    along the 34 km solar vector whenever Atmosphere or the Weather Forecast drawer is active
-    const stations = state.weatherReport?.ray_path_stations;
-    if ((state.showAtmosphere || weatherDisclosure?.open) && stations && stations.length === 3) {
-      const st75 = stations[0];
-      const st18 = stations[1];
-      const st0 = stations[2];
-
-      // 18 km Keyhole Gate placed at 10.5 km along the 34 km solar corridor
-      const gate18Pos = targetWorld.clone().addScaledVector(sunDirWorld, 10500);
-      const gate18RingGeo = new THREE.RingGeometry(420, 780, 32);
-      const gate18RingMat = new THREE.MeshBasicMaterial({
-        color: 0x38bdf8,
-        transparent: true,
-        opacity: 0.22,
-        side: THREE.DoubleSide,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-      });
-      const gate18Ring = new THREE.Mesh(gate18RingGeo, gate18RingMat);
-      gate18Ring.position.copy(gate18Pos);
-      gate18Ring.lookAt(targetWorld);
-      sunBeamsGroup.add(gate18Ring);
-
-      const gate18Sprite = makeTextSprite(
-        `18km GATE: ${st18.cloud_low_pct}%L/${st18.cloud_mid_pct}%M/${st18.cloud_high_pct}%H (${st18.gate_transmittance_pct}% PASS)`,
-        "#0f172a",
-        "#38bdf8",
-        "#e0f2fe"
-      );
-      gate18Sprite.scale.set(1150, 235, 1);
-      gate18Sprite.position.copy(gate18Pos).add(new THREE.Vector3(0, 620, 0));
-      sunBeamsGroup.add(gate18Sprite);
-
-      // 75 km Horizon Entry Gate placed at 22.5 km along the 34 km solar corridor
-      const gate75Pos = targetWorld.clone().addScaledVector(sunDirWorld, 22500);
-      const gate75RingGeo = new THREE.RingGeometry(750, 1380, 32);
-      const gate75RingMat = new THREE.MeshBasicMaterial({
-        color: 0xf59e0b,
-        transparent: true,
-        opacity: 0.22,
-        side: THREE.DoubleSide,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-      });
-      const gate75Ring = new THREE.Mesh(gate75RingGeo, gate75RingMat);
-      gate75Ring.position.copy(gate75Pos);
-      gate75Ring.lookAt(targetWorld);
-      sunBeamsGroup.add(gate75Ring);
-
-      const gate75Sprite = makeTextSprite(
-        `75km ENTRY: ${st75.cloud_low_pct}%L/${st75.cloud_mid_pct}%M/${st75.cloud_high_pct}%H (${st75.gate_transmittance_pct}% PASS)`,
-        "#0f172a",
-        "#f59e0b",
-        "#fef3c7"
-      );
-      gate75Sprite.scale.set(1950, 400, 1);
-      gate75Sprite.position.copy(gate75Pos).add(new THREE.Vector3(0, 1100, 0));
-      sunBeamsGroup.add(gate75Sprite);
-
-      // 0 km Marine Inversion / Fog Top 3D Altitude Marker
-      if (inv) {
-        const sign = inv.inversion_delta_t_f >= 0 ? "+" : "";
-        const fogTopLocalY = activeFogTopLocalY;
-        const fogBadgePos = new THREE.Vector3(
-          targetWorld.x + sunDirWorld.x * 1350,
-          fogTopLocalY + 95,
-          targetWorld.z + sunDirWorld.z * 1350
-        );
-        const fogSprite = makeTextSprite(
-          `FOG TOP ${inv.fog_top_ft.toLocaleString()} ft • ΔT ${sign}${inv.inversion_delta_t_f}°F • ${wr.temp_sunset_f}°F (${st0.cloud_high_pct}%H/${st0.cloud_low_pct}%L)`,
-          "#0f172a",
-          "#34d399",
-          "#d1fae5"
-        );
-        fogSprite.scale.set(540, 110, 1);
-        fogSprite.position.copy(fogBadgePos);
-        sunBeamsGroup.add(fogSprite);
-      }
-    }
+    mu.uCloudShadowTex.value = volumetricEngine.getShadowMapTexture();
+    mu.uGridSize.value = state.terrainPatch.grid_size;
+    mu.uSpanM.value = state.terrainPatch.span_m;
+    mu.uMinZ.value = state.terrainPatch.min_elevation_m;
+    mu.uCloudDomainM.value = volumetricEngine.telemetry.domainXyM || 18000.0;
+    mu.uUseFluidShadows.value = state.showAtmosphere ? 1.0 : 0.0;
+    mu.uSunDirWorld.value.copy(sunDirWorld);
+    mu.uTargetWorld.value.copy(targetWorld);
+    mu.uBeamColor.value.setHex(isGolden ? 0xfbbf24 : 0xfde047);
+    mu.uEdgeColor.value.setHex(isGolden ? 0xf59e0b : 0xfef08a);
+    mu.uIsOvercast.value = isOvercast ? 1.0 : 0.0;
   }
 
-  // Render 3D Upper-Atmosphere Jet Stream Streamlines, Aerosol Layer & Lunar/Galactic Vectors
-  // when the user opens the Astrophotography disclosure card or enables Sun Beams at night
+  // Rebuild sparse label sprites / custom tripod ray / night astro streamlines ONLY when dirty
   const astroAtm = state.weatherReport?.astro_atmosphere;
   const astroGeo = state.shootReport?.astro_night_summary;
-  if (
+  const showCorridorGates = Boolean(
+    hasDaySunBeams &&
+      (state.showAtmosphere || weatherDisclosure?.open) &&
+      state.weatherReport?.ray_path_stations?.length === 3
+  );
+  const showNightAstro = Boolean(
     shouldBuildSunBeams &&
-    state.shootReport &&
-    state.terrainPatch &&
-    (astroDisclosureEl?.open || elevationDeg <= -0.5) &&
-    astroAtm
-  ) {
-    const lm = state.shootReport.target_landmark;
-    const targetWorld = latLonElevToWorld(lm.upper_face_lat, lm.upper_face_lon, lm.upper_face_z_m);
+      state.shootReport &&
+      state.terrainPatch &&
+      (astroDisclosureEl?.open || elevationDeg <= -0.5) &&
+      astroAtm
+  );
+  const hasCustomPinRay = Boolean(
+    hasDaySunBeams && !inspectorCard.hidden && state.customTripodReport
+  );
 
-    // 1. Upper-Troposphere 250hPa Jet Stream Current Streamlines (y = targetWorld.y + 1850m)
-    const jetY = targetWorld.y + 1850;
-    const shearAmp = Math.min(180, Math.max(22, astroAtm.vertical_wind_shear_mph * 2.2));
-    for (let lane = -900; lane <= 900; lane += 450) {
-      const streamPts = [];
-      for (let x = -3400; x <= 3400; x += 220) {
-        const waveY = jetY + Math.sin(x * 0.0022 + lane * 0.01) * shearAmp;
-        const waveZ = targetWorld.z + lane + Math.cos(x * 0.0018) * (shearAmp * 0.65);
-        streamPts.push(new THREE.Vector3(targetWorld.x + x, waveY, waveZ));
+  if (!showCorridorGates && !showNightAstro && !hasCustomPinRay) {
+    sunBeamsDynamicExtrasGroup.visible = false;
+  } else {
+    sunBeamsDynamicExtrasGroup.visible = true;
+    const stKey = showCorridorGates
+      ? `${state.weatherReport.ray_path_stations[0].gate_transmittance_pct}_${state.weatherReport.ray_path_stations[1].gate_transmittance_pct}_${Math.round(activeFogTopLocalY)}`
+      : "0";
+    const pinKey = hasCustomPinRay
+      ? `${state.customTripodReport.tripod_lat.toFixed(4)}_${state.customTripodReport.tripod_lon.toFixed(4)}`
+      : "0";
+    const extrasKey = `${state.shootReport?.target_landmark?.name || ""}_${sunDirWorld.x.toFixed(3)}_${sunDirWorld.y.toFixed(3)}_${sunDirWorld.z.toFixed(3)}_${stKey}_${pinKey}_${showNightAstro ? 1 : 0}_${astroAtm?.jet_stream_250hpa_mph || 0}`;
+
+    if (extrasKey !== _lastSunBeamsExtrasKey) {
+      _lastSunBeamsExtrasKey = extrasKey;
+      disposeObjectTree(sunBeamsDynamicExtrasGroup);
+
+      const lm = state.shootReport.target_landmark;
+      const targetWorld = latLonElevToWorld(lm.upper_face_lat, lm.upper_face_lon, lm.upper_face_z_m);
+      const SUN_DIST_M = 34000;
+      const propDir = sunDirWorld.clone().negate();
+      const halfSpan = state.terrainPatch.span_m * 0.485;
+
+      // E. Custom tripod uprange grazing ray
+      if (hasCustomPinRay) {
+        const rep = state.customTripodReport;
+        const pinWorld = latLonElevToWorld(rep.tripod_lat, rep.tripod_lon, rep.tripod_elevation_m);
+        let maxObstructionScore = -Infinity;
+        let occluderCrest = null;
+
+        for (let d = 80; d <= 3800; d += 30) {
+          const uPt = pinWorld.clone().addScaledVector(sunDirWorld, d);
+          if (Math.abs(uPt.x) > halfSpan || Math.abs(uPt.z) > halfSpan) break;
+          const ty = sampleLocalTerrainY(uPt.x, -uPt.z);
+          const rayHeightAtD = pinWorld.y + d * sunDirWorld.y;
+          const excess = ty - rayHeightAtD;
+          if (excess > maxObstructionScore) {
+            maxObstructionScore = excess;
+            occluderCrest = new THREE.Vector3(uPt.x, ty + 6, uPt.z);
+          }
+        }
+
+        if (occluderCrest) {
+          const grazeSrc = occluderCrest.clone().addScaledVector(sunDirWorld, SUN_DIST_M);
+          const grazePastPin = occluderCrest.clone().addScaledVector(propDir, 3600);
+          const customRayGeo = new THREE.BufferGeometry().setFromPoints([
+            grazeSrc,
+            occluderCrest,
+            grazePastPin,
+          ]);
+          const customRayMat = new THREE.LineBasicMaterial({
+            color: 0x34d399,
+            transparent: true,
+            opacity: 0.9,
+            blending: THREE.AdditiveBlending,
+            depthWrite: false,
+          });
+          sunBeamsDynamicExtrasGroup.add(new THREE.Line(customRayGeo, customRayMat));
+        }
       }
-      const streamGeo = new THREE.BufferGeometry().setFromPoints(streamPts);
-      const streamMat = new THREE.LineBasicMaterial({
-        color: 0x818cf8,
-        transparent: true,
-        opacity: 0.55,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-      });
-      sunBeamsGroup.add(new THREE.Line(streamGeo, streamMat));
-    }
 
-    const jetBadge = makeTextSprite(
-      `250hPa JET STREAM (${astroAtm.jet_stream_250hpa_mph} MPH • SEEING ${astroAtm.seeing_score}/100)`,
-      "#0f172a",
-      "#818cf8",
-      "#e0e7ff"
-    );
-    jetBadge.scale.set(460, 88, 1);
-    jetBadge.position.set(targetWorld.x - 450, jetY + 150, targetWorld.z - 250);
-    sunBeamsGroup.add(jetBadge);
+      // F. 3D Weather Corridor Cloud Gates (75 km Entry, 18 km Keyhole, 0 km Fog/Inversion Deck)
+      if (showCorridorGates) {
+        const stations = state.weatherReport.ray_path_stations;
+        const st75 = stations[0];
+        const st18 = stations[1];
+        const st0 = stations[2];
 
-    // 2. Crest-Level CAMS Aerosol Optical Depth (AOD 550nm) & Transparency Badge
-    const hazeColor = astroAtm.aod_550nm < 0.12 ? "#34d399" : "#f59e0b";
-    const hazeBadge = makeTextSprite(
-      `UPPER HAZE / AOD ${astroAtm.aod_550nm} (${astroAtm.transparency_score}% TRANSPARENCY)`,
-      "#0f172a",
-      hazeColor,
-      "#ecfdf5"
-    );
-    hazeBadge.scale.set(450, 86, 1);
-    hazeBadge.position.set(targetWorld.x + 650, targetWorld.y + 820, targetWorld.z + 320);
-    sunBeamsGroup.add(hazeBadge);
+        const gate18Pos = targetWorld.clone().addScaledVector(sunDirWorld, 10500);
+        const gate18RingGeo = new THREE.RingGeometry(420, 780, 32);
+        const gate18RingMat = new THREE.MeshBasicMaterial({
+          color: 0x38bdf8,
+          transparent: true,
+          opacity: 0.22,
+          side: THREE.DoubleSide,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+        });
+        const gate18Ring = new THREE.Mesh(gate18RingGeo, gate18RingMat);
+        gate18Ring.position.copy(gate18Pos);
+        gate18Ring.lookAt(targetWorld);
+        sunBeamsDynamicExtrasGroup.add(gate18Ring);
 
-    // 3. 3D Galactic Core & Lunar Alpenglow / Moon Vectors at Night
-    if (astroGeo) {
-      const gcPeakAz = astroGeo.galactic_core_peak_az_deg ?? 205;
-      const gcPeakEl = astroGeo.galactic_core_peak_el_deg ?? 14;
-      const gcClearDeg = astroGeo.galactic_core_clearance_deg ?? 0;
-      const gcAzRad = (gcPeakAz * Math.PI) / 180;
-      const gcElRad = (Math.max(6, gcPeakEl) * Math.PI) / 180;
-      const gcDirWorld = new THREE.Vector3(
-        Math.sin(gcAzRad) * Math.cos(gcElRad),
-        Math.sin(gcElRad),
-        -Math.cos(gcAzRad) * Math.cos(gcElRad)
-      ).normalize();
-      const gcEnd = targetWorld.clone().addScaledVector(gcDirWorld, 3400);
-      const gcCurve = new THREE.LineCurve3(targetWorld, gcEnd);
-      const gcTube = new THREE.TubeGeometry(gcCurve, 12, 10, 8, false);
-      const gcMat = new THREE.MeshBasicMaterial({
-        color: 0xc084fc,
-        transparent: true,
-        opacity: 0.42,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-      });
-      sunBeamsGroup.add(new THREE.Mesh(gcTube, gcMat));
+        const gate18Sprite = makeTextSprite(
+          `18km GATE: ${st18.cloud_low_pct}%L/${st18.cloud_mid_pct}%M/${st18.cloud_high_pct}%H (${st18.gate_transmittance_pct}% PASS)`,
+          "#0f172a",
+          "#38bdf8",
+          "#e0f2fe"
+        );
+        gate18Sprite.scale.set(1150, 235, 1);
+        gate18Sprite.position.copy(gate18Pos).add(new THREE.Vector3(0, 620, 0));
+        sunBeamsDynamicExtrasGroup.add(gate18Sprite);
 
-      const gcSprite = makeTextSprite(
-        `🌌 GALACTIC CORE (AZ ${gcPeakAz}° • +${gcClearDeg}° CLEAR)`,
-        "#0f172a",
-        "#c084fc",
-        "#f3e8ff"
-      );
-      gcSprite.scale.set(450, 86, 1);
-      gcSprite.position.copy(gcEnd).add(new THREE.Vector3(0, 90, 0));
-      sunBeamsGroup.add(gcSprite);
+        const gate75Pos = targetWorld.clone().addScaledVector(sunDirWorld, 22500);
+        const gate75RingGeo = new THREE.RingGeometry(750, 1380, 32);
+        const gate75RingMat = new THREE.MeshBasicMaterial({
+          color: 0xf59e0b,
+          transparent: true,
+          opacity: 0.22,
+          side: THREE.DoubleSide,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+        });
+        const gate75Ring = new THREE.Mesh(gate75RingGeo, gate75RingMat);
+        gate75Ring.position.copy(gate75Pos);
+        gate75Ring.lookAt(targetWorld);
+        sunBeamsDynamicExtrasGroup.add(gate75Ring);
+
+        const gate75Sprite = makeTextSprite(
+          `75km ENTRY: ${st75.cloud_low_pct}%L/${st75.cloud_mid_pct}%M/${st75.cloud_high_pct}%H (${st75.gate_transmittance_pct}% PASS)`,
+          "#0f172a",
+          "#f59e0b",
+          "#fef3c7"
+        );
+        gate75Sprite.scale.set(1950, 400, 1);
+        gate75Sprite.position.copy(gate75Pos).add(new THREE.Vector3(0, 1100, 0));
+        sunBeamsDynamicExtrasGroup.add(gate75Sprite);
+
+        if (inv) {
+          const sign = inv.inversion_delta_t_f >= 0 ? "+" : "";
+          const fogTopLocalY = activeFogTopLocalY;
+          const fogBadgePos = new THREE.Vector3(
+            targetWorld.x + sunDirWorld.x * 1350,
+            fogTopLocalY + 95,
+            targetWorld.z + sunDirWorld.z * 1350
+          );
+          const fogSprite = makeTextSprite(
+            `FOG TOP ${inv.fog_top_ft.toLocaleString()} ft • ΔT ${sign}${inv.inversion_delta_t_f}°F • ${wr.temp_sunset_f}°F (${st0.cloud_high_pct}%H/${st0.cloud_low_pct}%L)`,
+            "#0f172a",
+            "#34d399",
+            "#d1fae5"
+          );
+          fogSprite.scale.set(540, 110, 1);
+          fogSprite.position.copy(fogBadgePos);
+          sunBeamsDynamicExtrasGroup.add(fogSprite);
+        }
+      }
+
+      // Night Astrophotography Jet Stream Streamlines, AOD Badge & Galactic Core Vector
+      if (showNightAstro) {
+        const jetY = targetWorld.y + 1850;
+        const shearAmp = Math.min(180, Math.max(22, astroAtm.vertical_wind_shear_mph * 2.2));
+        for (let lane = -900; lane <= 900; lane += 450) {
+          const streamPts = [];
+          for (let x = -3400; x <= 3400; x += 220) {
+            const waveY = jetY + Math.sin(x * 0.0022 + lane * 0.01) * shearAmp;
+            const waveZ = targetWorld.z + lane + Math.cos(x * 0.0018) * (shearAmp * 0.65);
+            streamPts.push(new THREE.Vector3(targetWorld.x + x, waveY, waveZ));
+          }
+          const streamGeo = new THREE.BufferGeometry().setFromPoints(streamPts);
+          const streamMat = new THREE.LineBasicMaterial({
+            color: 0x818cf8,
+            transparent: true,
+            opacity: 0.55,
+            blending: THREE.AdditiveBlending,
+            depthWrite: false,
+          });
+          sunBeamsDynamicExtrasGroup.add(new THREE.Line(streamGeo, streamMat));
+        }
+
+        const jetBadge = makeTextSprite(
+          `250hPa JET STREAM (${astroAtm.jet_stream_250hpa_mph} MPH • SEEING ${astroAtm.seeing_score}/100)`,
+          "#0f172a",
+          "#818cf8",
+          "#e0e7ff"
+        );
+        jetBadge.scale.set(460, 88, 1);
+        jetBadge.position.set(targetWorld.x - 450, jetY + 150, targetWorld.z - 250);
+        sunBeamsDynamicExtrasGroup.add(jetBadge);
+
+        const hazeColor = astroAtm.aod_550nm < 0.12 ? "#34d399" : "#f59e0b";
+        const hazeBadge = makeTextSprite(
+          `UPPER HAZE / AOD ${astroAtm.aod_550nm} (${astroAtm.transparency_score}% TRANSPARENCY)`,
+          "#0f172a",
+          hazeColor,
+          "#ecfdf5"
+        );
+        hazeBadge.scale.set(450, 86, 1);
+        hazeBadge.position.set(targetWorld.x + 650, targetWorld.y + 820, targetWorld.z + 320);
+        sunBeamsDynamicExtrasGroup.add(hazeBadge);
+
+        if (astroGeo) {
+          const gcPeakAz = astroGeo.galactic_core_peak_az_deg ?? 205;
+          const gcPeakEl = astroGeo.galactic_core_peak_el_deg ?? 14;
+          const gcClearDeg = astroGeo.galactic_core_clearance_deg ?? 0;
+          const gcAzRad = (gcPeakAz * Math.PI) / 180;
+          const gcElRad = (Math.max(6, gcPeakEl) * Math.PI) / 180;
+          const gcDirWorld = new THREE.Vector3(
+            Math.sin(gcAzRad) * Math.cos(gcElRad),
+            Math.sin(gcElRad),
+            -Math.cos(gcAzRad) * Math.cos(gcElRad)
+          ).normalize();
+          const gcEnd = targetWorld.clone().addScaledVector(gcDirWorld, 3400);
+          const gcCurve = new THREE.LineCurve3(targetWorld, gcEnd);
+          const gcTube = new THREE.TubeGeometry(gcCurve, 12, 10, 8, false);
+          const gcMat = new THREE.MeshBasicMaterial({
+            color: 0xc084fc,
+            transparent: true,
+            opacity: 0.42,
+            blending: THREE.AdditiveBlending,
+            depthWrite: false,
+          });
+          sunBeamsDynamicExtrasGroup.add(new THREE.Mesh(gcTube, gcMat));
+
+          const gcSprite = makeTextSprite(
+            `🌌 GALACTIC CORE (AZ ${gcPeakAz}° • +${gcClearDeg}° CLEAR)`,
+            "#0f172a",
+            "#c084fc",
+            "#f3e8ff"
+          );
+          gcSprite.scale.set(450, 86, 1);
+          gcSprite.position.copy(gcEnd).add(new THREE.Vector3(0, 90, 0));
+          sunBeamsDynamicExtrasGroup.add(gcSprite);
+        }
+      }
     }
   }
 
@@ -3631,38 +3566,57 @@ async function loadLandmarkScenario(customCoord = null) {
 const raycaster = new THREE.Raycaster();
 const pointerNDC = new THREE.Vector2();
 let pointerDownPos = { x: 0, y: 0 };
+let pointerHoverRafPending = false;
+let latestPointerClientX = 0;
+let latestPointerClientY = 0;
 
-function updatePointerNDC(event) {
+function updatePointerNDCFromCoords(clientX, clientY) {
   const rect = renderer.domElement.getBoundingClientRect();
-  pointerNDC.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-  pointerNDC.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+  pointerNDC.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+  pointerNDC.y = -((clientY - rect.top) / rect.height) * 2 + 1;
 }
 
-renderer.domElement.addEventListener("pointermove", (e) => {
-  if (!terrainMeshRef || !state.terrainPatch) return;
-  updatePointerNDC(e);
-  raycaster.setFromCamera(pointerNDC, camera);
+function updatePointerNDC(event) {
+  updatePointerNDCFromCoords(event.clientX, event.clientY);
+}
 
-  // Check if hovering a 3D Viewpoint marker first
-  const vpHits = raycaster.intersectObjects(vpMarkerMeshes, false);
-  if (vpHits.length > 0 && vpHits[0].object.userData?.vpIndex !== undefined) {
-    const vpIdx = vpHits[0].object.userData.vpIndex;
-    const vp = state.shootReport?.top_viewpoints?.[vpIdx];
-    if (vp) {
-      cursorCoordsBar.textContent = `VP${vp.viewpoint_rank}: ${vp.viewpoint_label} (${vp.hike_distance_to_vp_miles} mi) • Click to highlight`;
-      return;
-    }
-  }
+renderer.domElement.addEventListener(
+  "pointermove",
+  (e) => {
+    if (!terrainMeshRef || !state.terrainPatch) return;
+    latestPointerClientX = e.clientX;
+    latestPointerClientY = e.clientY;
+    if (pointerHoverRafPending) return;
+    pointerHoverRafPending = true;
+    requestAnimationFrame(() => {
+      pointerHoverRafPending = false;
+      if (!terrainMeshRef || !state.terrainPatch) return;
+      updatePointerNDCFromCoords(latestPointerClientX, latestPointerClientY);
+      raycaster.setFromCamera(pointerNDC, camera);
 
-  const hits = raycaster.intersectObject(terrainMeshRef, false);
-  if (hits.length > 0) {
-    const { lat, lon, elevM } = worldToLatLonElev(hits[0].point);
-    const elevFt = Math.round(elevM * 3.28084);
-    const actionLabel =
-      state.clickMode === "tripod" ? "Click to inspect sightline" : "Click to set Target";
-    cursorCoordsBar.textContent = `${lat.toFixed(4)}, ${lon.toFixed(4)} • ${elevFt.toLocaleString()} ft • ${actionLabel}`;
-  }
-});
+      // Check if hovering a 3D Viewpoint marker first
+      const vpHits = raycaster.intersectObjects(vpMarkerMeshes, false);
+      if (vpHits.length > 0 && vpHits[0].object.userData?.vpIndex !== undefined) {
+        const vpIdx = vpHits[0].object.userData.vpIndex;
+        const vp = state.shootReport?.top_viewpoints?.[vpIdx];
+        if (vp) {
+          cursorCoordsBar.textContent = `VP${vp.viewpoint_rank}: ${vp.viewpoint_label} (${vp.hike_distance_to_vp_miles} mi) • Click to highlight`;
+          return;
+        }
+      }
+
+      const terrHit = intersectTerrainHeightfield(raycaster.ray);
+      if (terrHit) {
+        const { lat, lon, elevM } = worldToLatLonElev(terrHit.point);
+        const elevFt = Math.round(elevM * 3.28084);
+        const actionLabel =
+          state.clickMode === "tripod" ? "Click to inspect sightline" : "Click to set Target";
+        cursorCoordsBar.textContent = `${lat.toFixed(4)}, ${lon.toFixed(4)} • ${elevFt.toLocaleString()} ft • ${actionLabel}`;
+      }
+    });
+  },
+  { passive: true }
+);
 
 let tripodRequestSeq = 0;
 
@@ -3681,7 +3635,8 @@ renderer.domElement.addEventListener("pointerup", async (e) => {
   updatePointerNDC(e);
   raycaster.setFromCamera(pointerNDC, camera);
 
-  const hits = raycaster.intersectObject(terrainMeshRef, false);
+  const terrHit = intersectTerrainHeightfield(raycaster.ray);
+  const hits = terrHit ? [terrHit] : [];
 
   // 1. Check if the user clicked directly on a 3D Viewpoint Marker Pillar (VP1..VP3)
   const vpHits = raycaster.intersectObjects(vpMarkerMeshes, false);
@@ -3780,10 +3735,17 @@ renderer.domElement.addEventListener("pointerup", async (e) => {
 // ============================================================================
 syncSliderValue(timeScrubber);
 
+let scrubberRafPending = false;
+
 timeScrubber.addEventListener("input", () => {
   state.currentMinutes = parseFloat(timeScrubber.value);
   syncSliderValue(timeScrubber);
-  updateSunRaysAndShader();
+  if (scrubberRafPending) return;
+  scrubberRafPending = true;
+  requestAnimationFrame(() => {
+    scrubberRafPending = false;
+    updateSunRaysAndShader();
+  });
 });
 
 document.getElementById("query-form").addEventListener("submit", (e) => {
@@ -4272,10 +4234,11 @@ volumetricEngine.onTelemetryCallback = (tel) => {
     cirCovEl.textContent = `${highPct}% · ${(tel.maxIceGKg || 0).toFixed(2)} g/kg`;
   }
 
-  const stepStr = (tel.stepMs || 1.2).toFixed(1);
+  const stepStr = (tel.stepMs || 0.28).toFixed(2);
+  const solverTag = tel.gpuFluidActive ? "GPU 128×128×48 Fluid" : "WASM Fluid (Worker)";
   if (fluidPerfBadge) {
     fluidPerfBadge.textContent = `${Math.round(rollingFps)} FPS`;
-    fluidPerfBadge.title = `WASM Fluid Step: ${stepStr} ms (Worker Thread)`;
+    fluidPerfBadge.title = `${solverTag} Step: ${stepStr} ms`;
   }
   if (viewportGpuPill) {
     viewportGpuPill.textContent = `⚡ ${Math.round(rollingFps)} FPS · ${stepStr}ms`;
@@ -4295,14 +4258,60 @@ window.addEventListener("resize", () => {
 });
 
 // ============================================================================
-// Main GPU Volumetric + Rust WASM Render Loop
+// Main GPU Volumetric + Navier-Stokes Render Loop (Paused when Hidden/Offscreen)
 // ============================================================================
 let lastFrameTimeMs = performance.now();
 let fpsAccumFrames = 0;
 let fpsAccumMs = 0;
+let activeAnimRafId = 0;
+let stageIntersecting = true;
+
+function shouldRunRenderLoop() {
+  return !document.hidden && stageIntersecting;
+}
+
+function ensureRenderLoopRunning() {
+  if (activeAnimRafId === 0 && shouldRunRenderLoop()) {
+    lastFrameTimeMs = performance.now();
+    activeAnimRafId = requestAnimationFrame(animate);
+  }
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    if (activeAnimRafId !== 0) {
+      cancelAnimationFrame(activeAnimRafId);
+      activeAnimRafId = 0;
+    }
+  } else {
+    ensureRenderLoopRunning();
+  }
+});
+
+if (typeof IntersectionObserver !== "undefined" && container) {
+  const stageObserver = new IntersectionObserver(
+    (entries) => {
+      for (const entry of entries) {
+        stageIntersecting = entry.isIntersecting;
+      }
+      if (!stageIntersecting && activeAnimRafId !== 0) {
+        cancelAnimationFrame(activeAnimRafId);
+        activeAnimRafId = 0;
+      } else if (stageIntersecting) {
+        ensureRenderLoopRunning();
+      }
+    },
+    { threshold: 0.01 }
+  );
+  stageObserver.observe(container);
+}
 
 function animate(nowMs = performance.now()) {
-  requestAnimationFrame(animate);
+  if (!shouldRunRenderLoop()) {
+    activeAnimRafId = 0;
+    return;
+  }
+  activeAnimRafId = requestAnimationFrame(animate);
 
   const dtMs = Math.min(100, Math.max(0.5, nowMs - lastFrameTimeMs));
   lastFrameTimeMs = nowMs;
@@ -4314,10 +4323,13 @@ function animate(nowMs = performance.now()) {
     rollingFps = (fpsAccumFrames * 1000) / fpsAccumMs;
     fpsAccumFrames = 0;
     fpsAccumMs = 0;
-    const stepStr = (volumetricEngine.telemetry.stepMs || 1.2).toFixed(1);
+    const stepStr = (volumetricEngine.telemetry.stepMs || 0.28).toFixed(2);
+    const solverTag = volumetricEngine.telemetry.gpuFluidActive
+      ? "GPU 128×128×48 Fluid"
+      : "WASM Fluid (Worker)";
     if (fluidPerfBadge) {
       fluidPerfBadge.textContent = `${Math.round(rollingFps)} FPS`;
-      fluidPerfBadge.title = `WASM Fluid Step: ${stepStr} ms (Worker Thread)`;
+      fluidPerfBadge.title = `${solverTag} Step: ${stepStr} ms`;
     }
     if (viewportGpuPill) {
       viewportGpuPill.textContent = `⚡ ${Math.round(rollingFps)} FPS · ${stepStr}ms`;
@@ -4346,5 +4358,5 @@ function animate(nowMs = performance.now()) {
   volumetricEngine.renderPipeline(worldScene, overlayScene, dtRealS, state.showAtmosphere);
 }
 
-animate();
+ensureRenderLoopRunning();
 loadLandmarkScenario();

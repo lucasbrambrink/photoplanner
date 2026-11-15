@@ -1,18 +1,20 @@
 use anyhow::Result;
 use chrono::{DateTime, NaiveDate, Utc};
 use clap::{Parser, Subcommand};
-use pp_raycast::{compute_horizon_profile, compute_shadow_and_light_map, detect_light_notches};
+use pp_raycast::{
+    compute_horizon_profile, compute_shadow_and_light_map, compute_terrain_patch_elevations,
+    detect_light_notches, gpu_backend_info,
+};
 use pp_solar::solar_position;
 use pp_terrain::{
-    meters_per_deg_lon, query_usgs_3dep_1m_tiles, ElevationSurface, HybridTerrain,
-    MaxMipmapGrid1m, SrtmCache, METERS_PER_DEG_LAT,
+    meters_per_deg_lon, query_usgs_3dep_1m_tiles, HybridTerrain, MaxMipmapGrid1m, SrtmCache,
+    METERS_PER_DEG_LAT,
 };
 use pp_trails::{
     analyze_custom_tripod_point, build_itinerary_for_route,
     find_best_viewpoints_and_hikes_for_landmark, find_best_viewpoints_for_seed,
     RecreationDbHarness,
 };
-use rayon::prelude::*;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -277,6 +279,10 @@ fn main() -> Result<()> {
                 az_step_deg
             );
             println!(
+                " Compute Backend : {}",
+                gpu_backend_info().unwrap_or_else(|| "Multi-Core Rayon CPU".to_string())
+            );
+            println!(
                 " Performance     : Pyramid Build = {:.1} ms | 360° Ray Sweep = {:.2} ms | Notch + Ephemeris Solver = {:.2} ms",
                 build_ms, ray_ms, notch_ms
             );
@@ -513,6 +519,10 @@ fn main() -> Result<()> {
                 );
             }
             println!(
+                " Compute Backend : {}",
+                gpu_backend_info().unwrap_or_else(|| "Multi-Core Rayon CPU".to_string())
+            );
+            println!(
                 " Performance     : Ray-Cast Render = {:.1} ms (Total w/ 1m Pyramid = {:.1} ms)",
                 cast_ms, total_ms
             );
@@ -581,6 +591,10 @@ fn main() -> Result<()> {
                 lm.summit_elevation_m,
                 lm.vertical_relief_ft,
                 lm.vertical_relief_m
+            );
+            println!(
+                " Compute Backend : {}",
+                gpu_backend_info().unwrap_or_else(|| "Multi-Core Rayon CPU".to_string())
             );
             println!(
                 " Primary Face    : Aspect {:.1}° | Scanned {} routes ({} trail vertices) in {:.1} ms",
@@ -691,35 +705,10 @@ fn main() -> Result<()> {
             let half_span = span_m * 0.5;
             let step_m = span_m / ((grid_size - 1).max(1) as f64);
 
-            // Parallel row evaluation across all CPU cores via Rayon
-            let rows: Vec<(f64, f64, Vec<f32>)> = (0..grid_size)
-                .into_par_iter()
-                .map(|iy| {
-                    let dy_m = -half_span + (iy as f64) * step_m;
-                    let sample_lat = lat + dy_m / m_per_lat;
-                    let mut row_vals = Vec::with_capacity(grid_size);
-                    let mut r_min = f64::INFINITY;
-                    let mut r_max = f64::NEG_INFINITY;
-                    for ix in 0..grid_size {
-                        let dx_m = -half_span + (ix as f64) * step_m;
-                        let sample_lon = lon + dx_m / m_per_lon;
-                        let z = terrain.elevation_m(sample_lat, sample_lon);
-                        r_min = r_min.min(z);
-                        r_max = r_max.max(z);
-                        row_vals.push((z * 100.0).round() as f32 / 100.0);
-                    }
-                    (r_min, r_max, row_vals)
-                })
-                .collect();
-
-            let mut elevations = Vec::with_capacity(grid_size * grid_size);
-            let mut min_z = f64::INFINITY;
-            let mut max_z = f64::NEG_INFINITY;
-            for (r_min, r_max, mut r_vals) in rows {
-                min_z = min_z.min(r_min);
-                max_z = max_z.max(r_max);
-                elevations.append(&mut r_vals);
-            }
+            // Evaluate 2D hybrid 1m + SRTM patch on Metal GPU (with automatic Rayon CPU fallback)
+            let _ = half_span;
+            let (min_z, max_z, elevations) =
+                compute_terrain_patch_elevations(&terrain, lat, lon, span_m, grid_size);
 
             if let Some(ref bpath) = bin_out {
                 let header = serde_json::json!({

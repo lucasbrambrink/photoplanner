@@ -1172,11 +1172,12 @@ impl FluidAtmosphere {
                         let xe = agl * (1.0 / 900.0);
                         1.0 / (1.0 + xe + 0.48 * xe * xe)
                     };
-                    let w_target_oro = wave_gain * w_slope * env_decay * wave_phase;
+                    let w_target_oro = wave_gain * w_slope * env_decay * wave_phase
+                        + (0.38 + 0.45 * cape_factor) * ridge_root_col[ij] * env_decay;
 
                     let mut thermal_theta_rate = 0.0_f32;
-                    if agl < 750.0 {
-                        let xs = agl * (1.0 / 280.0);
+                    if agl < 950.0 {
+                        let xs = agl * (1.0 / 320.0);
                         let sfc_weight = 1.0 / (1.0 + xs + 0.48 * xs * xs);
                         thermal_theta_rate = sfc_thermal_col[ij] * sfc_weight;
                     }
@@ -1473,8 +1474,65 @@ impl FluidAtmosphere {
         )
     }
 
-    /// Fused single-backtrace semi-Lagrangian 3D advection for `(u', v', w, theta', qt, qc)`
-    /// plus upper-tropospheric (`z >= 5.6 km`) wind-sheared ice sedimentation (`qi`).
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn minmax8(
+        field: &[f32],
+        c000: usize,
+        c100: usize,
+        c010: usize,
+        c110: usize,
+        c001: usize,
+        c101: usize,
+        c011: usize,
+        c111: usize,
+    ) -> (f32, f32) {
+        let a0 = field[c000].min(field[c100]);
+        let a1 = field[c010].min(field[c110]);
+        let a2 = field[c001].min(field[c101]);
+        let a3 = field[c011].min(field[c111]);
+        let b0 = field[c000].max(field[c100]);
+        let b1 = field[c010].max(field[c110]);
+        let b2 = field[c001].max(field[c101]);
+        let b3 = field[c011].max(field[c111]);
+        (a0.min(a1).min(a2.min(a3)), b0.max(b1).max(b2.max(b3)))
+    }
+
+    #[inline]
+    fn sample_trilinear_with_bounds(field: &[f32], fx: f32, fy: f32, fk: f32) -> (f32, f32, f32) {
+        let xw = fx.rem_euclid(GRID_NX as f32);
+        let yw = fy.rem_euclid(GRID_NY as f32);
+        let kc = fk.clamp(0.0, (GRID_NZ - 1) as f32 - 1.0e-4);
+
+        let xf = xw.floor();
+        let yf = yw.floor();
+        let i0 = xf as usize % GRID_NX;
+        let i1 = (i0 + 1) % GRID_NX;
+        let j0 = yf as usize % GRID_NY;
+        let j1 = (j0 + 1) % GRID_NY;
+        let k0 = (kc.floor() as usize).min(GRID_NZ - 2);
+        let k1 = k0 + 1;
+
+        let c000 = idx3(i0, j0, k0);
+        let c100 = idx3(i1, j0, k0);
+        let c010 = idx3(i0, j1, k0);
+        let c110 = idx3(i1, j1, k0);
+        let c001 = idx3(i0, j0, k1);
+        let c101 = idx3(i1, j0, k1);
+        let c011 = idx3(i0, j1, k1);
+        let c111 = idx3(i1, j1, k1);
+
+        let val = Self::bilerp8(
+            field, c000, c100, c010, c110, c001, c101, c011, c111, xw - xf, yw - yf, kc - k0 as f32,
+        );
+        let (mn, mx) = Self::minmax8(field, c000, c100, c010, c110, c001, c101, c011, c111);
+        (val, mn, mx)
+    }
+
+    /// Fused semi-Lagrangian momentum advection + **Clamped 2nd-Order MacCormack (Predictor-Corrector)**
+    /// scalar advection for `(qt, qc, qi)`!
+    /// Eliminates 1st-order trilinear numerical diffusion so 3D cumulus towers, coastal fog decks,
+    /// lenticular saucers, and 3D cirrus uncinus plumes maintain razor-sharp 3D permanence!
     fn advect_all_fields(&mut self, dt: f32) {
         let dom = self.params.domain_xy_m.max(4000.0);
         let inv_dx = GRID_NX as f32 / dom;
@@ -1483,9 +1541,10 @@ impl FluidAtmosphere {
         let nz_scale = (GRID_NZ - 1) as f32;
         let low_cov = (self.params.low_cloud_pct * 0.01).clamp(0.0, 1.0);
         let mid_cov = (self.params.mid_cloud_pct * 0.01).clamp(0.0, 1.0);
-        let q_amp = 0.16 + 0.12 * low_cov.max(mid_cov);
+        let q_amp = 0.18 + 0.14 * low_cov.max(mid_cov);
 
-        // 1. Fused parcel backtrace for all 6 air/liquid prognostic fields at once!
+        // 1A. Semi-Lagrangian backtrace for momentum/buoyancy `(u', v', w, theta')`
+        //     + MacCormack Predictor (`qt_hat -> scratch_e`, `qc_hat -> scratch_f`)!
         for k in 0..GRID_NZ {
             let z = self.z_levels_m[k];
             let u0 = self.u_bar[k];
@@ -1493,8 +1552,6 @@ impl FluidAtmosphere {
             let qv0 = self.qv_env[k];
 
             for j in 0..GRID_NY {
-                let uy = (j as f32 + 0.5) * (1.0 / GRID_NY as f32);
-                let edge_j = j.min(GRID_NY - 1 - j);
                 for i in 0..GRID_NX {
                     let c = idx3(i, j, k);
                     if self.solid_mask[c] != 0 {
@@ -1555,14 +1612,71 @@ impl FluidAtmosphere {
                         &self.theta_pert, c000, c100, c010, c110, c001, c101, c011, c111, tx, ty,
                         tz,
                     );
-                    let mut qt_val = Self::bilerp8(
+                    self.scratch_e[c] = Self::bilerp8(
                         &self.qt, c000, c100, c010, c110, c001, c101, c011, c111, tx, ty, tz,
                     );
                     self.scratch_f[c] = Self::bilerp8(
                         &self.qc, c000, c100, c010, c110, c001, c101, c011, c111, tx, ty, tz,
                     );
+                }
+            }
+        }
 
-                    // Lateral perimeter sponge relaxation (outermost 3 cells) feeds fresh synoptic moisture
+        // Copy advected velocity/theta back so `scratch_a..d` are free for MacCormack corrector!
+        self.u_pert.copy_from_slice(&self.scratch_a);
+        self.v_pert.copy_from_slice(&self.scratch_b);
+        self.w_vel.copy_from_slice(&self.scratch_c);
+        self.theta_pert.copy_from_slice(&self.scratch_d);
+
+        // 1B. Clamped 2nd-Order MacCormack Corrector on `qt` & `qc`!
+        //     Forward-advect `qt_hat` (`scratch_e`) & `qc_hat` (`scratch_f`) by `+dt * u`, subtract half
+        //     round-trip error, and clamp strictly to the 8-corner departure stencil `[min8, max8]`.
+        for k in 0..GRID_NZ {
+            let z = self.z_levels_m[k];
+            let u0 = self.u_bar[k];
+            let v0 = self.v_bar[k];
+            let qv0 = self.qv_env[k];
+
+            for j in 0..GRID_NY {
+                let uy = (j as f32 + 0.5) * (1.0 / GRID_NY as f32);
+                let edge_j = j.min(GRID_NY - 1 - j);
+                for i in 0..GRID_NX {
+                    let c = idx3(i, j, k);
+                    if self.solid_mask[c] != 0 {
+                        self.scratch_a[c] = qv0 * 0.7;
+                        self.scratch_b[c] = 0.0;
+                        continue;
+                    }
+
+                    let u_tot = u0 + self.u_pert[c];
+                    let v_tot = v0 + self.v_pert[c];
+                    let w_tot = self.w_vel[c];
+
+                    let back_x = i as f32 - dt * u_tot * inv_dx;
+                    let back_y = j as f32 - dt * v_tot * inv_dx;
+                    let back_z = (z - dt * w_tot).clamp(z_base, z_top);
+                    let back_k = altitude_m_to_s(back_z, z_base, z_top) * nz_scale;
+
+                    let fwd_x = i as f32 + dt * u_tot * inv_dx;
+                    let fwd_y = j as f32 + dt * v_tot * inv_dx;
+                    let fwd_z = (z + dt * w_tot).clamp(z_base, z_top);
+                    let fwd_k = altitude_m_to_s(fwd_z, z_base, z_top) * nz_scale;
+
+                    let (_, qt_min, qt_max) =
+                        Self::sample_trilinear_with_bounds(&self.qt, back_x, back_y, back_k);
+                    let (_, qc_min, qc_max) =
+                        Self::sample_trilinear_with_bounds(&self.qc, back_x, back_y, back_k);
+
+                    let qt_check = Self::sample_trilinear(&self.scratch_e, fwd_x, fwd_y, fwd_k);
+                    let qc_check = Self::sample_trilinear(&self.scratch_f, fwd_x, fwd_y, fwd_k);
+
+                    let mut qt_mc = (self.scratch_e[c] + 0.5 * (self.qt[c] - qt_check))
+                        .clamp(qt_min, qt_max);
+                    let qc_mc = (self.scratch_f[c] + 0.5 * (self.qc[c] - qc_check))
+                        .clamp(qc_min, qc_max)
+                        .max(0.0);
+
+                    // Lateral perimeter sponge relaxation (outermost 3 cells) feeds fresh synoptic cloud clusters
                     let edge_dist = i.min(GRID_NX - 1 - i).min(edge_j);
                     if edge_dist < 4 {
                         let ux = (i as f32 + 0.5) * (1.0 / GRID_NX as f32);
@@ -1575,22 +1689,18 @@ impl FluidAtmosphere {
                         );
                         let inflow_qt = (qv0 * (1.0 + q_amp * q_anom)).max(1.0e-6);
                         let w_edge = (4 - edge_dist) as f32 * 0.14;
-                        qt_val = qt_val * (1.0 - w_edge) + inflow_qt * w_edge;
+                        qt_mc = qt_mc * (1.0 - w_edge) + inflow_qt * w_edge;
                     }
-                    self.scratch_e[c] = qt_val;
+                    self.scratch_a[c] = qt_mc;
+                    self.scratch_b[c] = qc_mc;
                 }
             }
         }
+        self.qt.copy_from_slice(&self.scratch_a);
+        self.qc.copy_from_slice(&self.scratch_b);
 
-        self.u_pert.copy_from_slice(&self.scratch_a);
-        self.v_pert.copy_from_slice(&self.scratch_b);
-        self.w_vel.copy_from_slice(&self.scratch_c);
-        self.theta_pert.copy_from_slice(&self.scratch_d);
-        self.qt.copy_from_slice(&self.scratch_e);
-        self.qc.copy_from_slice(&self.scratch_f);
-
-        // 2. Upper-tropospheric 3D Cirrus ice-crystal sedimentation (`z >= 5,600 m` only!)
-        let gen_rate = (dt * 0.024).clamp(0.0, 0.28);
+        // 2. Upper-tropospheric 3D Cirrus ice-crystal MacCormack sedimentation (`z >= 5,600 m` only!)
+        let gen_rate = (dt * 0.022).clamp(0.0, 0.25);
         let jet_u = self.params.wind_250_u;
         let jet_v = self.params.wind_250_v;
         let jet_spd = (jet_u * jet_u + jet_v * jet_v).sqrt().max(1.0);
@@ -1603,6 +1713,8 @@ impl FluidAtmosphere {
             if z < 5600.0 {
                 self.scratch_a[slice_start..slice_start + GRID_NX * GRID_NY].fill(0.0);
                 self.scratch_b[slice_start..slice_start + GRID_NX * GRID_NY].fill(0.0);
+                self.scratch_c[slice_start..slice_start + GRID_NX * GRID_NY].fill(0.0);
+                self.scratch_d[slice_start..slice_start + GRID_NX * GRID_NY].fill(0.0);
                 continue;
             }
             let u0 = self.u_bar[k];
@@ -1618,6 +1730,8 @@ impl FluidAtmosphere {
                     if self.solid_mask[c] != 0 {
                         self.scratch_a[c] = 0.0;
                         self.scratch_b[c] = 0.0;
+                        self.scratch_c[c] = 0.0;
+                        self.scratch_d[c] = 0.0;
                         continue;
                     }
                     let ux = (i as f32 + 0.5) * (1.0 / GRID_NX as f32);
@@ -1629,7 +1743,6 @@ impl FluidAtmosphere {
                         Self::sample_lut2d_periodic(&self.synoptic_lut_ci_band, along, cross);
 
                     let qi_here = self.qi[c];
-                    // Gravitational ice-crystal fall speed (`0.62 .. 1.42 m/s`) traces 3D mares' tails!
                     let v_fall = 0.62 + (qi_here * 2000.0).clamp(0.0, 0.80);
                     let u_tot = u0 + self.u_pert[c];
                     let v_tot = v0 + self.v_pert[c];
@@ -1640,8 +1753,51 @@ impl FluidAtmosphere {
                     let back_z = (z - dt * w_tot).clamp(z_base, z_top);
                     let back_k = altitude_m_to_s(back_z, z_base, z_top) * nz_scale;
 
-                    let mut val = Self::sample_trilinear(&self.qi, back_x, back_y, back_k);
+                    let (qi_hat, qi_min, qi_max) =
+                        Self::sample_trilinear_with_bounds(&self.qi, back_x, back_y, back_k);
+                    self.scratch_a[c] = qi_hat;
+                    self.scratch_c[c] = qi_min;
+                    self.scratch_d[c] = qi_max;
+                }
+            }
+        }
+
+        // Cirrus MacCormack Corrector + upper-tropospheric generating-tuft seeding
+        for k in 0..GRID_NZ {
+            let z = self.z_levels_m[k];
+            let slice_start = k * GRID_NX * GRID_NY;
+            if z < 5600.0 {
+                self.scratch_e[slice_start..slice_start + GRID_NX * GRID_NY].fill(0.0);
+                continue;
+            }
+            let u0 = self.u_bar[k];
+            let v0 = self.v_bar[k];
+            for j in 0..GRID_NY {
+                let uy = (j as f32 + 0.5) * (1.0 / GRID_NY as f32);
+                for i in 0..GRID_NX {
+                    let c = idx3(i, j, k);
+                    if self.solid_mask[c] != 0 {
+                        self.scratch_e[c] = 0.0;
+                        continue;
+                    }
+                    let qi_here = self.qi[c];
+                    let v_fall = 0.62 + (qi_here * 2000.0).clamp(0.0, 0.80);
+                    let u_tot = u0 + self.u_pert[c];
+                    let v_tot = v0 + self.v_pert[c];
+                    let w_tot = self.w_vel[c] - v_fall;
+
+                    let fwd_x = i as f32 + dt * u_tot * inv_dx;
+                    let fwd_y = j as f32 + dt * v_tot * inv_dx;
+                    let fwd_z = (z + dt * w_tot).clamp(z_base, z_top);
+                    let fwd_k = altitude_m_to_s(fwd_z, z_base, z_top) * nz_scale;
+
+                    let qi_check = Self::sample_trilinear(&self.scratch_a, fwd_x, fwd_y, fwd_k);
+                    let mut val = (self.scratch_a[c] + 0.5 * (qi_here - qi_check))
+                        .clamp(self.scratch_c[c], self.scratch_d[c])
+                        .max(0.0);
+
                     if z >= 8400.0 {
+                        let ux = (i as f32 + 0.5) * (1.0 / GRID_NX as f32);
                         let (_, ci_src) = self.sample_synoptic_moisture_perturbation(
                             ux,
                             uy,
@@ -1649,13 +1805,13 @@ impl FluidAtmosphere {
                             k,
                             self.sim_time_s,
                         );
-                        val = val * (1.0 - gen_rate * 0.48) + ci_src * gen_rate;
+                        val = val * (1.0 - gen_rate * 0.52) + ci_src * gen_rate;
                     }
-                    self.scratch_a[c] = val;
+                    self.scratch_e[c] = val;
                 }
             }
         }
-        self.qi.copy_from_slice(&self.scratch_a);
+        self.qi.copy_from_slice(&self.scratch_e);
     }
 
     /// Fused zero-`exp`/zero-`powf` Clausius-Clapeyron liquid saturation adjustment + Koop 3D Cirrus
@@ -1731,36 +1887,36 @@ impl FluidAtmosphere {
                         }
 
                         // 2. Upper-Tropospheric 3D Cirrus Heterogeneous Growth & Sublimation (`z >= 6.0 km`)
-                        // Crucial physics: vapour deposition (`1.01 < RHi < 1.38`) grows ONLY on existing
-                        // ice crystals seeded in discrete generating tufts (`self.qi[c] > 3.0e-6`) or in
-                        // intense standing mountain-wave crests, preserving crisp clear sky lanes!
+                        // Crucial physics: vapour deposition (`1.01 < RHi < 1.38`) grows ONLY inside narrow
+                        // jet-streak filaments (`lane_cube`) or strong mountain-wave crests while dry lanes
+                        // actively sublimate ice so distinct 3D cirrus plumes float in open sky (`~25-58%`)!
                         if z >= 6000.0 && temp_c <= -18.0 {
-                            let ci_lane = self.scratch_b[c]; // [0..1] jet-streak conveyor vs dry subsidence lane
-                            let lane_sq = ci_lane * ci_lane;
+                            let ci_lane = self.scratch_b[c];
+                            let lane_cube = ci_lane * ci_lane * (0.45 + 0.55 * ci_lane);
                             let rhi_env = if z >= 7900.0 {
-                                0.58 + 0.74 * high_cov * lane_sq * ci_boost
-                                    + 0.08 * w_here.clamp(-1.8, 2.8)
+                                0.52 + 0.78 * high_cov * lane_cube * ci_boost
+                                    + 0.07 * w_here.clamp(-2.0, 2.6)
                             } else {
-                                // Drier sub-cirrus shear zone (`6.0..7.9 km`) tapers falling mares' tails!
-                                0.38 + 0.30 * high_cov * lane_sq
+                                // Drier sub-cirrus shear zone (`6.0..7.9 km`) tapers falling mares' tails ethereally!
+                                0.34 + 0.32 * high_cov * lane_cube
                             };
 
-                            let has_ice = self.qi[c] > 4.0e-6;
+                            let has_ice = self.qi[c] > 4.5e-6;
                             let wave_nucleate =
-                                z >= 8800.0 && w_here > 2.5 && rhi_env > 1.16 && high_cov > 0.15;
+                                z >= 8800.0 && w_here > 2.8 && rhi_env > 1.18 && high_cov > 0.15;
 
-                            if (has_ice || wave_nucleate) && rhi_env > 1.01 {
+                            if (has_ice || wave_nucleate) && rhi_env > 1.02 {
                                 let ad_ice = (alpha_ice * dt_k).clamp(-0.68, 0.90);
                                 let qvs_ice = (qvs_ice0
                                     * (1.0 + ad_ice + 0.5 * ad_ice * ad_ice))
                                     .max(1.0e-7);
-                                let dep = (rhi_env - 1.0) * qvs_ice * (dt * 0.024).min(0.24);
-                                self.qi[c] = (self.qi[c] + dep).min(0.42e-3);
+                                let dep = (rhi_env - 1.0) * qvs_ice * (dt * 0.022).min(0.22);
+                                self.qi[c] = (self.qi[c] + dep).min(0.44e-3);
                             } else if self.qi[c] > 0.0 {
                                 let sub_rate =
-                                    ((1.05 - rhi_env).max(0.05) * dt * 0.052).clamp(0.0, 0.68);
+                                    ((1.08 - rhi_env).max(0.06) * dt * 0.065).clamp(0.0, 0.72);
                                 let rem = self.qi[c] * (1.0 - sub_rate);
-                                self.qi[c] = if rem < 4.0e-6 { 0.0 } else { rem };
+                                self.qi[c] = if rem < 4.5e-6 { 0.0 } else { rem };
                             }
                         } else {
                             self.qi[c] = 0.0;

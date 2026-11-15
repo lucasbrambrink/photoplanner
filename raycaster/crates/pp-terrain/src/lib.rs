@@ -607,17 +607,26 @@ impl MaxMipmapGrid1m {
     }
 }
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_HYBRID_TERRAIN_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Hybrid Two-Tier Terrain Pyramid combining:
 /// 1. Near-Field 1-meter `MaxMipmapGrid1m` (0–5 km)
 /// 2. Far-Field 30m/90m `SrtmCache` (5–100 km)
 pub struct HybridTerrain {
+    pub cache_id: u64,
     pub near_1m: Option<MaxMipmapGrid1m>,
     pub far_srtm: SrtmCache,
 }
 
 impl HybridTerrain {
     pub fn new(near_1m: Option<MaxMipmapGrid1m>, far_srtm: SrtmCache) -> Self {
-        Self { near_1m, far_srtm }
+        Self {
+            cache_id: NEXT_HYBRID_TERRAIN_ID.fetch_add(1, Ordering::Relaxed),
+            near_1m,
+            far_srtm,
+        }
     }
 }
 

@@ -8,7 +8,7 @@ const PARAMS_LEN = 23;
 
 async function loadWasmModule(seed = 1337) {
   const t0 = performance.now();
-  const url = new URL('./pkg/pp_wasm.wasm?v=20261114d', self.location.href);
+  const url = new URL('./pkg/pp_wasm.wasm?v=20261115a', self.location.href);
   let instance;
   try {
     const res = await fetch(url);

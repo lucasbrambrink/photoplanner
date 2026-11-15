@@ -751,6 +751,7 @@ input:not(input[type="range"]):user-invalid {
 }
 
 .card {
+  contain: layout style paint;
   background: var(--surface-canvas);
   border: 1px solid var(--border-subtle);
   border-radius: 11px;
