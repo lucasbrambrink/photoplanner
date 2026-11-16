@@ -8,10 +8,22 @@ if (!Object.hasOwn(HTMLElement.prototype, "popover")) {
 }
 
 // ============================================================================
-// Application State (Default to SF Coast / Montara Mountain on Today's Sunset, persisted in localStorage)
+// Application State (Default to SF Coast / Pedro Point on Today's Live Sunset, persisted in localStorage)
 // ============================================================================
+function formatLocalDateISO(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+const nowLocalDate = new Date();
+const todayIso = formatLocalDateISO(nowLocalDate);
+const yesterdayDateObj = new Date(nowLocalDate.getTime() - 86400 * 1000);
+const yesterdayIso = formatLocalDateISO(yesterdayDateObj);
+
 const savedLandmark = localStorage.getItem("pp_landmark_v2") || "Pedro Point Headlands";
-const savedDate = localStorage.getItem("pp_date_v2") || "2026-04-16";
+const savedDate = localStorage.getItem("pp_date_v3") || todayIso;
 
 const state = {
   landmark: savedLandmark,
@@ -302,7 +314,45 @@ spatialCloudTex.wrapS = THREE.ClampToEdgeWrapping;
 spatialCloudTex.wrapT = THREE.ClampToEdgeWrapping;
 spatialCloudTex.needsUpdate = true;
 
-const CLOUD_SLANT_FACTOR = 1.65;
+function computeDynamicCloudSlant(sunDirY, horizLen = 1.0) {
+  return Math.min(8.2, Math.max(0.35, horizLen / Math.max(0.11, sunDirY)));
+}
+
+const CORRIDOR_LUT_GLSL1 = /* glsl */ `
+  uniform sampler2D uCorridorLutTex;
+  uniform float uHasCorridorHorizon;
+  uniform float uUseCorridorAtmo;
+  uniform float uCorridorLutSunElDeg;
+
+  vec4 sampleCorridorLut(float azimuthDeg, float zAslM) {
+    float uAz = fract(azimuthDeg / 360.0) + (0.5 / 180.0);
+    float vNorm = pow(clamp(max(0.0, zAslM) / 12500.0, 0.0, 1.0), 1.0 / 1.6);
+    float vAlt = vNorm * (31.0 / 32.0) + (0.5 / 32.0);
+    return texture2D(uCorridorLutTex, vec2(uAz, vAlt));
+  }
+
+  float decodeCorridorHorizonDeg(float alphaByteNorm) {
+    return -6.0 + 32.0 * alphaByteNorm;
+  }
+
+  vec3 computeCorridorAtmoModulation(vec3 lutRgb, float zAslM) {
+    float dipDeg = 1.015 * sqrt(max(0.0, zAslM * 0.001));
+    float locEl = clamp(uCorridorLutSunElDeg + dipDeg * 0.52, -1.8, 89.0);
+    float sinEl = sin(radians(max(0.0, locEl)));
+    float amRay = exp(-max(0.0, zAslM) / 8434.0) / (sinEl + 0.15 * pow(max(0.25, locEl + 3.885), -1.253));
+    float amAer = exp(-max(0.0, zAslM) / 1800.0) * 0.72 / (sinEl + 0.09 * pow(max(0.25, locEl + 2.2), -1.15));
+    float o3Slant = 12.2 / sqrt(1.0 + 150.0 * sinEl * sinEl);
+    vec3 tauRef = vec3(0.056, 0.110, 0.220) * amRay
+                + vec3(0.036, 0.045, 0.056) * amAer
+                + vec3(0.026, 0.020, 0.002) * o3Slant;
+    vec3 clearRef = exp(-tauRef);
+    float redMod   = clamp(lutRgb.r / max(0.032, clearRef.r), 0.0, 1.30);
+    float greenMod = mix(redMod, clamp(lutRgb.g / max(0.025, clearRef.g), 0.0, 1.30), smoothstep(0.02, 0.08, clearRef.g));
+    float blueMod  = mix(greenMod, clamp(lutRgb.b / max(0.025, clearRef.b), 0.0, 1.30), smoothstep(0.02, 0.08, clearRef.b));
+    return vec3(redMod, greenMod, blueMod);
+  }
+`;
+
 const createDefaultCloudGapsUniform = () =>
   Array.from({ length: 6 }, () => new THREE.Vector4(0, 0, 600, 0));
 let activeWindDirENU = new THREE.Vector2(0.88, -0.46);
@@ -434,6 +484,7 @@ const TERRAIN_FRAGMENT_SHADER = /* glsl */ `
   uniform float uNumCloudGaps;
   uniform float uMeanCloudTau;
   uniform float uCloudTime;
+  ${CORRIDOR_LUT_GLSL1}
 
   varying vec2 vUv;
   varying vec3 vWorldPos;
@@ -561,7 +612,7 @@ const TERRAIN_FRAGMENT_SHADER = /* glsl */ `
     vec2 spUv = clamp(posEN / max(uSpatialSpanM, 1000.0) + 0.5, 0.02, 0.98);
     vec4 scHere = texture2D(uSpatialCloudTex, spUv);
     vec2 horizSun = normalize(uSunDirENU.xy + vec2(1e-5));
-    const float CLOUD_SLANT = 1.65;
+    float CLOUD_SLANT = clamp(length(uSunDirENU.xy) / max(0.11, uSunDirENU.z), 0.35, 8.2);
 
     float gapSpotlight = 0.0;
     float gapCoreBeam = 0.0;
@@ -612,6 +663,17 @@ const TERRAIN_FRAGMENT_SHADER = /* glsl */ `
       float totalCloudTau = max(tauStratus, scHere.a * 4.5) * (1.0 - gapSpotlight * 0.94);
       cloudTransmittance = mix(exp(-clamp(totalCloudTau * 0.72, 0.0, 4.0)), 0.98, gapSpotlight);
     }
+
+    vec3 corrChromaTint = vec3(1.0);
+    if (uUseCorridorAtmo > 0.5 && uUseFluidShadows > 0.5) {
+      float sunAzDeg = mod(degrees(atan(uSunDirENU.x, uSunDirENU.y)) + 360.0, 360.0);
+      vec4 corr = sampleCorridorLut(sunAzDeg, z);
+      vec3 corrMod = computeCorridorAtmoModulation(corr.rgb, z);
+      float corrBeamStrength = clamp(dot(corrMod, vec3(0.55, 0.33, 0.12)), 0.0, 1.25);
+      cloudTransmittance *= clamp(corrBeamStrength, 0.03, 1.18);
+      corrChromaTint = mix(vec3(1.0), clamp(corrMod / max(0.08, corrBeamStrength), 0.35, 1.45), 0.85);
+    }
+
     float isThickOvercast = smoothstep(1.25, 2.6, uMeanCloudTau);
     float ambientFloor = mix(0.38, 0.16, isThickOvercast);
     float effectiveCloudLight = ambientFloor + (1.0 - ambientFloor) * cloudTransmittance;
@@ -622,7 +684,7 @@ const TERRAIN_FRAGMENT_SHADER = /* glsl */ `
 
     // High-contrast Shadowed Umbra vs. Sunlit Area coloring for a razor-sharp light/dark border
     vec3 shadowColor = rockBase * vec3(0.12, 0.19, 0.35) * (0.34 + 0.50 * relZ);
-    vec3 warmSunColor = mix(vec3(1.0, 0.92, 0.78), vec3(1.0, 0.58, 0.22), goldenFactor);
+    vec3 warmSunColor = mix(vec3(1.0, 0.92, 0.78), vec3(1.0, 0.58, 0.22), goldenFactor) * corrChromaTint;
     vec3 sunlitColor = rockBase * (0.46 + 0.88 * ndotl) * warmSunColor * effectiveCloudLight;
 
     // Dramatic molten-gold crepuscular spotlight patch where a 3D cloud-gap sunbeam strikes the bluffs/ridges
@@ -1012,6 +1074,7 @@ function buildTerrainMesh() {
       uNumCloudGaps: { value: 0.0 },
       uMeanCloudTau: { value: 0.35 },
       uCloudTime: { value: 0.0 },
+      ...volumetricEngine.getCorridorUniforms(),
     },
   });
 
@@ -1572,6 +1635,7 @@ function integrateSolarCloudTransmittance(worldX, worldY, worldZ, sunDirWorld, c
 
   // Coaxial check: does the ray from (worldX, worldY, worldZ) pass up through any 3D crepuscular cloud hole?
   const horizLen = Math.max(0.01, Math.hypot(sunDirWorld.x, sunDirWorld.z));
+  const cloudSlant = computeDynamicCloudSlant(sunDirWorld.y, horizLen);
   const ux = sunDirWorld.x / horizLen;
   const uz = sunDirWorld.z / horizLen;
   let maxGapPass = 0.0;
@@ -1579,8 +1643,8 @@ function integrateSolarCloudTransmittance(worldX, worldY, worldZ, sunDirWorld, c
     const gap = activeCloudGaps[g];
     if (worldY < gap.wy + 120) {
       const dy = Math.max(40.0, gap.wy - worldY);
-      const hitX = worldX + ux * dy * CLOUD_SLANT_FACTOR;
-      const hitZ = worldZ + uz * dy * CLOUD_SLANT_FACTOR;
+      const hitX = worldX + ux * dy * cloudSlant;
+      const hitZ = worldZ + uz * dy * cloudSlant;
       const dGap = Math.hypot(hitX - gap.wx, hitZ - gap.wz);
       if (dGap < gap.radiusM * 1.05) {
         const spot = 1.0 - Math.min(1.0, Math.max(0.0, (dGap - gap.radiusM * 0.25) / (gap.radiusM * 0.80)));
@@ -1613,8 +1677,8 @@ function integrateSolarCloudTransmittance(worldX, worldY, worldZ, sunDirWorld, c
 
   // Also include local 12-level vertical optical depth when below the main cloud deck
   if (worldY < 720) {
-    const hitX = worldX + ux * Math.max(60, 640 - worldY) * CLOUD_SLANT_FACTOR;
-    const hitZ = worldZ + uz * Math.max(60, 640 - worldY) * CLOUD_SLANT_FACTOR;
+    const hitX = worldX + ux * Math.max(60, 640 - worldY) * cloudSlant;
+    const hitZ = worldZ + uz * Math.max(60, 640 - worldY) * cloudSlant;
     const scHit = sampleBilinearSpatialCloud(hitX, -hitZ);
     tau = Math.max(tau, scHit.tauNorm * 4.2 * (1.0 - maxGapPass * 0.92));
   }
@@ -1643,6 +1707,7 @@ const GPU_VALLEY_LIGHT_VERTEX_SHADER = /* glsl */ `
   uniform vec3 uBaseColor;
   uniform vec3 uGrazeColor;
   uniform float uIsOvercast;
+  ${CORRIDOR_LUT_GLSL1}
 
   varying vec4 vColor;
 
@@ -1699,12 +1764,26 @@ const GPU_VALLEY_LIGHT_VERTEX_SHADER = /* glsl */ `
     }
 
     vec2 crestEN = vec2(pC.x, -pC.z);
+    float zCrestAsl = yC + 5.0 + uMinZ;
     float cloudTrans = 1.0;
     if (uUseFluidShadows > 0.5) {
       vec2 shadowUv = fract(crestEN / max(uCloudDomainM, 1000.0) + 0.5);
       cloudTrans = texture2D(uCloudShadowTex, shadowUv).r;
     }
-    if (uIsOvercast > 0.5 && cloudTrans < 0.16) {
+    if (uHasCorridorHorizon > 0.5 || uUseCorridorAtmo > 0.5) {
+      float sunAzDeg = mod(degrees(atan(uSunDirWorld.x, -uSunDirWorld.z)) + 360.0, 360.0);
+      float sunElDeg = degrees(asin(clamp(uSunDirWorld.y, -1.0, 1.0)));
+      vec4 corr = sampleCorridorLut(sunAzDeg, zCrestAsl);
+      if (uHasCorridorHorizon > 0.5) {
+        float farH = decodeCorridorHorizonDeg(corr.a);
+        cloudTrans *= smoothstep(farH - 0.28, farH + 0.28, sunElDeg);
+      }
+      if (uUseCorridorAtmo > 0.5 && uUseFluidShadows > 0.5) {
+        vec3 cMod = computeCorridorAtmoModulation(corr.rgb, zCrestAsl);
+        cloudTrans *= clamp(dot(cMod, vec3(0.55, 0.33, 0.12)), 0.0, 1.15);
+      }
+    }
+    if (cloudTrans < 0.02 || (uIsOvercast > 0.5 && cloudTrans < 0.16)) {
       vColor = vec4(0.0);
       gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
       return;
@@ -1799,6 +1878,7 @@ const GPU_MONOLITH_GRAZING_VERTEX_SHADER = /* glsl */ `
   uniform vec3 uBeamColor;
   uniform vec3 uEdgeColor;
   uniform float uIsOvercast;
+  ${CORRIDOR_LUT_GLSL1}
 
   varying vec4 vColor;
 
@@ -1858,6 +1938,20 @@ const GPU_MONOLITH_GRAZING_VERTEX_SHADER = /* glsl */ `
       vec2 en = vec2(grazeOrigin.x, -grazeOrigin.z);
       vec2 suv = fract(en / max(uCloudDomainM, 1000.0) + 0.5);
       cloudTrans = texture2D(uCloudShadowTex, suv).r;
+    }
+    if (uHasCorridorHorizon > 0.5 || uUseCorridorAtmo > 0.5) {
+      float zGrazeAsl = grazeOrigin.y + uMinZ;
+      float sunAzDeg = mod(degrees(atan(uSunDirWorld.x, -uSunDirWorld.z)) + 360.0, 360.0);
+      float sunElDeg = degrees(asin(clamp(uSunDirWorld.y, -1.0, 1.0)));
+      vec4 corr = sampleCorridorLut(sunAzDeg, zGrazeAsl);
+      if (uHasCorridorHorizon > 0.5) {
+        float farH = decodeCorridorHorizonDeg(corr.a);
+        cloudTrans *= smoothstep(farH - 0.28, farH + 0.28, sunElDeg);
+      }
+      if (uUseCorridorAtmo > 0.5 && uUseFluidShadows > 0.5) {
+        vec3 cMod = computeCorridorAtmoModulation(corr.rgb, zGrazeAsl);
+        cloudTrans *= clamp(dot(cMod, vec3(0.55, 0.33, 0.12)), 0.0, 1.15);
+      }
     }
   }
 
@@ -1955,6 +2049,7 @@ function ensureGpuValleyLightField() {
       uBaseColor: { value: new THREE.Color(0.99, 0.76, 0.30) },
       uGrazeColor: { value: new THREE.Color(1.0, 0.80, 0.32) },
       uIsOvercast: { value: 0.0 },
+      ...volumetricEngine.getCorridorUniforms(),
     },
     transparent: true,
     side: THREE.DoubleSide,
@@ -2018,6 +2113,7 @@ function ensureGpuMonolithGrazing() {
       uBeamColor: { value: new THREE.Color(0xfbbf24) },
       uEdgeColor: { value: new THREE.Color(0xf59e0b) },
       uIsOvercast: { value: 0.0 },
+      ...volumetricEngine.getCorridorUniforms(),
     },
     transparent: true,
     side: THREE.DoubleSide,
@@ -2148,8 +2244,9 @@ function updateValleyLightField(sunDirWorld, elevationDeg) {
   disposeObjectTree(gpuValleyGapsGroup);
 
   const horizLen = Math.max(0.01, Math.hypot(sunDirWorld.x, sunDirWorld.z));
-  const slantDx = (-sunDirWorld.x / horizLen) * CLOUD_SLANT_FACTOR;
-  const slantDz = (-sunDirWorld.z / horizLen) * CLOUD_SLANT_FACTOR;
+  const cloudSlant = computeDynamicCloudSlant(sunDirWorld.y, horizLen);
+  const slantDx = (-sunDirWorld.x / horizLen) * cloudSlant;
+  const slantDz = (-sunDirWorld.z / horizLen) * cloudSlant;
   const nowSec = performance.now() * 0.001;
 
   activeCloudGaps.forEach((gap, gIdx) => {
@@ -2317,7 +2414,106 @@ function update3DPositionalClouds(sunDirWorld, elevationDeg, minElevM, fogBaseM,
   }
 }
 
+let _activeCorridorLutSector = null;
+let _lastSyncedFluidMinutes = -999;
+
+function applyHourlyWeatherAtMinutes(minutes) {
+  const wr = state.weatherReport;
+  if (!wr) return null;
+
+  // Automatically swap between precomputed 380 km Sunrise (East) & Sunset (West) Corridor LUTs across solar noon
+  const wantSector = minutes < 720 ? "sunrise" : "sunset";
+  if (_activeCorridorLutSector !== wantSector) {
+    const sectorLut =
+      wantSector === "sunrise"
+        ? wr.sunrise_corridor_lut || wr.corridor_lut
+        : wr.sunset_corridor_lut || wr.corridor_lut;
+    if (sectorLut) {
+      volumetricEngine.setCorridorLut(sectorLut);
+      _activeCorridorLutSector = wantSector;
+    }
+  }
+
+  const timeline = wr.hourly_timeline;
+  if (!Array.isArray(timeline) || timeline.length < 2) return null;
+
+  // Each entry `h` in `hourly_timeline` is centered at `h * 60 + 30` minutes local
+  const clampedMin = Math.max(0, Math.min(1439, minutes));
+  const fHour = (clampedMin - 30) / 60.0;
+  const idx0 = Math.max(0, Math.min(timeline.length - 1, Math.floor(fHour)));
+  const idx1 = Math.max(0, Math.min(timeline.length - 1, idx0 + 1));
+  const alpha = idx0 === idx1 ? 0.0 : Math.max(0.0, Math.min(1.0, fHour - idx0));
+
+  const row0 = timeline[idx0];
+  const row1 = timeline[idx1];
+  const lerpNum = (a, b, fallback = 0) => {
+    const va = typeof a === "number" ? a : fallback;
+    const vb = typeof b === "number" ? b : va;
+    return va + (vb - va) * alpha;
+  };
+
+  if (
+    row0?.fluid_atmosphere_params &&
+    row1?.fluid_atmosphere_params &&
+    volumetricEngine.activePreset === "live" &&
+    Math.abs(clampedMin - _lastSyncedFluidMinutes) >= 3
+  ) {
+    _lastSyncedFluidMinutes = clampedMin;
+    const p0 = row0.fluid_atmosphere_params;
+    const p1 = row1.fluid_atmosphere_params;
+    const interpParams = { ...(volumetricEngine.liveWeatherParams || p0) };
+    const numericKeys = [
+      "surfaceTempC",
+      "surfaceRhPct",
+      "lowCloudPct",
+      "midCloudPct",
+      "highCloudPct",
+      "inversionBaseM",
+      "inversionThicknessM",
+      "inversionStrengthK",
+      "windSfcU",
+      "windSfcV",
+      "wind850U",
+      "wind850V",
+      "wind500U",
+      "wind500V",
+      "wind250U",
+      "wind250V",
+      "convectiveCape",
+      "orographicWaveGain",
+      "vorticityConfinement",
+      "cirrusIceBoost",
+      "jet250Mph",
+      "jet300Mph",
+    ];
+    for (const k of numericKeys) {
+      if (typeof p0[k] === "number" || typeof p1[k] === "number") {
+        interpParams[k] = lerpNum(p0[k], p1[k], interpParams[k] ?? 0);
+      }
+    }
+    volumetricEngine.liveWeatherParams = interpParams;
+    volumetricEngine.syncWeatherParamsToWorker(false);
+  }
+
+  const pickRow = alpha < 0.5 ? row0 : row1;
+  return {
+    expBeamPct: Math.round(lerpNum(row0.expected_transmittance_pct, row1.expected_transmittance_pct, wr.ray_transmittance_pct ?? 50)),
+    directBeamPct: Math.round(lerpNum(row0.direct_beam_pct, row1.direct_beam_pct, wr.direct_beam_probability_pct ?? 50)),
+    p10Pct: Math.round(lerpNum(row0.p10_pct, row1.p10_pct, wr.transmittance_p10_pct ?? 0)),
+    p50Pct: Math.round(lerpNum(row0.p50_pct, row1.p50_pct, wr.transmittance_p50_pct ?? 50)),
+    p90Pct: Math.round(lerpNum(row0.p90_pct, row1.p90_pct, wr.transmittance_p90_pct ?? 80)),
+    kelvin: Math.round(lerpNum(row0.kelvin, row1.kelvin, wr.color_temperature_kelvin ?? 2400)),
+    canvasGlow: Math.round(lerpNum(row0.canvas_glow_score, row1.canvas_glow_score, wr.canvas_score ?? 50)),
+    fogTopFt: Math.round(lerpNum(row0.fog_top_ft, row1.fog_top_ft, wr.fog_top_ft ?? 1250)),
+    cloudLowPct: Math.round(lerpNum(row0.cloud_low_pct, row1.cloud_low_pct, wr.cloud_low_pct ?? 15)),
+    aod550: lerpNum(row0.aod_550nm, row1.aod_550nm, wr.astro_atmosphere?.aod_550nm ?? 0.06),
+    blockerLabel: pickRow?.blocker_label || "clear",
+    blockerDistKm: pickRow?.blocker_distance_km || 0,
+  };
+}
+
 function updateSunRaysAndShader() {
+  const hourlyMet = applyHourlyWeatherAtMinutes(state.currentMinutes);
   const { azimuthDeg, elevationDeg } = getSolarAnglesAtMinutes(state.currentMinutes);
   const azRad = (azimuthDeg * Math.PI) / 180;
   const elRad = (elevationDeg * Math.PI) / 180;
@@ -2381,11 +2577,12 @@ function updateSunRaysAndShader() {
 
   const wr = state.weatherReport;
   const inv = wr?.inversion_model;
+  const activeLowPct = hourlyMet ? hourlyMet.cloudLowPct : (wr?.cloud_low_pct || 15);
   const mistCov = wr
     ? Math.max(
         0.14,
         ((wr.valley_inversion_fog_pct || 25) * 0.8 +
-          (wr.cloud_low_pct || 15) * 0.3 +
+          activeLowPct * 0.3 +
           (inv?.cloud_sea_score || 0) * 0.25) /
           110
       )
@@ -2393,7 +2590,7 @@ function updateSunRaysAndShader() {
 
   if (state.terrainPatch) {
     const minElevM = state.terrainPatch.min_elevation_m ?? 0.0;
-    const fogTopFt = inv?.fog_top_ft ?? (wr?.lcl_cloud_base_ft ? wr.lcl_cloud_base_ft - 600 : 1250);
+    const fogTopFt = hourlyMet?.fogTopFt ?? inv?.fog_top_ft ?? (wr?.lcl_cloud_base_ft ? wr.lcl_cloud_base_ft - 600 : 1250);
     const fogBaseFt = inv?.fog_base_ft ?? Math.max(100, fogTopFt - 650);
     const fogTopM = fogTopFt / 3.28084;
     const fogBaseM = fogBaseFt / 3.28084;
@@ -2411,7 +2608,7 @@ function updateSunRaysAndShader() {
 
   // Match scene background & far-field fog to the physical sky horizon phase (Night / Blue Hour / Golden Hour / Day)
   // and modulate volumetric Mie scattering density by live CAMS Aerosol Optical Depth (AOD 550nm)
-  const aodVal = wr?.astro_atmosphere?.aod_550nm ?? 0.06;
+  const aodVal = hourlyMet?.aod550 ?? wr?.astro_atmosphere?.aod_550nm ?? 0.06;
   scene.fog.density = 0.000007 + Math.min(0.25, aodVal) * 0.000032;
 
   if (elevationDeg < -7.0) {
@@ -2545,11 +2742,11 @@ function updateSunRaysAndShader() {
         }
       }
 
-      // F. 3D Weather Corridor Cloud Gates (75 km Entry, 18 km Keyhole, 0 km Fog/Inversion Deck)
+      // F. 3D Weather Corridor Cloud Gates (Far Corridor Entry, Mid Keyhole, 0 km Fog/Inversion Deck)
       if (showCorridorGates) {
         const stations = state.weatherReport.ray_path_stations;
-        const st75 = stations[0];
-        const st18 = stations[1];
+        const stFar = stations[0];
+        const stMid = stations[1];
         const st0 = stations[2];
 
         const gate18Pos = targetWorld.clone().addScaledVector(sunDirWorld, 10500);
@@ -2568,7 +2765,7 @@ function updateSunRaysAndShader() {
         sunBeamsDynamicExtrasGroup.add(gate18Ring);
 
         const gate18Sprite = makeTextSprite(
-          `18km GATE: ${st18.cloud_low_pct}%L/${st18.cloud_mid_pct}%M/${st18.cloud_high_pct}%H (${st18.gate_transmittance_pct}% PASS)`,
+          `${stMid.distance_km}km GATE: ${stMid.cloud_low_pct}%L/${stMid.cloud_mid_pct}%M/${stMid.cloud_high_pct}%H (${stMid.gate_transmittance_pct}% PASS)`,
           "#0f172a",
           "#38bdf8",
           "#e0f2fe"
@@ -2593,7 +2790,7 @@ function updateSunRaysAndShader() {
         sunBeamsDynamicExtrasGroup.add(gate75Ring);
 
         const gate75Sprite = makeTextSprite(
-          `75km ENTRY: ${st75.cloud_low_pct}%L/${st75.cloud_mid_pct}%M/${st75.cloud_high_pct}%H (${st75.gate_transmittance_pct}% PASS)`,
+          `${stFar.distance_km}km ENTRY: ${stFar.cloud_low_pct}%L/${stFar.cloud_mid_pct}%M/${stFar.cloud_high_pct}%H (${stFar.gate_transmittance_pct}% PASS)`,
           "#0f172a",
           "#f59e0b",
           "#fef3c7"
@@ -2710,7 +2907,9 @@ function updateSunRaysAndShader() {
   const elSign = elevationDeg >= 0 ? "+" : "";
 
   let phaseLabel = "Daylight High Sun";
-  let cliffLitLabel = "82% Direct Light";
+  let cliffLitLabel = hourlyMet
+    ? `${hourlyMet.expBeamPct}% Beam · P90 ${hourlyMet.p90Pct}% (${hourlyMet.kelvin}K)`
+    : "82% Direct Light";
   if (elevationDeg < -0.5) {
     const astro = state.shootReport?.astro_night_summary;
     const track = astro?.nightly_celestial_track || [];
@@ -2720,7 +2919,10 @@ function updateSunRaysAndShader() {
         bestCel = row;
       }
     }
-    if (bestCel && astro) {
+    if (elevationDeg >= -5.5 && hourlyMet) {
+      phaseLabel = state.currentMinutes >= 720 ? "Civil Twilight / Cirrus Afterglow" : "Pre-Dawn Civil Twilight";
+      cliffLitLabel = `Afterglow ${hourlyMet.canvasGlow}/100`;
+    } else if (bestCel && astro) {
       const [, moonAz, moonEl, gcAz, gcEl] = bestCel;
       if (astro.galactic_core_visible && gcEl > 2.0) {
         phaseLabel = `Nightscape • Galactic Core Az ${gcAz.toFixed(1)}° (El +${gcEl.toFixed(1)}°)`;
@@ -2736,10 +2938,10 @@ function updateSunRaysAndShader() {
     }
   } else if (elevationDeg <= 13.5 && state.currentMinutes >= 900) {
     phaseLabel = "Sunset Golden Hour / Alpenglow";
-    cliffLitLabel = "96% Alpenglow";
+    if (!hourlyMet) cliffLitLabel = "96% Alpenglow";
   } else if (elevationDeg <= 13.5 && state.currentMinutes < 720) {
     phaseLabel = "Sunrise Golden Hour";
-    cliffLitLabel = "88% Rim Light";
+    if (!hourlyMet) cliffLitLabel = "88% Rim Light";
   }
 
   document.getElementById("hud-local-time").textContent = `${hhmm} Local`;
@@ -2895,7 +3097,7 @@ function renderWeatherCard(w) {
 
   const summarySub = document.getElementById("weather-summary-sub");
   if (summarySub) {
-    summarySub.textContent = `${w.ray_transmittance_pct}% Beam • ${w.temp_sunset_f}°F • Click to inspect 75 km ray corridor`;
+    summarySub.textContent = `${w.ray_transmittance_pct}% Beam • ${w.temp_sunset_f}°F • Click to inspect 380 km ray corridor`;
   }
 
   document.getElementById("raypath-azimuth-label").textContent =
@@ -2903,11 +3105,52 @@ function renderWeatherCard(w) {
   document.getElementById("raypath-trans-pill").textContent =
     `End-to-End Beam: ${w.ray_transmittance_pct}%`;
 
-  // Render SVG 3-Station Atmospheric Ray-Path Cross-Section (75 km -> 18 km -> 0 km)
+  // Populate 380 km Curved-Earth Bimodal & Spectral Telemetry (#corridor-bimodal-box)
+  const nowcastPillEl = document.getElementById("corridor-nowcast-pill");
+  if (nowcastPillEl) {
+    if (w.nowcast_status?.active) {
+      const stId = w.nowcast_status.metar_station?.id || "ABI";
+      const wtPct = Math.round((w.nowcast_status.nowcast_blend_weight || 0) * 100);
+      nowcastPillEl.textContent = `📡 GOES-18 + ${stId} (${wtPct}%)`;
+    } else if (w.inversion_model?.is_historical) {
+      nowcastPillEl.textContent = "📚 Historical Archive";
+    } else {
+      nowcastPillEl.textContent = "🛰️ 6-Station 380 km";
+    }
+  }
+  const directProbEl = document.getElementById("val-direct-beam-prob");
+  if (directProbEl) {
+    directProbEl.textContent = `${w.direct_beam_probability_pct ?? w.ray_transmittance_pct}%`;
+  }
+  const quantEl = document.getElementById("val-bimodal-quantiles");
+  if (quantEl) {
+    const p10 = w.transmittance_p10_pct ?? 0;
+    const p50 = w.transmittance_p50_pct ?? w.ray_transmittance_pct;
+    const p90 = w.transmittance_p90_pct ?? w.ray_transmittance_pct;
+    quantEl.textContent = `${p10} / ${p50} / ${p90}%`;
+  }
+  const kelvEl = document.getElementById("val-kelvin-canvas");
+  if (kelvEl) {
+    kelvEl.textContent = `${w.color_temperature_kelvin ?? 2400} K · ${w.canvas_score ?? 50}/100`;
+  }
+  const blockerEl = document.getElementById("val-dominant-blocker");
+  if (blockerEl) {
+    const blkLbl = w.corridor_raycast?.dominant_blocker_label || "";
+    const blkDist = Math.round(w.corridor_raycast?.dominant_blocker_distance_km || 0);
+    if ((w.ray_transmittance_pct ?? 0) >= 65 && (!blkLbl || blkLbl === "clear_corridor")) {
+      blockerEl.textContent = "Clear 380 km";
+    } else if (!blkLbl || blkLbl === "clear_corridor") {
+      blockerEl.textContent = "Clear / Haze";
+    } else {
+      blockerEl.textContent = `${blkLbl.toUpperCase()} @ ${blkDist} km`;
+    }
+  }
+
+  // Render SVG 3-Station Atmospheric Ray-Path Cross-Section (Far Entry -> Mid Keyhole -> 0 km)
   const svg = document.getElementById("raypath-svg");
   const stations = w.ray_path_stations || [];
   if (svg && stations.length === 3) {
-    const [st75, st18, st0] = stations;
+    const [stFar, stMid, st0] = stations;
     svg.innerHTML = `
       <defs>
         <linearGradient id="beamGrad" x1="0" y1="0" x2="1" y2="0">
@@ -2927,18 +3170,18 @@ function renderWeatherCard(w) {
         0km High Cirrus Canvas (${st0.cloud_high_pct}%)
       </text>
 
-      <!-- Mid/Low Cloud Decks at 75 km Entry & 18 km Ridge -->
+      <!-- Mid/Low Cloud Decks at Far Entry & Mid Keyhole Ridge -->
       <rect x="14" y="24" width="76" height="11" rx="5" fill="rgba(148,163,184,0.25)" stroke="#64748b" stroke-width="0.8" />
-      <text x="52" y="32" fill="#cbd5e1" font-size="7" text-anchor="middle">75km Deck (${st75.cloud_low_pct}%L/${st75.cloud_mid_pct}%M)</text>
+      <text x="52" y="32" fill="#cbd5e1" font-size="7" text-anchor="middle">${stFar.distance_km}km Deck (${stFar.cloud_low_pct}%L/${stFar.cloud_mid_pct}%M)</text>
 
       <rect x="128" y="31" width="74" height="11" rx="5" fill="rgba(56,189,248,0.18)" stroke="#38bdf8" stroke-width="0.8" />
-      <text x="165" y="39" fill="#bae6fd" font-size="7" text-anchor="middle">18km Cap (${st18.cloud_low_pct}%L/${st18.cloud_mid_pct}%M)</text>
+      <text x="165" y="39" fill="#bae6fd" font-size="7" text-anchor="middle">${stMid.distance_km}km Cap (${stMid.cloud_low_pct}%L/${stMid.cloud_mid_pct}%M)</text>
 
-      <!-- Terrain Silhouette: 75 km Foothills -> 18 km Keyhole Ridge -> 0 km Monolith -->
+      <!-- Terrain Silhouette: Far Foothills -> Mid Keyhole Ridge -> 0 km Monolith -->
       <path d="M 8 84 L 8 72 L 65 70 L 125 66 L 158 49 L 172 56 L 188 47 L 235 74 L 296 74 L 316 34 L 335 34 L 348 84 Z"
             fill="rgba(30,41,59,0.88)" stroke="#64748b" stroke-width="1.2" />
 
-      <!-- Incoming Solar Ray Shaft from 75 km -> 18 km Keyhole -> 0 km Monolith Face -->
+      <!-- Incoming Solar Ray Shaft from Far Entry -> Mid Keyhole -> 0 km Monolith Face -->
       <line x1="16" y1="42" x2="172" y2="52" stroke="url(#beamGrad)" stroke-width="3.2" />
       <line x1="172" y1="52" x2="316" y2="41" stroke="url(#beamGrad)" stroke-width="3.2" />
       <!-- Reflected Alpenglow Rays up onto Overhead High Cirrus Canvas -->
@@ -2949,8 +3192,8 @@ function renderWeatherCard(w) {
       <circle cx="172" cy="52" r="4" fill="#38bdf8" />
       <circle cx="316" cy="41" r="4.5" fill="#f97316" />
 
-      <text x="26" y="81" fill="#94a3b8" font-size="7.2" font-weight="700">75 km Entry</text>
-      <text x="145" y="81" fill="#94a3b8" font-size="7.2" font-weight="700">18 km Keyhole</text>
+      <text x="20" y="81" fill="#94a3b8" font-size="7.2" font-weight="700">${stFar.distance_km} km Entry</text>
+      <text x="142" y="81" fill="#94a3b8" font-size="7.2" font-weight="700">${stMid.distance_km} km Keyhole</text>
       <text x="292" y="81" fill="#fde68a" font-size="7.2" font-weight="700">0 km Monolith</text>
     `;
 
@@ -3029,7 +3272,7 @@ function renderWeatherCard(w) {
       const aiEng = w.ai_ensemble?.selected_engine || w.ai_ensemble?.active_engine || state.weatherEngine;
       const engLabelMap = {
         ensemble: "⚡ Hybrid",
-        graphcast: "🧠 GraphCast",
+        graphcast: "🧠 AI Forecast",
         hrrr: "🛰️ HRRR",
         ecmwf: "🌍 ECMWF",
         nowcast: "📡 Nowcast",
@@ -3040,7 +3283,7 @@ function renderWeatherCard(w) {
           ? ` • 3D τ=${tauVal} (${gapCount} Gap${gapCount === 1 ? "" : "s"})`
           : "";
       vpWeatherPill.textContent = `${engTag}🌤️ ${w.temp_sunset_f}°F · 💨 ${w.wind_mph} mph · ☀️ ${w.alpenglow_score}/100`;
-      vpWeatherPill.title = `${engTag}${w.temp_sunset_f}°F • Wind ${w.wind_mph} mph • Fog ${inv.fog_base_ft.toLocaleString()}–${inv.fog_top_ft.toLocaleString()} ft (ΔT ${sign}${inv.inversion_delta_t_f}°F)${tauTag} — Click to inspect 75 km ray corridor`;
+      vpWeatherPill.title = `${engTag}${w.temp_sunset_f}°F • Wind ${w.wind_mph} mph • Fog ${inv.fog_base_ft.toLocaleString()}–${inv.fog_top_ft.toLocaleString()} ft (ΔT ${sign}${inv.inversion_delta_t_f}°F)${tauTag} — Click to inspect 380 km ray corridor`;
     }
   }
 
@@ -3104,7 +3347,7 @@ function renderWeatherCard(w) {
     if (transectPill) {
       const gapCount = scf?.crepuscular_gaps?.length || 0;
       const tauStr = scf?.mean_optical_depth_tau !== undefined ? ` • τ=${scf.mean_optical_depth_tau} (${gapCount} Gaps)` : "";
-      transectPill.textContent = `Wind ${Math.round(scf.wind_dir_deg || 295)}° • 8×8 Voxel${tauStr}`;
+      transectPill.textContent = `Wind ${Math.round(scf.wind_dir_deg || 295)}° • 16×16 Mesoscale${tauStr}`;
     }
     transectGrid.innerHTML = scf.transect_west_to_east
       .map((pt) => {
@@ -3349,6 +3592,8 @@ async function fetchWeatherForCorridor(phase = "sunset") {
   const res = await fetch(url);
   if (res.ok) {
     state.weatherReport = await res.json();
+    _activeCorridorLutSector = null;
+    _lastSyncedFluidMinutes = -999;
     volumetricEngine.setLiveWeatherReport(state.weatherReport);
     renderWeatherCard(state.weatherReport);
     updateSunRaysAndShader();
@@ -3503,7 +3748,7 @@ async function loadLandmarkScenario(customCoord = null) {
   if (dtInp) dtInp.value = state.date;
   try {
     if (!customCoord) localStorage.setItem("pp_landmark_v2", state.landmark);
-    localStorage.setItem("pp_date_v2", state.date);
+    localStorage.setItem("pp_date_v3", state.date);
   } catch (_) {}
 
   const label = customCoord ? customCoord.name : state.landmark;
@@ -3536,6 +3781,8 @@ async function loadLandmarkScenario(customCoord = null) {
 
     if (weatherRes.ok) {
       state.weatherReport = await weatherRes.json();
+      _activeCorridorLutSector = null;
+      _lastSyncedFluidMinutes = -999;
       volumetricEngine.setLiveWeatherReport(state.weatherReport);
       renderWeatherCard(state.weatherReport);
     }
@@ -3976,19 +4223,19 @@ function applyQuickScenario(landmark, date, fluidPreset = null) {
 }
 
 document.getElementById("btn-yesterday-pedro")?.addEventListener("click", () => {
-  applyQuickScenario("Pedro Point Headlands", "2026-04-16", "live");
+  applyQuickScenario("Pedro Point Headlands", yesterdayIso, "live");
 });
 
 document.getElementById("btn-vp-yesterday-pedro")?.addEventListener("click", () => {
-  applyQuickScenario("Pedro Point Headlands", "2026-04-16", "live");
+  applyQuickScenario("Pedro Point Headlands", yesterdayIso, "live");
 });
 
 document.getElementById("btn-live-today-sf")?.addEventListener("click", () => {
-  applyQuickScenario("Montara Mountain", "2026-04-17", "live");
+  applyQuickScenario("Montara Mountain", todayIso, "live");
 });
 
 document.getElementById("btn-vp-today-sf")?.addEventListener("click", () => {
-  applyQuickScenario("Montara Mountain", "2026-04-17", "live");
+  applyQuickScenario("Montara Mountain", todayIso, "live");
 });
 
 document.getElementById("btn-hist-fog-sea")?.addEventListener("click", () => {
@@ -4008,11 +4255,11 @@ document.getElementById("btn-vp-clear-slot")?.addEventListener("click", () => {
 });
 
 document.getElementById("btn-vp-halfdome-alpenglow")?.addEventListener("click", () => {
-  applyQuickScenario("Half Dome", "2026-04-16", "sierra_cumulus_cirrus");
+  applyQuickScenario("Half Dome", todayIso, "sierra_cumulus_cirrus");
 });
 
 document.getElementById("btn-vp-clouds-rest-wave")?.addEventListener("click", () => {
-  applyQuickScenario("Clouds Rest", "2026-04-16", "lenticular_wave");
+  applyQuickScenario("Clouds Rest", todayIso, "lenticular_wave");
 });
 
 const playBtn = document.getElementById("btn-play-sun");

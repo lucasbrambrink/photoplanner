@@ -1,12 +1,18 @@
 use anyhow::{Context, Result};
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
+use flate2::read::GzDecoder;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-/// Combined Earth curvature and standard atmospheric refraction coefficient (k ≈ 0.13):
-/// Δz(d) = -d² / (2 * R_earth) * (1 - k) ≈ -6.75e-8 * d² (in meters)
+/// Mean WGS84 Earth radius in meters.
+pub const EARTH_RADIUS_M: f64 = 6_371_008.8;
+
+/// Combined Earth curvature and standard atmospheric refraction coefficient (k ≈ 0.14):
+/// Δz(d) = d² / (2 * R_earth) * (1 - k) ≈ 6.75e-8 * d² (in meters)
 pub const CURVATURE_REFRACTION_FACTOR: f64 = 6.75e-8;
 
 /// Metres per degree of latitude (approximate WGS84 meridional scale)
@@ -17,10 +23,18 @@ pub fn meters_per_deg_lon(lat_deg: f64) -> f64 {
     111_412.84 * lat_deg.to_radians().cos()
 }
 
-/// Effective vertical drop (in meters) of distant terrain due to Earth curvature minus atmospheric refraction.
+/// Effective vertical drop (in meters) of distant terrain due to Earth curvature minus standard atmospheric refraction.
 #[inline]
 pub fn earth_curvature_refraction_drop_m(distance_m: f64) -> f64 {
     CURVATURE_REFRACTION_FACTOR * distance_m * distance_m
+}
+
+/// Effective vertical drop (in meters) of distant terrain using a state-dependent refraction coefficient `k`
+/// (`k ≈ 0.13` standard atmosphere; `k ≈ 0.22–0.45` across strong nocturnal/marine thermal inversions).
+#[inline]
+pub fn earth_curvature_refraction_drop_custom_m(distance_m: f64, refraction_k: f64) -> f64 {
+    let k = refraction_k.clamp(-0.05, 0.82);
+    (distance_m * distance_m) * (1.0 - k) / (2.0 * EARTH_RADIUS_M)
 }
 
 /// Core trait abstracting bare-earth or surface elevation models.
@@ -49,33 +63,73 @@ pub trait ElevationSurface: Send + Sync {
     }
 }
 
-/// Represents a loaded binary SRTM `.hgt` tile (either SRTM1 3601x3601 or SRTM3 1201x1201).
+/// Represents a loaded binary SRTM `.hgt` / `.hgt.gz` tile (SRTM1 3601x3601, SRTM3 1201x1201, or compact ocean tile).
 #[derive(Debug, Clone)]
 pub struct SrtmTile {
     pub tile_name: String,
     pub lat_floor: i32,
     pub lon_floor: i32,
-    /// Number of intervals per degree (1200 for SRTM3, 3600 for SRTM1)
+    /// Number of intervals per degree (1200 for SRTM3, 3600 for SRTM1, or 4 for open-ocean sea-level tile)
     pub samples: usize,
     /// Row-major grid of `(samples + 1) * (samples + 1)` heights in meters
     pub data: Vec<f32>,
 }
 
 impl SrtmTile {
+    /// Compact sea-level (`0.0 m`) representation for open-ocean 1°x1° cells (works seamlessly on CPU and Metal GPU).
+    pub fn ocean_tile(lat_floor: i32, lon_floor: i32) -> Self {
+        let samples = 4usize;
+        let side = samples + 1;
+        Self {
+            tile_name: SrtmCache::tile_name(lat_floor, lon_floor),
+            lat_floor,
+            lon_floor,
+            samples,
+            data: vec![0.0_f32; side * side],
+        }
+    }
+
     pub fn load_from_path(path: &Path, lat_floor: i32, lon_floor: i32) -> Result<Self> {
-        let bytes = std::fs::read(path)
+        let raw_bytes = std::fs::read(path)
             .with_context(|| format!("Failed to read HGT tile at {}", path.display()))?;
+        let tile_name = SrtmCache::tile_name(lat_floor, lon_floor);
+        Self::load_from_bytes(&raw_bytes, tile_name, lat_floor, lon_floor)
+    }
+
+    pub fn load_from_bytes(
+        raw_bytes: &[u8],
+        tile_name: String,
+        lat_floor: i32,
+        lon_floor: i32,
+    ) -> Result<Self> {
+        let decompressed: Vec<u8>;
+        let bytes: &[u8] = if raw_bytes.len() >= 2 && raw_bytes[0] == 0x1f && raw_bytes[1] == 0x8b {
+            let mut decoder = GzDecoder::new(raw_bytes);
+            let mut out = Vec::with_capacity(3601 * 3601 * 2);
+            decoder
+                .read_to_end(&mut out)
+                .with_context(|| format!("Failed to gunzip HGT tile {}", tile_name))?;
+            decompressed = out;
+            &decompressed
+        } else {
+            raw_bytes
+        };
+
         let samples = if bytes.len() == 3601 * 3601 * 2 {
             3600
         } else if bytes.len() == 1201 * 1201 * 2 {
             1200
         } else {
-            anyhow::bail!("Unexpected HGT file size: {} bytes", bytes.len());
+            anyhow::bail!(
+                "Unexpected HGT payload size for {}: {} bytes",
+                tile_name,
+                bytes.len()
+            );
         };
 
         let side = samples + 1;
         let mut raw = Vec::with_capacity(side * side);
-        let mut cursor = Cursor::new(&bytes);
+        let mut cursor = Cursor::new(bytes);
         for _ in 0..(side * side) {
             raw.push(cursor.read_i16::<BigEndian>()?);
         }
@@ -86,12 +140,17 @@ impl SrtmTile {
         let mut data = vec![0.0_f32; side * side];
         let mut valid = vec![false; side * side];
         let mut void_indices = Vec::new();
+        let mut valid_sum = 0.0_f64;
+        let mut valid_count = 0usize;
 
         for idx in 0..(side * side) {
             let v = raw[idx];
             if v != -32768 {
-                data[idx] = v as f32;
+                let vf = v as f32;
+                data[idx] = vf;
                 valid[idx] = true;
+                valid_sum += vf as f64;
+                valid_count += 1;
             } else {
                 void_indices.push(idx);
             }
@@ -150,15 +209,21 @@ impl SrtmTile {
             void_indices = next_voids;
         }
 
+        // Any disconnected void region (e.g. offshore ocean expanse or isolated void) defaults to
+        // sea level (0.0 m) unless the tile is predominantly high-elevation land.
+        let fallback_elev = if valid_count > 0 {
+            let mean_v = (valid_sum / valid_count as f64) as f32;
+            if mean_v > 250.0 && valid_count * 2 > side * side {
+                mean_v
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
         for idx in void_indices {
-            data[idx] = 1800.0;
+            data[idx] = fallback_elev;
         }
-
-        let tile_name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("UNKNOWN")
-            .to_string();
 
         Ok(Self {
             tile_name,
@@ -242,10 +307,13 @@ impl SrtmTile {
     }
 }
 
-/// Manages a collection of SRTM `.hgt` tiles for Far-Field Horizon lookups (5–100 km).
+/// Manages a collection of SRTM `.hgt` / `.hgt.gz` tiles for Far-Field Horizon lookups (5–220 km),
+/// with optional on-demand fetching & local disk caching from AWS Terrain Tiles (`skadi` SRTM1).
 #[derive(Debug, Default)]
 pub struct SrtmCache {
     pub search_dirs: Vec<PathBuf>,
+    pub remote_cache_dir: Option<PathBuf>,
+    pub allow_remote_fetch: bool,
     pub tiles: HashMap<(i32, i32), SrtmTile>,
 }
 
@@ -253,6 +321,23 @@ impl SrtmCache {
     pub fn new(search_dirs: Vec<PathBuf>) -> Self {
         Self {
             search_dirs,
+            remote_cache_dir: None,
+            allow_remote_fetch: false,
+            tiles: HashMap::new(),
+        }
+    }
+
+    /// Creates an `SrtmCache` that searches `search_dirs` + `remote_cache_dir` and automatically
+    /// fetches & caches missing 1-arcsecond SRTM tiles from AWS Open Data (`elevation-tiles-prod/skadi`).
+    pub fn with_aws_skadi_cache(mut search_dirs: Vec<PathBuf>, remote_cache_dir: PathBuf) -> Self {
+        let _ = std::fs::create_dir_all(&remote_cache_dir);
+        if !search_dirs.iter().any(|d| d == &remote_cache_dir) {
+            search_dirs.push(remote_cache_dir.clone());
+        }
+        Self {
+            search_dirs,
+            remote_cache_dir: Some(remote_cache_dir),
+            allow_remote_fetch: true,
             tiles: HashMap::new(),
         }
     }
@@ -269,21 +354,193 @@ impl SrtmCache {
         )
     }
 
+    fn load_or_fetch_single_tile(
+        search_dirs: &[PathBuf],
+        remote_cache_dir: Option<&Path>,
+        allow_remote_fetch: bool,
+        lat_floor: i32,
+        lon_floor: i32,
+    ) -> Result<Option<SrtmTile>> {
+        let name = Self::tile_name(lat_floor, lon_floor);
+        let candidates = [
+            format!("{}.hgt", name),
+            format!("{}.hgt.gz", name),
+            format!("{}.SRTMGL1.hgt", name),
+            format!("{}.SRTMGL1.hgt.gz", name),
+        ];
+        let ocean_marker = format!("{}.ocean", name);
+
+        for dir in search_dirs {
+            if dir.join(&ocean_marker).exists() {
+                return Ok(Some(SrtmTile::ocean_tile(lat_floor, lon_floor)));
+            }
+            for fname in &candidates {
+                let candidate = dir.join(fname);
+                if candidate.exists() {
+                    if let Ok(tile) = SrtmTile::load_from_path(&candidate, lat_floor, lon_floor) {
+                        return Ok(Some(tile));
+                    }
+                }
+            }
+        }
+
+        if !allow_remote_fetch {
+            return Ok(None);
+        }
+
+        let lat_prefix = if lat_floor >= 0 {
+            format!("N{:02}", lat_floor.abs())
+        } else {
+            format!("S{:02}", lat_floor.abs())
+        };
+        let url = format!(
+            "https://s3.amazonaws.com/elevation-tiles-prod/skadi/{}/{}.hgt.gz",
+            lat_prefix, name
+        );
+
+        let save_and_parse = |gz_bytes: &[u8]| -> Result<Option<SrtmTile>> {
+            if let Some(cdir) = remote_cache_dir {
+                let _ = std::fs::create_dir_all(cdir);
+                let tmp_path = cdir.join(format!(
+                    ".{}.{}.{:?}.tmp",
+                    name,
+                    std::process::id(),
+                    std::thread::current().id()
+                ));
+                let final_path = cdir.join(format!("{}.hgt.gz", name));
+                if std::fs::write(&tmp_path, gz_bytes).is_ok() {
+                    let _ = std::fs::rename(&tmp_path, &final_path);
+                }
+            }
+            let tile = SrtmTile::load_from_bytes(gz_bytes, name.clone(), lat_floor, lon_floor)?;
+            Ok(Some(tile))
+        };
+
+        let mark_ocean = || -> Result<Option<SrtmTile>> {
+            if let Some(cdir) = remote_cache_dir {
+                let _ = std::fs::create_dir_all(cdir);
+                let _ = std::fs::write(cdir.join(&ocean_marker), b"ocean\n");
+            }
+            Ok(Some(SrtmTile::ocean_tile(lat_floor, lon_floor)))
+        };
+
+        let has_proxy_env = std::env::var_os("HTTPS_PROXY").is_some()
+            || std::env::var_os("https_proxy").is_some()
+            || std::env::var_os("SSL_CERT_FILE").is_some();
+
+        if !has_proxy_env {
+            let agent = ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(4))
+                .timeout_read(Duration::from_secs(12))
+                .build();
+
+            match agent
+                .get(&url)
+                .set("User-Agent", "PhotoPlanner-Rust-Engine/0.2")
+                .call()
+            {
+                Ok(resp) => {
+                    let mut gz_bytes = Vec::new();
+                    resp.into_reader().read_to_end(&mut gz_bytes)?;
+                    return save_and_parse(&gz_bytes);
+                }
+                Err(ureq::Error::Status(code, _)) if code == 404 || code == 403 => {
+                    return mark_ocean();
+                }
+                Err(_) => {}
+            }
+        }
+
+        // System curl fallback: honors HTTPS_PROXY and OS/OpenSSL CA trust stores on Linux & macOS
+        let tmp_dl = std::env::temp_dir().join(format!(
+            "pp_srtm_{}_{}_{:?}.hgt.gz",
+            name,
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let curl_out = std::process::Command::new("curl")
+            .args([
+                "-sSL",
+                "--connect-timeout",
+                "4",
+                "--max-time",
+                "15",
+                "-A",
+                "PhotoPlanner-Rust-Engine/0.2",
+                "-o",
+            ])
+            .arg(&tmp_dl)
+            .args(["-w", "%{http_code}", &url])
+            .output();
+
+        if let Ok(out) = curl_out {
+            let code_str = String::from_utf8_lossy(&out.stdout);
+            let status_code: u16 = code_str.trim().parse().unwrap_or(0);
+            if status_code == 200 {
+                if let Ok(gz_bytes) = std::fs::read(&tmp_dl) {
+                    let _ = std::fs::remove_file(&tmp_dl);
+                    if gz_bytes.len() > 1024 {
+                        return save_and_parse(&gz_bytes);
+                    }
+                }
+            } else if status_code == 404 || status_code == 403 {
+                let _ = std::fs::remove_file(&tmp_dl);
+                return mark_ocean();
+            }
+        }
+        let _ = std::fs::remove_file(&tmp_dl);
+        Ok(None)
+    }
+
     pub fn preload_tile(&mut self, lat_floor: i32, lon_floor: i32) -> Result<bool> {
         if self.tiles.contains_key(&(lat_floor, lon_floor)) {
             return Ok(true);
         }
-        let name = Self::tile_name(lat_floor, lon_floor);
-        let filename = format!("{}.hgt", name);
-        for dir in &self.search_dirs {
-            let candidate = dir.join(&filename);
-            if candidate.exists() {
-                let tile = SrtmTile::load_from_path(&candidate, lat_floor, lon_floor)?;
-                self.tiles.insert((lat_floor, lon_floor), tile);
-                return Ok(true);
-            }
+        if let Some(tile) = Self::load_or_fetch_single_tile(
+            &self.search_dirs,
+            self.remote_cache_dir.as_deref(),
+            self.allow_remote_fetch,
+            lat_floor,
+            lon_floor,
+        )? {
+            self.tiles.insert((lat_floor, lon_floor), tile);
+            return Ok(true);
         }
         Ok(false)
+    }
+
+    pub fn preload_tiles_parallel(&mut self, coords: &[(i32, i32)]) {
+        let missing: Vec<(i32, i32)> = coords
+            .iter()
+            .copied()
+            .filter(|k| !self.tiles.contains_key(k))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let search_dirs = self.search_dirs.clone();
+        let remote_cache_dir = self.remote_cache_dir.clone();
+        let allow_remote = self.allow_remote_fetch;
+
+        let loaded: Vec<((i32, i32), SrtmTile)> = missing
+            .into_par_iter()
+            .filter_map(|(lat_f, lon_f)| {
+                Self::load_or_fetch_single_tile(
+                    &search_dirs,
+                    remote_cache_dir.as_deref(),
+                    allow_remote,
+                    lat_f,
+                    lon_f,
+                )
+                .ok()
+                .flatten()
+                .map(|t| ((lat_f, lon_f), t))
+            })
+            .collect();
+
+        for (k, tile) in loaded {
+            self.tiles.insert(k, tile);
+        }
     }
 
     pub fn preload_bbox(&mut self, min_lat: f64, min_lon: f64, max_lat: f64, max_lon: f64) {
@@ -291,11 +548,62 @@ impl SrtmCache {
         let lat1 = max_lat.floor() as i32;
         let lon0 = min_lon.floor() as i32;
         let lon1 = max_lon.floor() as i32;
+        let mut coords = Vec::new();
         for lat in lat0..=lat1 {
             for lon in lon0..=lon1 {
-                let _ = self.preload_tile(lat, lon);
+                coords.push((lat, lon));
             }
         }
+        self.preload_tiles_parallel(&coords);
+    }
+
+    /// Preloads all 1°x1° SRTM tiles intersected along rays up to `max_distance_km` from `(origin_lat, origin_lon)`.
+    /// If `az_sector_deg` is `Some((az_center_deg, half_width_deg))`, restricts far-field tile preloading
+    /// beyond 45 km to that solar azimuth wedge while keeping a full 360° ring inside 45 km.
+    pub fn preload_corridor_wedge(
+        &mut self,
+        origin_lat: f64,
+        origin_lon: f64,
+        max_distance_km: f64,
+        az_sector_deg: Option<(f64, f64)>,
+    ) {
+        let m_per_lat = METERS_PER_DEG_LAT;
+        let m_per_lon = meters_per_deg_lon(origin_lat).max(1.0);
+        let mut needed: HashSet<(i32, i32)> = HashSet::new();
+        needed.insert((origin_lat.floor() as i32, origin_lon.floor() as i32));
+
+        let max_d_m = (max_distance_km.clamp(10.0, 380.0)) * 1000.0;
+        for az_i in (0..360).step_by(4) {
+            let az = az_i as f64;
+            let in_sector = if let Some((center, half_w)) = az_sector_deg {
+                let mut diff = (az - center).rem_euclid(360.0);
+                if diff > 180.0 {
+                    diff = 360.0 - diff;
+                }
+                diff <= half_w
+            } else {
+                true
+            };
+            let ray_limit_m = if in_sector {
+                max_d_m
+            } else {
+                max_d_m.min(48_000.0)
+            };
+            let az_rad = az.to_radians();
+            let de = az_rad.sin();
+            let dn = az_rad.cos();
+            let mut d = 15_000.0;
+            while d <= ray_limit_m {
+                let lat = origin_lat + (d * dn) / m_per_lat;
+                let lon = origin_lon + (d * de) / m_per_lon;
+                needed.insert((lat.floor() as i32, lon.floor() as i32));
+                d += 25_000.0;
+            }
+        }
+
+        let mut coords: Vec<(i32, i32)> = needed.into_iter().collect();
+        coords.sort_unstable();
+        self.preload_tiles_parallel(&coords);
     }
 }
 
@@ -305,10 +613,8 @@ impl ElevationSurface for SrtmCache {
         let lon_floor = lon_deg.floor() as i32;
         if let Some(tile) = self.tiles.get(&(lat_floor, lon_floor)) {
             tile.sample_bilinear_m(lat_deg, lon_deg)
-        } else if lon_deg < -121.5 {
-            0.0
         } else {
-            1200.0
+            0.0
         }
     }
 }

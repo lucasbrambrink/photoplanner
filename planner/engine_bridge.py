@@ -5,17 +5,45 @@ Python bridge connecting the PhotoPlanner Rust Light-Notch & Ray-Casting Engine
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_RUST_BIN = ROOT_DIR / "raycaster" / "target" / "release" / "photoplanner"
-DEFAULT_RECREATION_DB = Path("/Users/lucasbrambrink/Coding/recreation/recreation/db.sqlite3")
-DEFAULT_ELEVATION_DIR = Path("/Users/lucasbrambrink/Coding/recreation/recreation/data/elevation")
+
+
+def _resolve_recreation_db() -> Path:
+    env_p = os.environ.get("PHOTOPLANNER_RECREATION_DB")
+    if env_p:
+        return Path(env_p)
+    legacy = Path("/Users/lucasbrambrink/Coding/recreation/recreation/db.sqlite3")
+    if legacy.exists():
+        return legacy
+    return ROOT_DIR / "data" / "recreation_fallback.sqlite3"
+
+
+def _resolve_elevation_dir() -> Path:
+    env_p = os.environ.get("PHOTOPLANNER_ELEVATION_DIR")
+    if env_p:
+        p = Path(env_p)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    legacy = Path("/Users/lucasbrambrink/Coding/recreation/recreation/data/elevation")
+    if legacy.exists():
+        return legacy
+    fallback = ROOT_DIR / "data" / "srtm_cache"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+DEFAULT_RECREATION_DB = _resolve_recreation_db()
+DEFAULT_ELEVATION_DIR = _resolve_elevation_dir()
 
 
 class PhotoPlannerEngine:
@@ -24,12 +52,12 @@ class PhotoPlannerEngine:
     def __init__(
         self,
         binary_path: Path = DEFAULT_RUST_BIN,
-        recreation_db: Path = DEFAULT_RECREATION_DB,
-        elevation_dir: Path = DEFAULT_ELEVATION_DIR,
+        recreation_db: Optional[Path] = None,
+        elevation_dir: Optional[Path] = None,
     ) -> None:
         self.binary_path = Path(binary_path)
-        self.recreation_db = Path(recreation_db)
-        self.elevation_dir = Path(elevation_dir)
+        self.recreation_db = Path(recreation_db) if recreation_db is not None else _resolve_recreation_db()
+        self.elevation_dir = Path(elevation_dir) if elevation_dir is not None else _resolve_elevation_dir()
 
     def scan_light_notches(
         self,
@@ -113,7 +141,7 @@ class PhotoPlannerEngine:
     def shoot_landmark(
         self,
         landmark: str = "Half Dome",
-        date: str = "2026-10-15",
+        date: Optional[str] = None,
         max_miles: float = 16.0,
         top_k: int = 3,
     ) -> Dict[str, Any]:
@@ -122,6 +150,7 @@ class PhotoPlannerEngine:
         distinct trail viewpoints (VP1, VP2, VP3...), hikes from trailheads, sightline
         geometry, and golden-hour departure/arrival windows.
         """
+        resolved_date = date or dt.datetime.now(ZoneInfo("America/Los_Angeles")).date().isoformat()
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
             tmp_path = Path(tmp.name)
 
@@ -136,7 +165,7 @@ class PhotoPlannerEngine:
                 "--landmark",
                 landmark,
                 "--date",
-                date,
+                resolved_date,
                 "--max-miles",
                 str(max_miles),
                 "--top-k",
@@ -149,4 +178,35 @@ class PhotoPlannerEngine:
         finally:
             if tmp_path.exists():
                 os.remove(tmp_path)
+
+    def solve_corridor_weather(
+        self,
+        lat: float,
+        lon: float,
+        date: Optional[str] = None,
+        phase: str = "sunset",
+        sun_az_deg: float = 259.1,
+        sun_el_deg: float = 0.4,
+        target_elev_m: float = 2693.0,
+        model_engine: str = "ensemble",
+    ) -> Dict[str, Any]:
+        """
+        Runs the full live GOES-18/19 + METAR + 24h NWP + CAMS + Rust 380 km curved-Earth
+        corridor ray-casting solver and returns the parsed weather & radiative report.
+        """
+        from planner.weather import solve_weather_and_corridor
+
+        resolved_date = date or dt.datetime.now(ZoneInfo("America/Los_Angeles")).date().isoformat()
+        raw = solve_weather_and_corridor(
+            lat=lat,
+            lon=lon,
+            date_str=resolved_date,
+            phase=phase,
+            sun_az_deg=sun_az_deg,
+            sun_el_deg=sun_el_deg,
+            target_elev_m=target_elev_m,
+            model_engine=model_engine,
+        )
+        return json.loads(raw.decode("utf-8"))
+
 

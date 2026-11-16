@@ -49,7 +49,7 @@
 
       <div class="control-group">
         <label for="shoot-date" class="control-label">Date</label>
-        <input type="date" id="shoot-date" class="form-control" name="date" value="2026-04-16" />
+        <input type="date" id="shoot-date" class="form-control" name="date" />
       </div>
 
       <div class="control-group">
@@ -220,15 +220,15 @@
       <button type="button" class="scenario-preset-card" id="btn-vp-yesterday-pedro">
         <span class="scenario-preset-icon" aria-hidden="true">🌅</span>
         <span class="scenario-preset-body">
-          <strong>Pedro Point Offshore Slot</strong>
-          <span>3 km HRRR • 93% Open 18 km Horizon Slot + 35% High Cirrus</span>
+          <strong>Pedro Point Yesterday Sunset</strong>
+          <span>3 km HRRR + 380 km Offshore Pacific Corridor Backtest</span>
         </span>
       </button>
       <button type="button" class="scenario-preset-card" id="btn-vp-today-sf">
         <span class="scenario-preset-icon" aria-hidden="true">🔥</span>
         <span class="scenario-preset-body">
-          <strong>Montara Mountain Live HRRR</strong>
-          <span>SF Coast 3 km Mesoscale Deck &amp; Coastal Ridge Flow</span>
+          <strong>Montara Mountain Live Today</strong>
+          <span>Live GOES-18 + METAR + 3 km HRRR Coastal Corridor</span>
         </span>
       </button>
       <button type="button" class="scenario-preset-card" id="btn-vp-fog-sea">
@@ -383,18 +383,18 @@
         </div>
       </details>
 
-      <!-- On-Demand Disclosure: 3-Station Solar Ray-Path & Alpenglow Forecast -->
+      <!-- On-Demand Disclosure: 380 km Curved-Earth Solar Ray-Path & Alpenglow Forecast -->
       <details class="card weather-card" id="weather-disclosure">
         <summary class="weather-summary">
           <div class="weather-summary-main">
-            <span class="eyebrow" id="weather-corridor-eyebrow">SOLAR RAY &amp; ALPENGLOW FORECAST</span>
-            <span class="weather-verdict" id="weather-verdict">Under-the-Deck Alpenglow Explosion</span>
+            <span class="eyebrow" id="weather-corridor-eyebrow">380 KM SOLAR RAY &amp; ALPENGLOW FORECAST</span>
+            <span class="weather-verdict" id="weather-verdict">Evaluating 380 km Corridor…</span>
             <span class="weather-summary-sub" id="weather-summary-sub">
-              87% Beam Transmittance • Click to inspect 75 km ray corridor
+              Click to inspect 380 km curved-Earth ray corridor &amp; live GOES/METAR telemetry
             </span>
           </div>
           <div class="weather-summary-right">
-            <span class="alpenglow-score-badge" id="weather-score-badge">88 / 100</span>
+            <span class="alpenglow-score-badge" id="weather-score-badge">-- / 100</span>
             <span class="disclosure-chevron" aria-hidden="true">▾</span>
           </div>
         </summary>
@@ -403,28 +403,54 @@
           <!-- Sunset vs Sunrise Ray Corridor Switcher -->
           <div class="corridor-phase-tabs" role="tablist" aria-label="Solar Ray Corridor Direction">
             <button type="button" class="corridor-tab is-active" id="tab-corridor-sunset" data-phase="sunset">
-              🌇 Sunset Ray (WSW 75 km)
+              🌇 Sunset Ray (WSW 380 km)
             </button>
             <button type="button" class="corridor-tab" id="tab-corridor-sunrise" data-phase="sunrise">
-              🌅 Sunrise Ray (ESE 75 km)
+              🌅 Sunrise Ray (ESE 380 km)
             </button>
           </div>
 
           <p class="weather-rec" id="weather-recommendation">
-            Sampling multi-altitude cloud layers at 75 km Horizon Entry, 18 km Keyhole Ridge, and 0 km Target Canvas…
+            Integrating 6-band spectral + stochastic cloud-chord extinction across the 0–380 km curved-Earth solar corridor…
           </p>
 
-          <!-- SVG 3-Station Atmospheric Ray-Path Cross-Section (75 km -> 18 km -> 0 km) -->
+          <!-- SVG Multi-Station Atmospheric Ray-Path Cross-Section (190–320 km -> 15 km -> 0 km) -->
           <div class="raypath-diagram-box">
             <div class="raypath-diagram-header">
-              <span id="raypath-azimuth-label">Solar Beam Corridor: Az 259.1° W (El +0.2°)</span>
-              <span id="raypath-trans-pill" class="raypath-trans-pill">End-to-End Beam: 87%</span>
+              <span id="raypath-azimuth-label">Solar Beam Corridor: Az 259.1° W (El +0.4°)</span>
+              <span id="raypath-trans-pill" class="raypath-trans-pill">End-to-End Beam: --%</span>
             </div>
-            <svg id="raypath-svg" class="raypath-svg" viewBox="0 0 360 92" preserveAspectRatio="none" aria-label="75 km to 0 km Solar Ray Cross-Section"></svg>
+            <svg id="raypath-svg" class="raypath-svg" viewBox="0 0 360 92" preserveAspectRatio="none" aria-label="380 km to 0 km Solar Ray Cross-Section"></svg>
           </div>
 
-          <!-- 3-Station Telemetry Grid (75 km Entry | 18 km Notch | 0 km Canvas) -->
+          <!-- 3-Station Representative Telemetry Grid (190 km Far Entry | 15 km Ridge Gate | 0 km Canvas) -->
           <div class="raypath-stations-grid" id="raypath-stations-grid"></div>
+
+          <!-- Bimodal 380 km Radiative Distribution & Live GOES-18 / METAR Nowcast Telemetry -->
+          <div class="raypath-diagram-box" id="corridor-bimodal-box">
+            <div class="raypath-diagram-header">
+              <span id="corridor-nowcast-label">380 km Spectral &amp; Stochastic Cloud-Chord Telemetry</span>
+              <span id="corridor-nowcast-pill" class="raypath-trans-pill">6-Station NWP</span>
+            </div>
+            <div class="metric-tiles-grid">
+              <div class="metric-tile">
+                <span class="metric-tile-label">Direct Sunbeam Odds</span>
+                <strong class="metric-tile-val" id="val-direct-beam-prob">--%</strong>
+              </div>
+              <div class="metric-tile">
+                <span class="metric-tile-label">P10 · P50 · P90 Beam</span>
+                <strong class="metric-tile-val" id="val-bimodal-quantiles">-- / -- / --%</strong>
+              </div>
+              <div class="metric-tile">
+                <span class="metric-tile-label">Chappuis Tint · Canvas</span>
+                <strong class="metric-tile-val" id="val-kelvin-canvas">2400 K · --/100</strong>
+              </div>
+              <div class="metric-tile">
+                <span class="metric-tile-label">Primary Corridor Gate</span>
+                <strong class="metric-tile-val" id="val-dominant-blocker">Clear 380 km</strong>
+              </div>
+            </div>
+          </div>
 
           <!-- Fog / Marine Layer Inversion & Dual Sunset Quality Profile -->
           <div class="raypath-diagram-box" id="inversion-profile-box">
@@ -452,32 +478,32 @@
             </div>
           </div>
 
-          <!-- AI Prediction Engines (Google GraphCast, NOAA 3km HRRR, ECMWF, Nowcast) & 3D Atmospheric Feel Synthesizer -->
+          <!-- AI Prediction Engines (ECMWF AIFS, NOAA 3km HRRR, ECMWF IFS, GOES-18 Nowcast) & 3D Atmospheric Feel Synthesizer -->
           <div class="raypath-diagram-box ai-ensemble-box" id="ai-ensemble-box">
             <div class="raypath-diagram-header">
-              <span id="ai-ensemble-header">🧠 3D AI Weather Engine &amp; Synthesizer</span>
+              <span id="ai-ensemble-header">🧠 Multi-Model Weather &amp; GOES Nowcast Engine</span>
               <span id="ai-ensemble-agreement-pill" class="raypath-trans-pill ai-agreement-pill">92% Agreement</span>
             </div>
-            <div class="corridor-phase-tabs ai-engine-tabs" id="ai-engine-selector-bar" role="group" aria-label="Select 3D Weather Prediction Engine">
-              <button type="button" class="corridor-tab is-active" data-weather-engine="ensemble" title="Hybrid Synthesis: Google DeepMind GraphCast + NOAA 3km HRRR + 15m DEM Downscaling">
+            <div class="corridor-phase-tabs ai-engine-tabs" role="group" id="ai-engine-selector-bar" aria-label="Select 3D Weather Prediction Engine">
+              <button type="button" class="corridor-tab is-active" data-weather-engine="ensemble" title="Lead-Time-Weighted Hybrid: GOES-18 + METAR Nowcast (0–4h) + NOAA 3km HRRR + ECMWF IFS/AIFS">
                 ⚡ Hybrid
               </button>
-              <button type="button" class="corridor-tab" data-weather-engine="graphcast" title="Google DeepMind GraphCast: 37-Level Global GNN + Synthesized 3D Cellular Billows">
-                🧠 GraphCast
+              <button type="button" class="corridor-tab" data-weather-engine="graphcast" title="ECMWF AIFS 0.25° Neural Forecast + 3D Sub-Grid Cellular Billows">
+                🧠 AI Forecast
               </button>
-              <button type="button" class="corridor-tab" data-weather-engine="hrrr" title="NOAA 3km HRRR: Radar-Assimilated Mesoscale 3D Cloud Deck">
+              <button type="button" class="corridor-tab" data-weather-engine="hrrr" title="NOAA NCEP 3km HRRR Radar-Assimilated Mesoscale Column">
                 🛰️ HRRR
               </button>
-              <button type="button" class="corridor-tab" data-weather-engine="ecmwf" title="ECMWF 0.25° IFS/AIFS: Upper-Level Cirrus &amp; Synoptic column">
+              <button type="button" class="corridor-tab" data-weather-engine="ecmwf" title="ECMWF 0.25° IFS Synoptic &amp; Upper-Tropospheric Cirrus">
                 🌍 ECMWF
               </button>
-              <button type="button" class="corridor-tab" data-weather-engine="nowcast" title="GOES-18 West (500m) + Live Wind-Vector Cloud-Break Advection Nowcast">
+              <button type="button" class="corridor-tab" data-weather-engine="nowcast" title="Live NOAA GOES-18/19 ABI Multi-Spectral + Optical-Flow Advection + NWS METAR">
                 📡 Nowcast
               </button>
             </div>
             <div class="ai-feel-banner" id="ai-feel-banner">
-              <strong id="ai-feel-archetype" class="ai-feel-archetype">Dramatic Overcast Cathedral (Dark Cloud Base + Crepuscular God-Rays)</strong>
-              <span id="ai-feel-note" class="ai-feel-note">Synthesizing a dense 3D stratocumulus ceiling with silver-lined cellular fenestrations drifting on the wind.</span>
+              <strong id="ai-feel-archetype" class="ai-feel-archetype">Evaluating 380 km Atmospheric Corridor…</strong>
+              <span id="ai-feel-note" class="ai-feel-note">Coupling 24-hour pressure-level soundings and 180×32 curved-Earth radiative LUT into WebGL2.</span>
             </div>
             <div class="raypath-stations-grid ai-models-grid" id="ai-models-comparison-grid"></div>
           </div>
@@ -486,24 +512,24 @@
           <div class="raypath-diagram-box" id="spatial-transect-box">
             <div class="raypath-diagram-header">
               <span id="spatial-transect-label">3D Positional Cloud &amp; Fog Transect (W → E)</span>
-              <span id="spatial-transect-pill" class="raypath-trans-pill">8×8 Voxel Field</span>
+              <span id="spatial-transect-pill" class="raypath-trans-pill">16×16 Mesoscale Field</span>
             </div>
             <div class="raypath-stations-grid spatial-transect-grid" id="spatial-transect-grid"></div>
           </div>
 
           <!-- Live & Historical Weather Backtesting Quick-Load Bar -->
           <div class="corridor-phase-tabs corridor-preset-grid" role="group" aria-label="Live and Historical Weather Presets">
-            <button type="button" class="corridor-tab" id="btn-yesterday-pedro" title="Yesterday's Pedro Point Sunset: 93% Open 18km Offshore Slot + 43% Mid Altocumulus &amp; 30–37% Cirrus Back-Edge Clearing">
-              🌅 Pedro Pt Slot
+            <button type="button" class="corridor-tab" id="btn-yesterday-pedro" title="Yesterday's Pedro Point Sunset Backtest (Archived HRRR + 380 km Pacific Corridor)">
+              🌅 Yesterday Pedro
             </button>
-            <button type="button" class="corridor-tab" id="btn-live-today-sf" title="Today's Live 3km HRRR Sunset Forecast for SF Coast / Montara / Pedro Point">
-              🔥 Today SF 3km
+            <button type="button" class="corridor-tab" id="btn-live-today-sf" title="Today's Live GOES-18 + METAR + 3km HRRR Sunset Forecast for SF Coast / Montara">
+              🔥 Today SF Live
             </button>
-            <button type="button" class="corridor-tab" id="btn-hist-fog-sea" title="Aug 15, 2025: +10.1°F Marine Inversion Cap with 1,260 ft Fog Sea below Montara Peak">
+            <button type="button" class="corridor-tab" id="btn-hist-fog-sea" title="Aug 15, 2025: Marine Inversion Cap with Fog Sea below Montara Peak">
               ☁️ Fog-Sea '25
             </button>
-            <button type="button" class="corridor-tab" id="btn-hist-clear-slot" title="Oct 22, 2025: Broken Coastal Clouds + Clear 18-75 km Offshore Sunset Slot">
-              ✨ Cirrus '25
+            <button type="button" class="corridor-tab" id="btn-hist-clear-slot" title="Oct 22, 2025: Coastal Pacific Sunset Benchmark">
+              ✨ Coastal '25
             </button>
           </div>
 
@@ -655,7 +681,7 @@
               type="button"
               class="toolbar-pill-btn hud-weather-pill"
               id="viewport-weather-pill"
-              title="Inspect 75 km Solar Ray Corridor &amp; Multi-Model Weather Telemetry"
+              title="Inspect 380 km Solar Ray Corridor &amp; Multi-Model Weather Telemetry"
             >
               🌤️ Loading Sounding…
             </button>

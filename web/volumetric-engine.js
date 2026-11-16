@@ -889,6 +889,9 @@ const FLUID_ADVECT_MICROPHYSICS_FRAGMENT_GLSL3 = /* glsl */ `
   uniform sampler2D uVelTex;
   uniform sampler2D uThermoTex;
   uniform sampler2D uTerrainGridTex;
+  uniform sampler2D uMesoscaleCloudTex;
+  uniform float uMesoscaleSpanM;
+  uniform float uHasMesoscaleGrid;
   out vec4 fragColor;
 
   void main() {
@@ -933,6 +936,17 @@ const FLUID_ADVECT_MICROPHYSICS_FRAGMENT_GLSL3 = /* glsl */ `
     float lowCov = clamp(uLowCloudPct / 100.0, 0.0, 1.0);
     float midCov = clamp(uMidCloudPct / 100.0, 0.0, 1.0);
     float highCov = clamp(uHighCloudPct / 100.0, 0.0, 1.0);
+
+    // Lateral mesoscale boundary relaxation: nudge outer edges of the 18km box toward the 160km NWP/GOES grid
+    if (uHasMesoscaleGrid > 0.5) {
+      vec2 enLocal = (uv - 0.5) * uDomainXyM;
+      vec2 mesoUv = clamp(enLocal / max(20000.0, uMesoscaleSpanM) + 0.5, 0.03, 0.97);
+      vec4 mesoCov = texture(uMesoscaleCloudTex, mesoUv);
+      float edgeBlend = smoothstep(0.30, 0.49, max(abs(uv.x - 0.5), abs(uv.y - 0.5)));
+      lowCov = mix(lowCov, max(mesoCov.r, mesoCov.a * 0.85), edgeBlend * 0.72);
+      midCov = mix(midCov, mesoCov.g, edgeBlend * 0.72);
+      highCov = mix(highCov, mesoCov.b, edgeBlend * 0.72);
+    }
 
     float lclRelM = max(130.0, (100.0 - clamp(uSurfaceRhPct, 15.0, 100.0)) * 25.0);
     float invTop = uInversionBaseM + max(90.0, uInversionThicknessM * 0.85);
@@ -1116,8 +1130,47 @@ const FLUID_TELEMETRY_FRAGMENT_GLSL3 = /* glsl */ `
 `;
 
 // ============================================================================
+// Shared 380 km Curved-Earth Atmospheric & Topographic Corridor LUT Sampler (180 x 32 RGBA8)
+// RGB = Far-corridor (4.6 -> 380 km) spectral transmittance; A = Far SRTM horizon [-6°, +26°]
+// ============================================================================
+const CORRIDOR_LUT_HELPER_GLSL3 = /* glsl */ `
+  uniform sampler2D uCorridorLutTex;
+  uniform float uHasCorridorHorizon;
+  uniform float uUseCorridorAtmo;
+  uniform float uCorridorLutSunElDeg;
+
+  vec4 sampleCorridorLut(float azimuthDeg, float zAslM) {
+    float uAz = fract(azimuthDeg / 360.0) + (0.5 / 180.0);
+    float vNorm = pow(clamp(max(0.0, zAslM) / 12500.0, 0.0, 1.0), 1.0 / 1.6);
+    float vAlt = vNorm * (31.0 / 32.0) + (0.5 / 32.0);
+    return texture(uCorridorLutTex, vec2(uAz, vAlt));
+  }
+
+  float decodeCorridorHorizonDeg(float alphaByteNorm) {
+    return -6.0 + 32.0 * alphaByteNorm;
+  }
+
+  vec3 computeCorridorAtmoModulation(vec3 lutRgb, float zAslM) {
+    float dipDeg = 1.015 * sqrt(max(0.0, zAslM * 0.001));
+    float locEl = clamp(uCorridorLutSunElDeg + dipDeg * 0.52, -1.8, 89.0);
+    float sinEl = sin(radians(max(0.0, locEl)));
+    float amRay = exp(-max(0.0, zAslM) / 8434.0) / (sinEl + 0.15 * pow(max(0.25, locEl + 3.885), -1.253));
+    float amAer = exp(-max(0.0, zAslM) / 1800.0) * 0.72 / (sinEl + 0.09 * pow(max(0.25, locEl + 2.2), -1.15));
+    float o3Slant = 12.2 / sqrt(1.0 + 150.0 * sinEl * sinEl);
+    vec3 tauRef = vec3(0.056, 0.110, 0.220) * amRay
+                + vec3(0.036, 0.045, 0.056) * amAer
+                + vec3(0.026, 0.020, 0.002) * o3Slant;
+    vec3 clearRef = exp(-tauRef);
+    float redMod   = clamp(lutRgb.r / max(0.032, clearRef.r), 0.0, 1.30);
+    float greenMod = mix(redMod, clamp(lutRgb.g / max(0.025, clearRef.g), 0.0, 1.30), smoothstep(0.02, 0.08, clearRef.g));
+    float blueMod  = mix(greenMod, clamp(lutRgb.b / max(0.025, clearRef.b), 0.0, 1.30), smoothstep(0.02, 0.08, clearRef.b));
+    return vec3(redMod, greenMod, blueMod);
+  }
+`;
+
+// ============================================================================
 // GPU Pass: DEM-Space Topographic Soft-Penumbra Shadow & 360° Viewshed Baker
-// Computed ONLY when sun angle, target subject, or DEM changes — turns 242 raymarch
+// Computed ONLY when sun angle, target subject, corridor LUT, or DEM changes — turns 242 raymarch
 // texture taps per Retina pixel in `TERRAIN_FRAGMENT_SHADER` into 1 O(1) fetch!
 // ============================================================================
 const TERRAIN_BAKE_FRAGMENT_GLSL3 = /* glsl */ `
@@ -1132,6 +1185,9 @@ const TERRAIN_BAKE_FRAGMENT_GLSL3 = /* glsl */ `
   uniform vec2 uTargetEN;
   uniform float uTargetUpperZ;
   uniform float uShowViewshed;
+  ${CORRIDOR_LUT_HELPER_GLSL3}
+
+  const float BAKE_EARTH_R_EFF = 7350000.0;
 
   float sampleDemSmooth(vec2 uv) {
     float n = max(uGridSize, 240.0);
@@ -1163,7 +1219,9 @@ const TERRAIN_BAKE_FRAGMENT_GLSL3 = /* glsl */ `
     float closestOccluderDist = 0.0;
     float minPenumbraRatio = 1e5;
 
-    if (uSunDirENU.z <= -0.01 || ndotl <= 0.002) {
+    float sunElDeg = degrees(asin(clamp(uSunDirENU.z, -1.0, 1.0)));
+
+    if (sunElDeg <= -2.2 || ndotl <= 0.002) {
       lit = 0.0;
     } else {
       vec2 horizDir = normalize(uSunDirENU.xy + vec2(1e-5));
@@ -1181,7 +1239,8 @@ const TERRAIN_BAKE_FRAGMENT_GLSL3 = /* glsl */ `
         }
         float distM = fi * marchStepM;
         float rayZ = zOrigin + distM * tanEl;
-        float terrainZ = sampleDemSmooth(sampleUv);
+        float curvDrop = (distM * distM) / (2.0 * BAKE_EARTH_R_EFF);
+        float terrainZ = sampleDemSmooth(sampleUv) - curvDrop;
         float clearance = rayZ - terrainZ;
         if (distM > 45.0 && clearance < minClearance) {
           minClearance = max(-50.0, clearance);
@@ -1197,6 +1256,25 @@ const TERRAIN_BAKE_FRAGMENT_GLSL3 = /* glsl */ `
       }
       if (lit > 0.0 && minPenumbraRatio < 1.0) {
         lit = smoothstep(-1.0, 1.0, minPenumbraRatio);
+      }
+
+      // Couple 4.6 km -> 200 km curved-Earth SRTM mountain & sea-limb horizon shadow!
+      if (lit > 0.0 && uHasCorridorHorizon > 0.5) {
+        float sunAzDeg = mod(degrees(atan(uSunDirENU.x, uSunDirENU.y)) + 360.0, 360.0);
+        vec4 corr = sampleCorridorLut(sunAzDeg, zOrigin);
+        float farHorizonDeg = decodeCorridorHorizonDeg(corr.a);
+        float farMarginDeg = sunElDeg - farHorizonDeg;
+        float farDiskVis = smoothstep(-0.2665, 0.2665, farMarginDeg);
+        lit *= farDiskVis;
+        if (farMarginDeg < 1.1) {
+          float eqClearanceM = farMarginDeg * 140.0;
+          if (eqClearanceM < minClearance) {
+            minClearance = max(-50.0, eqClearanceM);
+            closestOccluderDist = max(closestOccluderDist, 8500.0);
+          }
+        }
+      } else if (uHasCorridorHorizon <= 0.5 && sunElDeg <= -0.25) {
+        lit *= smoothstep(-0.55, 0.15, sunElDeg);
       }
     }
 
@@ -1237,6 +1315,7 @@ const TRIPOD_RAYCAST_FRAGMENT_GLSL3 = /* glsl */ `
   uniform vec2 uTripodEN;
   uniform vec2 uTargetEN;
   uniform float uTargetZM;
+  ${CORRIDOR_LUT_HELPER_GLSL3}
 
   const float R_EFF = 7328000.0; // Curved Earth with k=0.13 standard refraction
 
@@ -1297,17 +1376,28 @@ const TRIPOD_RAYCAST_FRAGMENT_GLSL3 = /* glsl */ `
         bestDistM = d;
       }
     }
-    float maxElDeg = max(0.0, degrees(atan(maxSlope)));
+    float maxElDeg = degrees(atan(maxSlope));
+    if (uHasCorridorHorizon > 0.5) {
+      float farH = decodeCorridorHorizonDeg(sampleCorridorLut(azDeg, eyeZ).a);
+      if (farH > maxElDeg) {
+        maxElDeg = farH;
+        bestDistM = max(bestDistM, uSpanM * 0.75);
+      }
+    }
+    maxElDeg = max(0.0, maxElDeg);
     fragColor = vec4(azDeg, maxElDeg, bestDistM, tripodGroundZ);
   }
 `;
 
 // Dual-backend fluid volume sampler (samples GPU 1040x780 padded 128x128x48 atlas OR fallback 64x64x48 3D texture)
-// Includes non-repeating far-horizon synoptic octave blend so 85 km vistas never tile periodically!
+// Seamlessly blends beyond the 18 km local Navier-Stokes domain into the 160 km GOES/NWP mesoscale cloud field!
 const SAMPLE_FLUID_VOLUME_HELPER_GLSL3 = /* glsl */ `
   uniform sampler2D uCloudAtlas2D;
   uniform sampler3D uCloudVolume3D;
   uniform float uUseGpuAtlas;
+  uniform sampler2D uMesoscaleCloudTex;
+  uniform float uMesoscaleSpanM;
+  uniform float uHasMesoscaleGrid;
 
   vec4 sampleFluidMacro(vec2 uvWorld, float s) {
     if (uUseGpuAtlas > 0.5) {
@@ -1343,7 +1433,7 @@ const SAMPLE_FLUID_VOLUME_HELPER_GLSL3 = /* glsl */ `
     vec4 nearFl = sampleFluidMacro(uvPrimary, s);
 
     // Keep central landmark domain 100% faithful to local DEM fluid physics;
-    // smoothly blend an incommensurately rotated (36.87 deg) 2.37x macro octave in the far vista!
+    // smoothly blend an incommensurately rotated (36.87 deg) 2.37x macro octave + 160 km mesoscale grid in the far vista!
     float radialDist = length(en);
     float farBlend = smoothstep(domainXyM * 0.43, domainXyM * 0.96, radialDist);
     if (farBlend <= 0.002) {
@@ -1359,15 +1449,33 @@ const SAMPLE_FLUID_VOLUME_HELPER_GLSL3 = /* glsl */ `
       clamp(nearFl.rg * (0.52 + 0.92 * farFl.rg) + 0.22 * farFl.rg * farFl.rg, 0.0, 1.0),
       farBlend * 0.78
     );
-    return vec4(
-      combinedCloud,
-      mix(nearFl.b, farFl.b, farBlend * 0.45),
-      mix(nearFl.a, farFl.a, farBlend * 0.55)
-    );
+    float outW = mix(nearFl.b, farFl.b, farBlend * 0.45);
+    float outRh = mix(nearFl.a, farFl.a, farBlend * 0.55);
+
+    if (uHasMesoscaleGrid > 0.5) {
+      float mesoBlend = smoothstep(domainXyM * 0.48, domainXyM * 1.45, radialDist);
+      if (mesoBlend > 0.005) {
+        vec2 mesoUv = clamp(en / max(20000.0, uMesoscaleSpanM) + 0.5, 0.02, 0.98);
+        vec4 meso = texture(uMesoscaleCloudTex, mesoUv); // R=low, G=mid, B=high, A=fog/inv
+        float lowVert = (1.0 - smoothstep(0.32, 0.52, s)) * smoothstep(0.01, 0.08, s);
+        float midVert = smoothstep(0.28, 0.44, s) * (1.0 - smoothstep(0.62, 0.78, s));
+        float highVert = smoothstep(0.60, 0.76, s) * (1.0 - smoothstep(0.93, 1.0, s));
+        float cellMod = clamp(0.45 + 0.95 * max(farFl.r, nearFl.r * 0.75), 0.35, 1.30);
+        float iceMod  = clamp(0.45 + 0.95 * max(farFl.g, nearFl.g * 0.75), 0.35, 1.30);
+        float mesoLiq = sqrt(clamp((max(meso.r, meso.a * 0.9) * lowVert + meso.g * midVert) * cellMod, 0.0, 1.0));
+        float mesoIce = sqrt(clamp(meso.b * highVert * iceMod, 0.0, 1.0));
+        combinedCloud.x = mix(combinedCloud.x, mesoLiq, mesoBlend * 0.85);
+        combinedCloud.y = mix(combinedCloud.y, mesoIce, mesoBlend * 0.85);
+        outRh = mix(outRh, clamp(0.25 + 0.70 * max(meso.r, meso.a), 0.0, 1.0), mesoBlend * 0.65);
+      }
+    }
+
+    return vec4(combinedCloud, outW, outRh);
   }
 `;
 
 // Pass A: 256x256 GPU Cloud Shadow Transmittance LUT (shadowMapRT)
+// Starts each shadow ray at the ACTUAL terrain surface elevation (uHeightTex) along true low-angle solar rays!
 const CLOUD_SHADOW_MAP_FRAGMENT_GLSL3 = /* glsl */ `
   precision highp float;
   precision highp sampler3D;
@@ -1376,6 +1484,9 @@ const CLOUD_SHADOW_MAP_FRAGMENT_GLSL3 = /* glsl */ `
   out vec4 fragColor;
 
   ${SAMPLE_FLUID_VOLUME_HELPER_GLSL3}
+  uniform sampler2D uHeightTex;
+  uniform float uHasHeightTex;
+  uniform float uSpanM;
   uniform sampler3D uDetailNoise3D;
   uniform vec3 uSunDirWorld;
   uniform float uDomainXyM;
@@ -1398,18 +1509,35 @@ const CLOUD_SHADOW_MAP_FRAGMENT_GLSL3 = /* glsl */ `
     return clamp((-0.26 + sqrt(0.0676 + 2.96 * zeta)) / 1.48, 0.0, 1.0);
   }
 
+  float sampleShadowTerrainLocalY(vec2 worldXZ) {
+    if (uHasHeightTex < 0.5) return 0.0;
+    float halfSpan = uSpanM * 0.5;
+    vec2 demUv = vec2((worldXZ.x + halfSpan) / max(uSpanM, 1.0), (-worldXZ.y + halfSpan) / max(uSpanM, 1.0));
+    if (demUv.x >= 0.0 && demUv.x <= 1.0 && demUv.y >= 0.0 && demUv.y <= 1.0) {
+      return max(0.0, texture(uHeightTex, demUv).r - uMinElevM);
+    }
+    return 0.0;
+  }
+
   void main() {
+    if (uSunDirWorld.y <= -0.03) {
+      fragColor = vec4(0.07, 1.0, 0.0, 1.0);
+      return;
+    }
     float wx = (vUv.x - 0.5) * uDomainXyM;
     float wz = (0.5 - vUv.y) * uDomainXyM;
-    vec3 origin = vec3(wx, max(0.0, 110.0), wz);
-    vec3 lightDir = normalize(vec3(uSunDirWorld.x, max(0.08, abs(uSunDirWorld.y)), uSunDirWorld.z));
+    float groundY = sampleShadowTerrainLocalY(vec2(wx, wz));
+    vec3 origin = vec3(wx, groundY + 4.0, wz);
+    vec3 lightDir = normalize(vec3(uSunDirWorld.x, max(0.016, uSunDirWorld.y), uSunDirWorld.z));
+    float stepM = mix(440.0, 820.0, smoothstep(0.24, 0.02, lightDir.y));
+    float dsKm = stepM * 0.001;
 
     bool convectiveBase = (uLclAltM > uZBaseM + 260.0) && (uInversionBaseM > 680.0);
 
     float tau = 0.0;
-    const int STEPS = 18;
+    const int STEPS = 20;
     for (int i = 0; i < STEPS; i++) {
-      float t = (float(i) + 0.45) * 540.0;
+      float t = (float(i) + 0.45) * stepM;
       vec3 p = origin + lightDir * t;
       float zAsl = p.y + uMinElevM;
       if (zAsl > uZTopM) break;
@@ -1424,7 +1552,7 @@ const CLOUD_SHADOW_MAP_FRAGMENT_GLSL3 = /* glsl */ `
         vec4 dMeso = texture(uDetailNoise3D, pAdv * (1.0 / 1380.0));
         float sculpted = max(0.0, qc * (0.55 + 0.90 * dMeso.r) - 0.16 * (1.0 - dMeso.g) * (1.0 - qc * 0.6));
         float ext = sculpted * 2.85 + qi * 0.48;
-        tau += ext * 0.54;
+        tau += ext * dsKm;
       }
     }
     float trans = clamp(exp(-tau), 0.07, 1.0);
@@ -1445,6 +1573,7 @@ const VOLUMETRIC_RAYMARCH_FRAGMENT_GLSL3 = /* glsl */ `
   uniform sampler2D uHeightTex;
   uniform float uHasHeightTex;
   ${SAMPLE_FLUID_VOLUME_HELPER_GLSL3}
+  ${CORRIDOR_LUT_HELPER_GLSL3}
   uniform sampler3D uDetailNoise3D;
 
   uniform mat4 uInvViewProj;
@@ -1553,7 +1682,7 @@ const VOLUMETRIC_RAYMARCH_FRAGMENT_GLSL3 = /* glsl */ `
     float s = altitudeToS(zAsl);
     vec4 fluid = sampleFluidFieldNonRepeating(posWorld.xz, uDomainXyM, s);
 
-    float farHorizonFade = 1.0 - smoothstep(54000.0, 88000.0, distToCam);
+    float farHorizonFade = 1.0 - smoothstep(78000.0, 118000.0, distToCam);
 
     float qcMacro = fluid.r * fluid.r * uCloudDensityGain * groundClear * farHorizonFade;
     float qiMacro = fluid.g * fluid.g * uCirrusDensityGain * farHorizonFade;
@@ -1738,7 +1867,7 @@ const VOLUMETRIC_RAYMARCH_FRAGMENT_GLSL3 = /* glsl */ `
     float dipDeg = 1.015 * sqrt(max(0.0, zAsl * 0.001));
     localSunElDeg = uSunElDeg + dipDeg;
 
-    if (localSunElDeg <= -2.6) {
+    if (localSunElDeg <= -2.8) {
       return vec3(0.0);
     }
 
@@ -1755,6 +1884,17 @@ const VOLUMETRIC_RAYMARCH_FRAGMENT_GLSL3 = /* glsl */ `
     sunCol *= mix(vec3(1.0), vec3(1.16, 0.92, 0.84), roseHorizon);
 
     float limbVis = smoothstep(-2.1, 0.45, localSunElDeg);
+    if (uHasCorridorHorizon > 0.5 || uUseCorridorAtmo > 0.5) {
+      float sunAzDeg = mod(degrees(atan(uSunDirWorld.x, -uSunDirWorld.z)) + 360.0, 360.0);
+      vec4 corr = sampleCorridorLut(sunAzDeg, zAsl);
+      if (uHasCorridorHorizon > 0.5) {
+        float farHorizonDeg = decodeCorridorHorizonDeg(corr.a);
+        limbVis = smoothstep(farHorizonDeg - 0.28, farHorizonDeg + 0.28, uSunElDeg);
+      }
+      if (uUseCorridorAtmo > 0.5) {
+        sunCol *= computeCorridorAtmoModulation(corr.rgb, zAsl);
+      }
+    }
     return sunCol * limbVis;
   }
 
@@ -1790,7 +1930,7 @@ const VOLUMETRIC_RAYMARCH_FRAGMENT_GLSL3 = /* glsl */ `
     vec3 rayDir = normalize(wFar.xyz - rayOrigin);
 
     bool hitTerrain = rawDepth < 0.99998;
-    float maxDist = 86000.0;
+    float maxDist = 116000.0;
     if (hitTerrain) {
       vec4 ndcHit = vec4(vUv * 2.0 - 1.0, rawDepth * 2.0 - 1.0, 1.0);
       vec4 wHit = uInvViewProj * ndcHit;
@@ -1807,7 +1947,7 @@ const VOLUMETRIC_RAYMARCH_FRAGMENT_GLSL3 = /* glsl */ `
       }
     }
 
-    maxDist = clamp(maxDist, 1.0, 88000.0);
+    maxDist = clamp(maxDist, 1.0, 118000.0);
 
     bool useLunarLight = (uSunElDeg < -6.2) && (uMoonElDeg > 0.2) && (uMoonIllum > 0.05);
     vec3 primaryLightDir = useLunarLight ? normalize(uMoonDirWorld) : normalize(uSunDirWorld);
@@ -2183,6 +2323,57 @@ export class VolumetricAtmosphereEngine {
 
     this.dummyAtlasTex = new THREE.DataTexture(new Uint8Array([0, 0, 128, 128]), 1, 1, THREE.RGBAFormat, THREE.UnsignedByteType);
     this.dummyAtlasTex.needsUpdate = true;
+
+    // 180x32 RGBA8 Curved-Earth 380 km Atmospheric & SRTM Horizon Corridor LUT
+    const lutBytes = new Uint8Array(180 * 32 * 4);
+    for (let i = 0; i < 180 * 32; i++) {
+      lutBytes[i * 4 + 0] = 255;
+      lutBytes[i * 4 + 1] = 255;
+      lutBytes[i * 4 + 2] = 255;
+      lutBytes[i * 4 + 3] = 48; // 0.0 deg horizon
+    }
+    this.corridorLutTex = new THREE.DataTexture(lutBytes, 180, 32, THREE.RGBAFormat, THREE.UnsignedByteType);
+    this.corridorLutTex.minFilter = THREE.LinearFilter;
+    this.corridorLutTex.magFilter = THREE.LinearFilter;
+    this.corridorLutTex.wrapS = THREE.RepeatWrapping;
+    this.corridorLutTex.wrapT = THREE.ClampToEdgeWrapping;
+    this.corridorLutTex.flipY = false;
+    this.corridorLutTex.unpackAlignment = 1;
+    this.corridorLutTex.needsUpdate = true;
+
+    // 16x16 RGBA8 160 km Mesoscale GOES/NWP Spatial Cloud Field (R=low, G=mid, B=high, A=fog)
+    const mesoBytes = new Uint8Array(16 * 16 * 4);
+    for (let i = 0; i < 16 * 16; i++) {
+      mesoBytes[i * 4 + 0] = 96;
+      mesoBytes[i * 4 + 1] = 48;
+      mesoBytes[i * 4 + 2] = 96;
+      mesoBytes[i * 4 + 3] = 32;
+    }
+    this.mesoscaleCloudTex = new THREE.DataTexture(mesoBytes, 16, 16, THREE.RGBAFormat, THREE.UnsignedByteType);
+    this.mesoscaleCloudTex.minFilter = THREE.LinearFilter;
+    this.mesoscaleCloudTex.magFilter = THREE.LinearFilter;
+    this.mesoscaleCloudTex.wrapS = THREE.ClampToEdgeWrapping;
+    this.mesoscaleCloudTex.wrapT = THREE.ClampToEdgeWrapping;
+    this.mesoscaleCloudTex.flipY = false;
+    this.mesoscaleCloudTex.unpackAlignment = 1;
+    this.mesoscaleCloudTex.needsUpdate = true;
+
+    this._hasLoadedCorridorLut = false;
+    this._hasCorridorAtmoData = false;
+    this._hasLoadedMesoscaleGrid = false;
+
+    this.corridorUniforms = {
+      uCorridorLutTex: { value: this.corridorLutTex },
+      uHasCorridorHorizon: { value: 0.0 },
+      uUseCorridorAtmo: { value: 0.0 },
+      uCorridorLutSunElDeg: { value: 0.6 },
+    };
+
+    this.mesoscaleUniforms = {
+      uMesoscaleCloudTex: { value: this.mesoscaleCloudTex },
+      uMesoscaleSpanM: { value: 160000.0 },
+      uHasMesoscaleGrid: { value: 0.0 },
+    };
   }
 
   /**
@@ -2379,6 +2570,7 @@ export class VolumetricAtmosphereEngine {
 
     this.fluidAdvectMicroPass = this._createComputeScene(FLUID_ADVECT_MICROPHYSICS_FRAGMENT_GLSL3, {
       ...this.simUniforms,
+      ...this.mesoscaleUniforms,
       uVelTex: { value: this.velRT[1].texture },
       uThermoTex: { value: this.thermoRT[0].texture },
       uTerrainGridTex: { value: this.terrainGridRT.texture },
@@ -2645,6 +2837,7 @@ export class VolumetricAtmosphereEngine {
       uTargetEN: { value: new THREE.Vector2(0, 0) },
       uTargetUpperZ: { value: 600.0 },
       uShowViewshed: { value: 0.0 },
+      ...this.corridorUniforms,
     });
 
     if (this.supportsFloatFBO) {
@@ -2655,6 +2848,7 @@ export class VolumetricAtmosphereEngine {
         uTripodEN: { value: new THREE.Vector2(0, 0) },
         uTargetEN: { value: new THREE.Vector2(0, 0) },
         uTargetZM: { value: 600.0 },
+        ...this.corridorUniforms,
       });
     }
 
@@ -2663,9 +2857,13 @@ export class VolumetricAtmosphereEngine {
       vertexShader: FULLSCREEN_VERTEX_GLSL3,
       fragmentShader: CLOUD_SHADOW_MAP_FRAGMENT_GLSL3,
       uniforms: {
+        uHeightTex: { value: this.dummyHeightTex },
+        uHasHeightTex: { value: 0.0 },
+        uSpanM: { value: 9200.0 },
         uCloudAtlas2D: { value: this.dummyAtlasTex },
         uCloudVolume3D: { value: this.cloudVolumeTex },
         uUseGpuAtlas: { value: 0.0 },
+        ...this.mesoscaleUniforms,
         uDetailNoise3D: { value: this.detailNoiseTex },
         uSunDirWorld: { value: new THREE.Vector3(-0.85, 0.15, 0.2).normalize() },
         uDomainXyM: { value: 18000.0 },
@@ -2699,6 +2897,8 @@ export class VolumetricAtmosphereEngine {
         uCloudAtlas2D: { value: this.dummyAtlasTex },
         uCloudVolume3D: { value: this.cloudVolumeTex },
         uUseGpuAtlas: { value: 0.0 },
+        ...this.mesoscaleUniforms,
+        ...this.corridorUniforms,
         uDetailNoise3D: { value: this.detailNoiseTex },
         uInvViewProj: { value: new THREE.Matrix4() },
         uViewProj: { value: new THREE.Matrix4() },
@@ -2849,6 +3049,120 @@ export class VolumetricAtmosphereEngine {
     return this.terrainBakeRT.texture;
   }
 
+  getCorridorLutTexture() {
+    return this.corridorLutTex;
+  }
+
+  getCorridorUniforms() {
+    return this.corridorUniforms;
+  }
+
+  setCorridorLut(lutPayload) {
+    if (!lutPayload) {
+      this._hasLoadedCorridorLut = false;
+      this._hasCorridorAtmoData = false;
+      this.corridorUniforms.uHasCorridorHorizon.value = 0.0;
+      this.corridorUniforms.uUseCorridorAtmo.value = 0.0;
+      this._needsTerrainBake = true;
+      return;
+    }
+
+    const azBins = Math.max(16, Math.round(lutPayload.az_bins || 180));
+    const altBins = Math.max(8, Math.round(lutPayload.alt_bins || 32));
+    const expectedLen = azBins * altBins * 4;
+    let bytes = null;
+
+    if (typeof lutPayload.rgba8_b64 === 'string' && lutPayload.rgba8_b64.length > 0) {
+      const binStr = atob(lutPayload.rgba8_b64);
+      if (binStr.length === expectedLen) {
+        bytes = new Uint8Array(expectedLen);
+        for (let i = 0; i < expectedLen; i++) {
+          bytes[i] = binStr.charCodeAt(i);
+        }
+      }
+    } else if (lutPayload.rgba8 && lutPayload.rgba8.length === expectedLen) {
+      bytes = lutPayload.rgba8 instanceof Uint8Array ? lutPayload.rgba8 : new Uint8Array(lutPayload.rgba8);
+    }
+
+    if (!bytes) return;
+
+    if (this.corridorLutTex.image.width !== azBins || this.corridorLutTex.image.height !== altBins) {
+      this.corridorLutTex.dispose();
+      this.corridorLutTex = new THREE.DataTexture(bytes, azBins, altBins, THREE.RGBAFormat, THREE.UnsignedByteType);
+      this.corridorLutTex.minFilter = THREE.LinearFilter;
+      this.corridorLutTex.magFilter = THREE.LinearFilter;
+      this.corridorLutTex.wrapS = THREE.RepeatWrapping;
+      this.corridorLutTex.wrapT = THREE.ClampToEdgeWrapping;
+      this.corridorLutTex.flipY = false;
+      this.corridorLutTex.unpackAlignment = 1;
+      this.corridorUniforms.uCorridorLutTex.value = this.corridorLutTex;
+    } else {
+      this.corridorLutTex.image.data.set(bytes);
+    }
+    this.corridorLutTex.needsUpdate = true;
+
+    this._hasLoadedCorridorLut = true;
+    this._hasCorridorAtmoData = lutPayload.has_weather !== false;
+    this.corridorUniforms.uHasCorridorHorizon.value = 1.0;
+    if (typeof lutPayload.sun_elevation_deg === 'number') {
+      this.corridorUniforms.uCorridorLutSunElDeg.value = lutPayload.sun_elevation_deg;
+    }
+    this.corridorUniforms.uUseCorridorAtmo.value =
+      this._hasCorridorAtmoData && this.activePreset === 'live' ? 1.0 : 0.0;
+    this._needsTerrainBake = true;
+  }
+
+  setMesoscaleCloudGrid(gridPayload) {
+    if (!gridPayload) {
+      this._hasLoadedMesoscaleGrid = false;
+      this.mesoscaleUniforms.uHasMesoscaleGrid.value = 0.0;
+      return;
+    }
+
+    const n = Math.max(4, Math.round(gridPayload.grid_size || 16));
+    const expectedPixels = n * n;
+    let bytes = null;
+
+    if (typeof gridPayload.rgba8_b64 === 'string' && gridPayload.rgba8_b64.length > 0) {
+      const binStr = atob(gridPayload.rgba8_b64);
+      if (binStr.length === expectedPixels * 4) {
+        bytes = new Uint8Array(expectedPixels * 4);
+        for (let i = 0; i < expectedPixels * 4; i++) {
+          bytes[i] = binStr.charCodeAt(i);
+        }
+      }
+    } else if (Array.isArray(gridPayload.cells) && gridPayload.cells.length === expectedPixels) {
+      bytes = new Uint8Array(expectedPixels * 4);
+      for (let i = 0; i < expectedPixels; i++) {
+        const c = gridPayload.cells[i];
+        bytes[i * 4 + 0] = Math.min(255, Math.max(0, Math.round(((c.low_pct ?? c.stratus_pct ?? 0) / 100) * 255)));
+        bytes[i * 4 + 1] = Math.min(255, Math.max(0, Math.round(((c.mid_pct ?? c.altocumulus_pct ?? 0) / 100) * 255)));
+        bytes[i * 4 + 2] = Math.min(255, Math.max(0, Math.round(((c.high_pct ?? c.cirrus_pct ?? 0) / 100) * 255)));
+        bytes[i * 4 + 3] = Math.min(255, Math.max(0, Math.round(((c.fog_pct ?? 0) / 100) * 255)));
+      }
+    }
+
+    if (!bytes) return;
+
+    if (this.mesoscaleCloudTex.image.width !== n || this.mesoscaleCloudTex.image.height !== n) {
+      this.mesoscaleCloudTex.dispose();
+      this.mesoscaleCloudTex = new THREE.DataTexture(bytes, n, n, THREE.RGBAFormat, THREE.UnsignedByteType);
+      this.mesoscaleCloudTex.minFilter = THREE.LinearFilter;
+      this.mesoscaleCloudTex.magFilter = THREE.LinearFilter;
+      this.mesoscaleCloudTex.wrapS = THREE.ClampToEdgeWrapping;
+      this.mesoscaleCloudTex.wrapT = THREE.ClampToEdgeWrapping;
+      this.mesoscaleCloudTex.flipY = false;
+      this.mesoscaleCloudTex.unpackAlignment = 1;
+      this.mesoscaleUniforms.uMesoscaleCloudTex.value = this.mesoscaleCloudTex;
+    } else {
+      this.mesoscaleCloudTex.image.data.set(bytes);
+    }
+    this.mesoscaleCloudTex.needsUpdate = true;
+    this.mesoscaleUniforms.uMesoscaleSpanM.value = gridPayload.span_m || 160000.0;
+    this._hasLoadedMesoscaleGrid = true;
+    this.mesoscaleUniforms.uHasMesoscaleGrid.value = this.activePreset === 'live' ? 1.0 : 0.0;
+  }
+
   setQualityMode(mode) {
     this.qualityMode = mode;
     if (mode === 'performance') {
@@ -2885,6 +3199,7 @@ export class VolumetricAtmosphereEngine {
     const u = this.volumetricMat.uniforms;
     u.uSpanM.value = spanM;
     u.uMinElevM.value = minElevM;
+    this.shadowMat.uniforms.uSpanM.value = spanM;
     this.shadowMat.uniforms.uMinElevM.value = minElevM;
 
     const computedMaxElev =
@@ -2922,6 +3237,8 @@ export class VolumetricAtmosphereEngine {
     if (heightTex) {
       u.uHeightTex.value = heightTex;
       u.uHasHeightTex.value = 1.0;
+      this.shadowMat.uniforms.uHeightTex.value = heightTex;
+      this.shadowMat.uniforms.uHasHeightTex.value = 1.0;
 
       // Resize & configure GPU DEM Bake target to match patch grid resolution
       if (this.terrainBakeRT.width !== gridSize || this.terrainBakeRT.height !== gridSize) {
@@ -2991,7 +3308,7 @@ export class VolumetricAtmosphereEngine {
 
     const s = bu.uSunDirENU.value;
     const t = bu.uTargetEN.value;
-    const key = `${this.terrainMeta.version}|${s.x.toFixed(4)},${s.y.toFixed(4)},${s.z.toFixed(4)}|${t.x.toFixed(1)},${t.y.toFixed(1)},${bu.uTargetUpperZ.value.toFixed(1)}|${bu.uShowViewshed.value}`;
+    const key = `${this.terrainMeta.version}|${s.x.toFixed(4)},${s.y.toFixed(4)},${s.z.toFixed(4)}|${t.x.toFixed(1)},${t.y.toFixed(1)},${bu.uTargetUpperZ.value.toFixed(1)}|${bu.uShowViewshed.value}|${this.corridorUniforms.uHasCorridorHorizon.value}`;
     if (key !== this._terrainBakeKey) {
       this._terrainBakeKey = key;
       this._needsTerrainBake = true;
@@ -3000,6 +3317,21 @@ export class VolumetricAtmosphereEngine {
 
   setLiveWeatherReport(weather) {
     if (!weather) return;
+    if (weather.corridor_lut) {
+      this.setCorridorLut(weather.corridor_lut);
+    }
+    if (weather.mesoscale_cloud_grid) {
+      this.setMesoscaleCloudGrid(weather.mesoscale_cloud_grid);
+    } else if (weather.spatial_cloud_field?.cells?.length) {
+      const n = Math.round(Math.sqrt(weather.spatial_cloud_field.cells.length));
+      if (n * n === weather.spatial_cloud_field.cells.length) {
+        this.setMesoscaleCloudGrid({
+          grid_size: n,
+          span_m: weather.spatial_cloud_field.span_m || 160000.0,
+          cells: weather.spatial_cloud_field.cells,
+        });
+      }
+    }
     if (weather.fluid_atmosphere_params) {
       this.liveWeatherParams = { ...weather.fluid_atmosphere_params };
     } else {
@@ -3047,6 +3379,12 @@ export class VolumetricAtmosphereEngine {
   }
 
   syncWeatherParamsToWorker(reseed = false) {
+    const isLive = this.activePreset === 'live';
+    this.corridorUniforms.uUseCorridorAtmo.value =
+      isLive && this._hasLoadedCorridorLut && this._hasCorridorAtmoData ? 1.0 : 0.0;
+    this.mesoscaleUniforms.uHasMesoscaleGrid.value =
+      isLive && this._hasLoadedMesoscaleGrid ? 1.0 : 0.0;
+
     const p = this.getEffectiveParams();
     const u = this.volumetricMat.uniforms;
     u.uWindSfc.value.set(p.windSfcU ?? 5.2, p.windSfcV ?? -3.4);

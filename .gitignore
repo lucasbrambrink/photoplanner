@@ -1,11 +1,15 @@
 # Rust build artifacts
 /raycaster/target/
 
-# Cached elevation / LiDAR tiles (USGS 3DEP, SRTM, etc.)
+# Cached elevation / LiDAR tiles & satellite weather cache
 /data/3dep_cache/
+/data/srtm_cache/
+/data/weather_cache/
 *.tif
 *.tiff
 *.hgt
+*.hgt.gz
+*.ocean
 
 # Python bytecode & virtual environments
 __pycache__/

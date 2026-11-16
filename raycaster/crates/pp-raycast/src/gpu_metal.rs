@@ -15,6 +15,10 @@
 
 #![cfg(target_os = "macos")]
 
+use crate::corridor::{
+    AtmosphericCorridorState, CorridorRadiativeLut, DEFAULT_LUT_START_DISTANCE_M,
+    LUT_ALTITUDE_GAMMA, LUT_HORIZON_MIN_DEG, LUT_HORIZON_SPAN_DEG, LUT_MAX_ALTITUDE_ASL_M,
+};
 use crate::{HorizonSample, LandmarkTarget3D, ShadowLightMapStats};
 use anyhow::Result;
 use image::{ImageBuffer, Rgb};
@@ -274,8 +278,7 @@ inline float sample_srtm_m(
         }
     }
 
-    float approx_lon = float(lon_floor) + lon_frac;
-    return (approx_lon < -121.5f) ? 0.0f : 1200.0f;
+    return 0.0f;
 }
 
 inline float sample_hybrid_m(
@@ -639,6 +642,249 @@ kernel void kernel_resample_terrain_patch(
     float z = sample_hybrid_m(meta, near_mip, srtm_tiles, srtm_data, s_dlat, s_dlon);
     out_elevations[gid.y * params.grid_size + gid.x] = rint(z * 100.0f) * 0.01f;
 }
+
+struct GpuCorridorStation {
+    float distance_km;
+    float azimuth_deg;
+    float surface_elev_m;
+    float surface_temp_k;
+    float surface_pressure_hpa;
+    float lapse_rate_k_km;
+    float inversion_top_asl_m;
+    float inversion_strength_k;
+    float pbl_top_asl_m;
+    float aod_550nm;
+    float angstrom_exp;
+    float aerosol_scale_m;
+    float ozone_du;
+    uint band_offset;
+    uint band_count;
+    uint _pad0;
+};
+
+struct GpuCloudBand {
+    float base_asl_m;
+    float top_asl_m;
+    float cloud_fraction;
+    float tau_core_vert;
+    float cell_d_m;
+    float delta_edd_factor;
+    float _pad0;
+    float _pad1;
+};
+
+struct GpuCorridorLutParams {
+    uint az_bins;
+    uint alt_bins;
+    uint num_stations;
+    uint _pad0;
+    float origin_dlat_ref;
+    float origin_dlon_ref;
+    float inv_m_per_lon;
+    float lut_el_rad;
+    float start_dist_m;
+    float max_terrain_m;
+    float max_corridor_m;
+    float refraction_k;
+};
+
+constant float GPU_SPECTRAL_WL_NM[6] = {450.0f, 500.0f, 550.0f, 590.0f, 630.0f, 675.0f};
+constant float GPU_TAU_RAYLEIGH[6]   = {0.2210f, 0.1435f, 0.0970f, 0.0730f, 0.0558f, 0.0422f};
+constant float GPU_TAU_OZONE_300[6]  = {0.0012f, 0.0095f, 0.0265f, 0.0368f, 0.0285f, 0.0125f};
+
+kernel void kernel_corridor_radiative_lut(
+    constant GpuSceneMeta& meta [[buffer(0)]],
+    constant GpuSrtmTileMeta* srtm_tiles [[buffer(1)]],
+    device const float* srtm_data [[buffer(2)]],
+    constant GpuCorridorLutParams& params [[buffer(3)]],
+    constant GpuCorridorStation* stations [[buffer(4)]],
+    constant GpuCloudBand* bands [[buffer(5)]],
+    device uchar* out_rgba8 [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.az_bins || gid.y >= params.alt_bins) return;
+
+    float az_deg = (float(gid.x) * 360.0f) / float(params.az_bins);
+    float az_rad = az_deg * 0.01745329252f;
+    float dir_east = sin(az_rad);
+    float dir_north = cos(az_rad);
+
+    float v_norm = (params.alt_bins > 1u) ? (float(gid.y) / float(params.alt_bins - 1u)) : 0.0f;
+    float z_asl = 12500.0f * pow(max(v_norm, 0.0f), 1.6f);
+
+    float k_ref = clamp(params.refraction_k, 0.05f, 0.55f);
+    float earth_r = 6371008.8f;
+    float r_eff = earth_r / (1.0f - k_ref);
+
+    // 1. Far-field SRTM curved-Earth horizon from altitude z_asl (4.6 km -> max_terrain_m)
+    float max_slope = -sqrt(max(0.0f, 2.0f * z_asl * (1.0f - k_ref) / earth_r));
+    float d = max(500.0f, params.start_dist_m);
+    while (d <= params.max_terrain_m) {
+        float s_dlat = fma(d * dir_north, INV_METERS_PER_DEG_LAT_F, params.origin_dlat_ref);
+        float s_dlon = fma(d * dir_east, params.inv_m_per_lon, params.origin_dlon_ref);
+        float z_srtm = sample_srtm_m(meta, srtm_tiles, srtm_data, s_dlat, s_dlon);
+        float drop = (d * d) / (2.0f * r_eff);
+        float slope = (z_srtm - drop - z_asl) / d;
+        if (slope > max_slope) {
+            max_slope = slope;
+        }
+        if (d < 12000.0f) d += 25.0f;
+        else if (d < 40000.0f) d += 50.0f;
+        else if (d < 100000.0f) d += 90.0f;
+        else d += 150.0f;
+    }
+    float far_h_deg = atan(max_slope) * 57.2957795f;
+
+    // 2. Spectral Rayleigh + Chappuis Ozone + CAMS Aerosol + 3D Stochastic Cloud corridor integration
+    float tan_alpha0 = tan(params.lut_el_rad);
+    float abs_tan0 = max(0.01f, abs(tan_alpha0));
+    float atmo_limit_m = max(params.max_corridor_m, 820000.0f);
+    float tau_mol_aer[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float sum_cloud_hazard = 0.0f;
+    float sum_uncond_cloudy_tau = 0.0f;
+
+    uint n_st = min(params.num_stations, 32u);
+    float weights[32];
+
+    float s_m = max(0.0f, params.start_dist_m);
+    while (s_m < atmo_limit_m) {
+        bool in_weather = (s_m < params.max_corridor_m);
+        float base_ds_m = (!in_weather) ? 8000.0f : ((s_m < 10000.0f) ? 250.0f : ((s_m < 40000.0f) ? 600.0f : ((s_m < 120000.0f) ? 1250.0f : 2500.0f)));
+        float max_dz_m = in_weather ? 250.0f : 900.0f;
+        float ds_m = max(2.0f, min(base_ds_m, max_dz_m / abs_tan0));
+
+        float step_end_m = in_weather ? min(s_m + ds_m, params.max_corridor_m) : min(s_m + ds_m, atmo_limit_m);
+        float step_horiz_m = step_end_m - s_m;
+        float s_mid_m = s_m + 0.5f * step_horiz_m;
+        s_m = step_end_m;
+        if (step_horiz_m <= 0.0f) break;
+
+        float drop_mid = (s_mid_m * s_mid_m) / (2.0f * r_eff);
+        float z_ray_m = z_asl + s_mid_m * tan_alpha0 + drop_mid;
+        if (z_ray_m > 45000.0f || z_ray_m < -150.0f) break;
+
+        float dz_ds = tan_alpha0 + s_mid_m / r_eff;
+        float dz_step_m = abs(step_horiz_m * dz_ds);
+        float ds_path_m = sqrt(step_horiz_m * step_horiz_m + dz_step_m * dz_step_m);
+        float s_km = min(s_mid_m, params.max_corridor_m) * 0.001f;
+
+        float dist_sector_blend = clamp(s_km / 25.0f, 0.0f, 1.0f);
+        float sigma_km = max(8.0f, 10.0f + 0.28f * s_km);
+        float inv_2sig2 = 1.0f / (2.0f * sigma_km * sigma_km);
+        float sum_w = 0.0f;
+
+        for (uint i = 0u; i < n_st; i++) {
+            float d_az = fmod(az_deg - stations[i].azimuth_deg + 720.0f, 360.0f);
+            if (d_az > 180.0f) d_az = 360.0f - d_az;
+            float az_w = (1.0f - dist_sector_blend) + dist_sector_blend * max(0.04f, exp(-(d_az * d_az) / (2.0f * 58.0f * 58.0f)));
+            float dd = s_km - stations[i].distance_km;
+            float w = az_w * (exp(-(dd * dd) * inv_2sig2) + 1.0e-6f);
+            weights[i] = w;
+            sum_w += w;
+        }
+
+        float surf_z = 0.0f, temp_k = 0.0f, press = 0.0f, lapse = 0.0f;
+        float inv_top = 0.0f, inv_str = 0.0f, pbl = 0.0f, aod = 0.0f, ang = 0.0f, h_aer = 0.0f, oz = 0.0f;
+
+        if (n_st == 0u || sum_w <= 0.0f) {
+            temp_k = 288.15f; press = 1013.25f; lapse = 6.5f; pbl = 2000.0f;
+            aod = 0.08f; ang = 1.25f; h_aer = 1650.0f; oz = 300.0f;
+        } else {
+            float inv_sum = 1.0f / sum_w;
+            for (uint i = 0u; i < n_st; i++) {
+                float w = weights[i] * inv_sum;
+                weights[i] = w;
+                if (w <= 1.0e-5f) continue;
+                surf_z  += w * stations[i].surface_elev_m;
+                temp_k  += w * stations[i].surface_temp_k;
+                press   += w * stations[i].surface_pressure_hpa;
+                lapse   += w * stations[i].lapse_rate_k_km;
+                inv_top += w * stations[i].inversion_top_asl_m;
+                inv_str += w * stations[i].inversion_strength_k;
+                pbl     += w * stations[i].pbl_top_asl_m;
+                aod     += w * stations[i].aod_550nm;
+                ang     += w * stations[i].angstrom_exp;
+                h_aer   += w * stations[i].aerosol_scale_m;
+                oz      += w * stations[i].ozone_du;
+            }
+            temp_k = max(210.0f, temp_k);
+            press  = clamp(press, 250.0f, 1060.0f);
+            h_aer  = clamp(h_aer, 400.0f, 4500.0f);
+            aod    = clamp(aod, 0.005f, 4.0f);
+            ang    = clamp(ang, 0.1f, 2.4f);
+            oz     = clamp(oz, 180.0f, 480.0f);
+        }
+
+        float h_ray = 8434.0f;
+        float t_local = max(212.0f, temp_k - lapse * 0.001f * max(0.0f, z_ray_m - surf_z));
+        float rho_rel = (press / 1013.25f) * exp(-max(0.0f, z_ray_m) / h_ray) * (288.15f / t_local);
+        float d_ray_base = (ds_path_m / h_ray) * max(0.0f, rho_rel);
+
+        float oz_dz = (z_ray_m - 22500.0f) / 5200.0f;
+        float d_oz_scale = ds_path_m * (exp(-0.5f * oz_dz * oz_dz) / (2.5066283f * 5200.0f)) * (oz / 300.0f);
+
+        float agl_m = max(0.0f, z_ray_m - surf_z);
+        float inv_trap = 1.0f;
+        if (inv_str > 0.5f && inv_top > surf_z) {
+            inv_trap = (z_ray_m <= inv_top) ? (1.0f + min(1.4f, 0.22f * inv_str)) : 0.22f;
+        } else if (z_ray_m > max(surf_z + 300.0f, pbl) + 600.0f) {
+            inv_trap = 0.35f;
+        }
+        float d_aer_550 = ds_path_m * (aod / h_aer) * exp(-agl_m / h_aer) * inv_trap;
+
+        for (uint b = 0u; b < 6u; b++) {
+            float wl_r = GPU_SPECTRAL_WL_NM[b] / 550.0f;
+            tau_mol_aer[b] += GPU_TAU_RAYLEIGH[b] * d_ray_base
+                            + GPU_TAU_OZONE_300[b] * d_oz_scale
+                            + d_aer_550 * pow(max(wl_r, 0.1f), -ang);
+        }
+
+        if (!in_weather) continue;
+
+        for (uint i = 0u; i < n_st; i++) {
+            float w_st = weights[i];
+            if (w_st < 0.02f) continue;
+            uint b0 = stations[i].band_offset;
+            uint bn = stations[i].band_count;
+            for (uint bi = 0u; bi < bn; bi++) {
+                constant GpuCloudBand& cb = bands[b0 + bi];
+                if (z_ray_m >= cb.base_asl_m && z_ray_m <= cb.top_asl_m) {
+                    float c = clamp(cb.cloud_fraction, 0.0f, 0.992f);
+                    if (c <= 0.005f) continue;
+                    float h_band = max(80.0f, cb.top_asl_m - cb.base_asl_m);
+                    float neg_ln = -log(max(0.012f, 1.0f - c));
+                    float du_v = (dz_step_m / h_band) * neg_ln;
+                    float du_g = (step_horiz_m / max(250.0f, cb.cell_d_m)) * neg_ln * (1.0f - 0.50f * c);
+                    sum_cloud_hazard += w_st * sqrt(du_v * du_v + du_g * du_g);
+                    sum_uncond_cloudy_tau += w_st * c * (cb.tau_core_vert / h_band) * min(ds_path_m, h_band * 12.0f) * cb.delta_edd_factor;
+                }
+            }
+        }
+    }
+
+    float p_clear = clamp(exp(-sum_cloud_hazard), 0.0f, 1.0f);
+    float mean_cloudy_tau = (p_clear < 0.998f && sum_uncond_cloudy_tau > 0.0f)
+        ? clamp(sum_uncond_cloudy_tau / max(0.01f, 1.0f - p_clear), 0.06f, 40.0f)
+        : 0.0f;
+    float t_cloudy = (mean_cloudy_tau > 0.0f) ? clamp(exp(-mean_cloudy_tau), 0.0f, 1.0f) : 1.0f;
+    float exp_cloud = p_clear + (1.0f - p_clear) * t_cloudy;
+
+    float tr[6];
+    for (uint b = 0u; b < 6u; b++) {
+        tr[b] = clamp(exp(-tau_mol_aer[b]) * exp_cloud, 0.0f, 1.0f);
+    }
+
+    float r = clamp(0.18f * tr[3] + 0.47f * tr[4] + 0.35f * tr[5], 0.0f, 1.0f);
+    float g = clamp(0.20f * tr[1] + 0.58f * tr[2] + 0.22f * tr[3], 0.0f, 1.0f);
+    float bl = clamp(0.76f * tr[0] + 0.24f * tr[1], 0.0f, 1.0f);
+    float h_norm = clamp((far_h_deg - (-6.0f)) / 32.0f, 0.0f, 1.0f);
+
+    uint out_off = (gid.y * params.az_bins + gid.x) * 4u;
+    out_rgba8[out_off + 0u] = uchar(rint(r * 255.0f));
+    out_rgba8[out_off + 1u] = uchar(rint(g * 255.0f));
+    out_rgba8[out_off + 2u] = uchar(rint(bl * 255.0f));
+    out_rgba8[out_off + 3u] = uchar(rint(h_norm * 255.0f));
+}
 "#;
 
 #[repr(C)]
@@ -785,6 +1031,57 @@ struct GpuPatchParams {
     _pad1: f32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GpuCorridorStation {
+    distance_km: f32,
+    azimuth_deg: f32,
+    surface_elev_m: f32,
+    surface_temp_k: f32,
+    surface_pressure_hpa: f32,
+    lapse_rate_k_km: f32,
+    inversion_top_asl_m: f32,
+    inversion_strength_k: f32,
+    pbl_top_asl_m: f32,
+    aod_550nm: f32,
+    angstrom_exp: f32,
+    aerosol_scale_m: f32,
+    ozone_du: f32,
+    band_offset: u32,
+    band_count: u32,
+    _pad0: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GpuCloudBand {
+    base_asl_m: f32,
+    top_asl_m: f32,
+    cloud_fraction: f32,
+    tau_core_vert: f32,
+    cell_d_m: f32,
+    delta_edd_factor: f32,
+    _pad0: f32,
+    _pad1: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GpuCorridorLutParams {
+    az_bins: u32,
+    alt_bins: u32,
+    num_stations: u32,
+    _pad0: u32,
+    origin_dlat_ref: f32,
+    origin_dlon_ref: f32,
+    inv_m_per_lon: f32,
+    lut_el_rad: f32,
+    start_dist_m: f32,
+    max_terrain_m: f32,
+    max_corridor_m: f32,
+    refraction_k: f32,
+}
+
 struct MetalBuffer {
     ptr: *mut c_void,
     len_bytes: usize,
@@ -867,6 +1164,7 @@ struct MetalEngine {
     pipe_spotlight: *mut c_void,
     pipe_camera_los: *mut c_void,
     pipe_patch: *mut c_void,
+    pipe_corridor_lut: *mut c_void,
     cached_terrain: Mutex<Option<CachedGpuTerrain>>,
 }
 
@@ -881,6 +1179,7 @@ impl Drop for MetalEngine {
             pp_metal_destroy_pipeline(self.pipe_spotlight);
             pp_metal_destroy_pipeline(self.pipe_camera_los);
             pp_metal_destroy_pipeline(self.pipe_patch);
+            pp_metal_destroy_pipeline(self.pipe_corridor_lut);
             pp_metal_destroy(self.ctx_ptr);
         }
     }
@@ -941,6 +1240,7 @@ fn get_engine() -> Option<&'static MetalEngine> {
             let pipe_spotlight = load_pipe("kernel_spotlight_and_png")?;
             let pipe_camera_los = load_pipe("kernel_batch_camera_los")?;
             let pipe_patch = load_pipe("kernel_resample_terrain_patch")?;
+            let pipe_corridor_lut = load_pipe("kernel_corridor_radiative_lut")?;
 
             Some(MetalEngine {
                 ctx_ptr,
@@ -950,6 +1250,7 @@ fn get_engine() -> Option<&'static MetalEngine> {
                 pipe_spotlight,
                 pipe_camera_los,
                 pipe_patch,
+                pipe_corridor_lut,
                 cached_terrain: Mutex::new(None),
             })
         })
@@ -1457,5 +1758,144 @@ pub fn dispatch_terrain_patch_gpu(
             }
         }
         Some((min_z, max_z, elevations))
+    })
+}
+
+/// Evaluates the 2D `(az_bins x alt_bins)` `CorridorRadiativeLut` (`4.6 km -> 380 km`) on Metal GPU.
+pub fn dispatch_corridor_lut_gpu(
+    terrain: &HybridTerrain,
+    corridor: &AtmosphericCorridorState,
+    origin_lat: f64,
+    origin_lon: f64,
+    sun_elevation_deg: f64,
+    az_bins: usize,
+    alt_bins: usize,
+) -> Option<CorridorRadiativeLut> {
+    let az_bins = az_bins.max(16);
+    let alt_bins = alt_bins.max(8);
+    if corridor.stations.len() > 32 {
+        return None;
+    }
+
+    let engine = get_engine()?;
+    engine.with_terrain(terrain, |scene| {
+        let mut gpu_stations = Vec::with_capacity(corridor.stations.len().max(1));
+        let mut gpu_bands = Vec::new();
+
+        for st in &corridor.stations {
+            let band_offset = gpu_bands.len() as u32;
+            let mut band_count = 0u32;
+            for b in &st.cloud_bands {
+                let c = b.cloud_fraction.clamp(0.0, 0.992);
+                if c <= 0.005 || b.top_asl_m <= b.base_asl_m + 10.0 {
+                    continue;
+                }
+                let h_band = (b.top_asl_m - b.base_asl_m).max(80.0);
+                let cell_d_m = (b.characteristic_cell_km.max(0.25) * 1000.0)
+                    .min((h_band / b.aspect_ratio_h_over_d.max(0.03)).max(250.0));
+                let g_asym = 0.85 * (1.0 - b.ice_fraction) + 0.77 * b.ice_fraction;
+                let delta_edd = 1.0 - g_asym * g_asym * 0.88;
+                gpu_bands.push(GpuCloudBand {
+                    base_asl_m: b.base_asl_m as f32,
+                    top_asl_m: b.top_asl_m as f32,
+                    cloud_fraction: c as f32,
+                    tau_core_vert: b.in_cloud_vertical_tau() as f32,
+                    cell_d_m: cell_d_m as f32,
+                    delta_edd_factor: delta_edd as f32,
+                    _pad0: 0.0,
+                    _pad1: 0.0,
+                });
+                band_count += 1;
+            }
+
+            gpu_stations.push(GpuCorridorStation {
+                distance_km: st.distance_km as f32,
+                azimuth_deg: st.azimuth_deg.unwrap_or(corridor.azimuth_center_deg) as f32,
+                surface_elev_m: st.surface_elevation_m as f32,
+                surface_temp_k: (st.surface_temp_c + 273.15) as f32,
+                surface_pressure_hpa: st.surface_pressure_hpa as f32,
+                lapse_rate_k_km: st.lapse_rate_k_km as f32,
+                inversion_top_asl_m: st.inversion_top_asl_m as f32,
+                inversion_strength_k: st.inversion_strength_k as f32,
+                pbl_top_asl_m: st.boundary_layer_top_asl_m as f32,
+                aod_550nm: st.aod_550nm as f32,
+                angstrom_exp: st.angstrom_exponent as f32,
+                aerosol_scale_m: st.aerosol_scale_height_m as f32,
+                ozone_du: st.ozone_du as f32,
+                band_offset,
+                band_count,
+                _pad0: 0,
+            });
+        }
+
+        if gpu_stations.is_empty() {
+            gpu_stations.push(GpuCorridorStation::default());
+        }
+        if gpu_bands.is_empty() {
+            gpu_bands.push(GpuCloudBand::default());
+        }
+
+        let lut_el_deg = sun_elevation_deg.clamp(-2.8, 89.0);
+        let k_ref = corridor.effective_refraction_k(corridor.azimuth_center_deg, 2_000.0);
+        let params = GpuCorridorLutParams {
+            az_bins: az_bins as u32,
+            alt_bins: alt_bins as u32,
+            num_stations: corridor.stations.len() as u32,
+            _pad0: 0,
+            origin_dlat_ref: (origin_lat - scene.ref_lat) as f32,
+            origin_dlon_ref: (origin_lon - scene.ref_lon) as f32,
+            inv_m_per_lon: (1.0 / meters_per_deg_lon(origin_lat).max(1.0)) as f32,
+            lut_el_rad: lut_el_deg.to_radians() as f32,
+            start_dist_m: DEFAULT_LUT_START_DISTANCE_M as f32,
+            max_terrain_m: 200_000.0,
+            max_corridor_m: (corridor.max_corridor_km.clamp(40.0, 420.0) * 1000.0) as f32,
+            refraction_k: k_ref as f32,
+        };
+
+        let total_bytes = az_bins * alt_bins * 4;
+        let params_buf = MetalBuffer::from_slice(engine.ctx_ptr, std::slice::from_ref(&params))?;
+        let stations_buf = MetalBuffer::from_slice(engine.ctx_ptr, &gpu_stations)?;
+        let bands_buf = MetalBuffer::from_slice(engine.ctx_ptr, &gpu_bands)?;
+        let out_buf = MetalBuffer::uninit::<u8>(engine.ctx_ptr, total_bytes)?;
+
+        let bufs = [
+            scene.meta_buf.ptr,
+            scene.srtm_tiles_buf.ptr,
+            scene.srtm_data_buf.ptr,
+            params_buf.ptr,
+            stations_buf.ptr,
+            bands_buf.ptr,
+            out_buf.ptr,
+        ];
+
+        let rc = unsafe {
+            pp_metal_dispatch_2pass_2d(
+                engine.ctx_ptr,
+                engine.pipe_corridor_lut,
+                bufs.as_ptr(),
+                bufs.len(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+                az_bins,
+                alt_bins,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+
+        let rgba8 = out_buf.as_slice::<u8>(total_bytes).to_vec();
+        Some(CorridorRadiativeLut {
+            az_bins,
+            alt_bins,
+            start_distance_m: DEFAULT_LUT_START_DISTANCE_M,
+            max_altitude_asl_m: LUT_MAX_ALTITUDE_ASL_M,
+            altitude_gamma: LUT_ALTITUDE_GAMMA,
+            horizon_min_deg: LUT_HORIZON_MIN_DEG,
+            horizon_span_deg: LUT_HORIZON_SPAN_DEG,
+            sun_elevation_deg,
+            rgba8,
+        })
     })
 }

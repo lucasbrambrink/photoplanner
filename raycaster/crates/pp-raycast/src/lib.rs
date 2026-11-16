@@ -11,8 +11,11 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+pub mod corridor;
+pub use corridor::*;
+
 #[cfg(target_os = "macos")]
-mod gpu_metal;
+pub(crate) mod gpu_metal;
 
 /// Returns the active hardware GPU compute backend description if available and enabled.
 pub fn gpu_backend_info() -> Option<String> {
@@ -920,10 +923,10 @@ pub fn find_subject_golden_hour_windows(
                 target.summit_lon,
                 target.summit_elevation_m + 1.0,
                 sun.azimuth_deg,
-                40_000.0,
+                160_000.0,
             ));
             for &(vlat, vlon, vz) in &valley_points {
-                batched_rays.push((vlat, vlon, vz + 1.0, sun.azimuth_deg, 25_000.0));
+                batched_rays.push((vlat, vlon, vz + 1.0, sun.azimuth_deg, 80_000.0));
             }
         }
 

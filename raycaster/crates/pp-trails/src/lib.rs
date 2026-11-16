@@ -75,8 +75,172 @@ pub struct RecreationDbHarness {
 
 impl RecreationDbHarness {
     pub fn open(db_path: &Path) -> Result<Self> {
-        let conn = Connection::open(db_path)
-            .with_context(|| format!("Failed to open recreation DB at {}", db_path.display()))?;
+        if db_path.exists() {
+            let conn = Connection::open(db_path).with_context(|| {
+                format!("Failed to open recreation DB at {}", db_path.display())
+            })?;
+            return Ok(Self { conn });
+        }
+        Self::open_builtin_fallback()
+    }
+
+    fn open_builtin_fallback() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE web_hikephoto (
+                landmark_name TEXT,
+                latitude REAL,
+                longitude REAL,
+                rank_score REAL,
+                direct_image_url TEXT,
+                title TEXT
+            );
+            CREATE TABLE ridb_permitentrance (
+                permit_entrance_id TEXT PRIMARY KEY,
+                permit_entrance_name TEXT,
+                latitude REAL,
+                longitude REAL
+            );
+            CREATE TABLE web_precomputedroute (
+                id INTEGER PRIMARY KEY,
+                name TEXT,
+                route_type TEXT,
+                start_trailhead_id TEXT,
+                distance_miles REAL,
+                elevation_gain_feet REAL,
+                geometry TEXT,
+                landmarks TEXT
+            );
+            CREATE TABLE web_trailroute (
+                route_id TEXT PRIMARY KEY,
+                name TEXT
+            );
+            CREATE TABLE web_trailsegment (
+                route_id TEXT,
+                geometry TEXT
+            );",
+        )?;
+
+        let seeds = [
+            ("Half Dome", 37.7459, -119.5332, 99.5, "Half Dome Northwest Face"),
+            ("El Capitan", 37.7339, -119.6377, 98.2, "El Capitan Monolith"),
+            ("Glacier Point", 37.7281, -119.5738, 97.4, "Glacier Point Amphitheater"),
+            ("Sentinel Dome", 37.7126, -119.5844, 96.0, "Sentinel Dome 360 Crown"),
+            ("Upper Yosemite Fall", 37.7566, -119.5969, 95.8, "Upper Yosemite Fall"),
+            ("Clouds Rest", 37.7678, -119.4894, 95.2, "Clouds Rest Knife-Edge"),
+            ("Cathedral Peak", 37.8536, -119.4046, 94.1, "Cathedral Peak High Sierra"),
+            ("Purisima Creek Redwoods", 37.4365, -122.3450, 91.5, "Purisima Coastal Ridge"),
+            ("Mt. Tamalpais East Peak", 37.9291, -122.5778, 93.0, "Mt. Tamalpais Marine Layer"),
+        ];
+        for (name, lat, lon, score, title) in seeds {
+            conn.execute(
+                "INSERT INTO web_hikephoto VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+                params![name, lat, lon, score, title],
+            )?;
+        }
+
+        conn.execute(
+            "INSERT INTO ridb_permitentrance VALUES
+             ('TH_GP', 'Glacier Point / Sentinel TH', 37.7118, -119.5865),
+             ('TH_ND', 'Porcupine Creek / North Dome TH', 37.8065, -119.5662),
+             ('TH_HI', 'Washburn & Panorama Rim TH', 37.7196, -119.5728),
+             ('TH_TV', 'Tunnel View / Pohono TH', 37.7156, -119.6776),
+             ('TH_OL', 'Sunrise / Olmsted Point TH', 37.8108, -119.4850),
+             ('TH_CP', 'Cathedral Lakes Trailhead', 37.8732, -119.3812),
+             ('TH_PC', 'Purisima Skyline Trailhead', 37.4428, -122.3322),
+             ('TH_MT', 'Pantoll / East Peak Trailhead', 37.9052, -122.6042)",
+            [],
+        )?;
+
+        let routes = [
+            (
+                101_i64,
+                "Sentinel Dome & Glacier Point Rim Loop",
+                "Loop",
+                "TH_GP",
+                4.8_f64,
+                820.0_f64,
+                r#"[[-119.5865,37.7118],[-119.5858,37.7121],[-119.5850,37.7124],[-119.5844,37.7126],[-119.5810,37.7180],[-119.5772,37.7235],[-119.5738,37.7281],[-119.5772,37.7235],[-119.5810,37.7180],[-119.5844,37.7126],[-119.5855,37.7122],[-119.5865,37.7118]]"#,
+                r#"["Half Dome","Sentinel Dome","Glacier Point","Upper Yosemite Fall"]"#,
+            ),
+            (
+                102_i64,
+                "North Dome & Indian Ridge Trail",
+                "Out & Back",
+                "TH_ND",
+                8.8_f64,
+                1150.0_f64,
+                r#"[[-119.5662,37.8065],[-119.5635,37.8005],[-119.5605,37.7945],[-119.5582,37.7892],[-119.5570,37.7860],[-119.5562,37.7845],[-119.5558,37.7832],[-119.5562,37.7845],[-119.5570,37.7860],[-119.5582,37.7892],[-119.5605,37.7945],[-119.5662,37.8065]]"#,
+                r#"["Half Dome","Clouds Rest","Upper Yosemite Fall"]"#,
+            ),
+            (
+                103_i64,
+                "Washburn Point & Panorama Cliff Overlook",
+                "Out & Back",
+                "TH_HI",
+                5.4_f64,
+                1050.0_f64,
+                r#"[[-119.5728,37.7196],[-119.5705,37.7210],[-119.5678,37.7218],[-119.5648,37.7220],[-119.5612,37.7222],[-119.5585,37.7224],[-119.5568,37.7225],[-119.5585,37.7224],[-119.5612,37.7222],[-119.5648,37.7220],[-119.5705,37.7210],[-119.5728,37.7196]]"#,
+                r#"["Half Dome","Clouds Rest","Glacier Point"]"#,
+            ),
+            (
+                104_i64,
+                "Pohono Trail — Tunnel View to Inspiration & Taft Point",
+                "Out & Back",
+                "TH_TV",
+                7.2_f64,
+                2100.0_f64,
+                r#"[[-119.6776,37.7156],[-119.6750,37.7140],[-119.6720,37.7128],[-119.6690,37.7130],[-119.6580,37.7122],[-119.6440,37.7125],[-119.6048,37.7131],[-119.6440,37.7125],[-119.6580,37.7122],[-119.6690,37.7130],[-119.6750,37.7140],[-119.6776,37.7156]]"#,
+                r#"["El Capitan","Half Dome"]"#,
+            ),
+            (
+                105_i64,
+                "Olmsted Point & Sunrise Lakes Ridge",
+                "Out & Back",
+                "TH_OL",
+                6.8_f64,
+                1420.0_f64,
+                r#"[[-119.4850,37.8108],[-119.4840,37.8065],[-119.4828,37.8012],[-119.4815,37.7960],[-119.4835,37.7895],[-119.4860,37.7820],[-119.4882,37.7745],[-119.4860,37.7820],[-119.4835,37.7895],[-119.4815,37.7960],[-119.4840,37.8065],[-119.4850,37.8108]]"#,
+                r#"["Clouds Rest","Half Dome"]"#,
+            ),
+            (
+                106_i64,
+                "Upper Cathedral Lake & Echo Peaks Bench",
+                "Out & Back",
+                "TH_CP",
+                7.4_f64,
+                1180.0_f64,
+                r#"[[-119.3812,37.8732],[-119.3865,37.8690],[-119.3920,37.8648],[-119.3985,37.8602],[-119.4035,37.8578],[-119.4090,37.8555],[-119.4138,37.8535],[-119.4090,37.8555],[-119.4035,37.8578],[-119.3985,37.8602],[-119.3865,37.8690],[-119.3812,37.8732]]"#,
+                r#"["Cathedral Peak"]"#,
+            ),
+            (
+                107_i64,
+                "Purisima Creek Skyline Ridge Trail",
+                "Loop",
+                "TH_PC",
+                6.2_f64,
+                1450.0_f64,
+                r#"[[-122.3322,37.4428],[-122.3355,37.4418],[-122.3380,37.4410],[-122.3418,37.4388],[-122.3450,37.4365],[-122.3490,37.4348],[-122.3520,37.4330],[-122.3490,37.4348],[-122.3450,37.4365],[-122.3380,37.4410],[-122.3355,37.4418],[-122.3322,37.4428]]"#,
+                r#"["Purisima Creek Redwoods"]"#,
+            ),
+            (
+                108_i64,
+                "Matt Davis & East Peak Ridge Traverse",
+                "Loop",
+                "TH_MT",
+                5.6_f64,
+                1380.0_f64,
+                r#"[[-122.6042,37.9052],[-122.5998,37.9092],[-122.5960,37.9125],[-122.5915,37.9168],[-122.5870,37.9210],[-122.5822,37.9252],[-122.5778,37.9291],[-122.5822,37.9252],[-122.5870,37.9210],[-122.5960,37.9125],[-122.5998,37.9092],[-122.6042,37.9052]]"#,
+                r#"["Mt. Tamalpais East Peak"]"#,
+            ),
+        ];
+        for (id, name, rtype, th, dist, gain, geom, lms) in routes {
+            conn.execute(
+                "INSERT INTO web_precomputedroute VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![id, name, rtype, th, dist, gain, geom, lms],
+            )?;
+        }
+
         Ok(Self { conn })
     }
 

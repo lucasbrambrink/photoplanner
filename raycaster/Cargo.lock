@@ -1119,6 +1119,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "byteorder",
+ "flate2",
+ "rayon",
  "serde",
  "serde_json",
  "ureq",

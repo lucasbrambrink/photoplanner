@@ -2,21 +2,55 @@ use anyhow::Result;
 use chrono::{DateTime, NaiveDate, Utc};
 use clap::{Parser, Subcommand};
 use pp_raycast::{
-    compute_horizon_profile, compute_shadow_and_light_map, compute_terrain_patch_elevations,
-    detect_light_notches, gpu_backend_info,
+    compute_corridor_radiative_lut, compute_horizon_profile, compute_shadow_and_light_map,
+    compute_terrain_patch_elevations, detect_light_notches, evaluate_corridor_ray,
+    evaluate_overhead_cloud_canvas, gpu_backend_info, AtmosphericCorridorState,
 };
 use pp_solar::solar_position;
 use pp_terrain::{
-    meters_per_deg_lon, query_usgs_3dep_1m_tiles, HybridTerrain, MaxMipmapGrid1m, SrtmCache,
-    METERS_PER_DEG_LAT,
+    meters_per_deg_lon, query_usgs_3dep_1m_tiles, ElevationSurface, HybridTerrain, MaxMipmapGrid1m,
+    SrtmCache, METERS_PER_DEG_LAT,
 };
 use pp_trails::{
     analyze_custom_tripod_point, build_itinerary_for_route,
     find_best_viewpoints_and_hikes_for_landmark, find_best_viewpoints_for_seed,
     RecreationDbHarness,
 };
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Instant;
+
+#[derive(Debug, Clone, Deserialize)]
+struct CorridorBatchInput {
+    pub corridor: AtmosphericCorridorState,
+    #[serde(default)]
+    pub hourly_evals: Vec<HourlyCorridorEvalInput>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HourlyCorridorEvalInput {
+    pub hour_index: usize,
+    #[serde(default)]
+    pub time_local: String,
+    pub sun_az_deg: f64,
+    pub sun_el_deg: f64,
+    #[serde(default)]
+    pub include_lut: bool,
+    #[serde(default)]
+    pub corridor: Option<AtmosphericCorridorState>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HourlyCorridorEvalOutput {
+    pub hour_index: usize,
+    pub time_local: String,
+    pub sun_az_deg: f64,
+    pub sun_el_deg: f64,
+    pub ray: pp_raycast::CorridorRayResult,
+    pub overhead_canvas: pp_raycast::OverheadCanvasReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lut_rgba8_b64: Option<String>,
+}
 
 #[derive(Parser)]
 #[command(
@@ -25,14 +59,14 @@ use std::time::Instant;
     about = "1m LiDAR Light-Notch & Trail Itinerary Prediction Engine"
 )]
 struct Cli {
-    /// Path to SRTM .hgt directory (defaults to recreation/data/elevation)
+    /// Path to SRTM .hgt directory (defaults to PHOTOPLANNER_ELEVATION_DIR or recreation/data/elevation)
     #[arg(
         long,
         default_value = "/Users/lucasbrambrink/Coding/recreation/recreation/data/elevation"
     )]
     elevation_dir: PathBuf,
 
-    /// Path to recreation SQLite database (defaults to recreation/db.sqlite3)
+    /// Path to recreation SQLite database (defaults to PHOTOPLANNER_RECREATION_DB or recreation/db.sqlite3)
     #[arg(
         long,
         default_value = "/Users/lucasbrambrink/Coding/recreation/recreation/db.sqlite3"
@@ -190,23 +224,91 @@ enum Commands {
         #[arg(long)]
         json_out: PathBuf,
     },
+
+    /// Integrate the full 0–380 km curved-Earth refractive, spectral & stochastic cloud corridor
+    /// onto a target landmark + local overhead cloud canvas, and emit the WebGL2 CorridorRadiativeLut
+    CorridorRaycast {
+        #[arg(long, default_value_t = 37.7459, allow_hyphen_values = true)]
+        lat: f64,
+        #[arg(long, default_value_t = -119.5332, allow_hyphen_values = true)]
+        lon: f64,
+        /// Optional explicit target altitude in meters ASL (defaults to terrain elevation at lat/lon)
+        #[arg(long, allow_hyphen_values = true)]
+        target_asl_m: Option<f64>,
+        #[arg(long, default_value_t = 252.0, allow_hyphen_values = true)]
+        sun_az_deg: f64,
+        #[arg(long, default_value_t = 1.5, allow_hyphen_values = true)]
+        sun_el_deg: f64,
+        #[arg(long, default_value_t = 2000)]
+        near_grid_m: usize,
+        #[arg(long, default_value_t = 180)]
+        az_bins: usize,
+        #[arg(long, default_value_t = 32)]
+        alt_bins: usize,
+        /// Optional JSON file containing `CorridorBatchInput` (`{ corridor, hourly_evals }`) or `AtmosphericCorridorState`
+        #[arg(long)]
+        corridor_json: Option<PathBuf>,
+        /// Optional output JSON file path
+        #[arg(long)]
+        json_out: Option<PathBuf>,
+    },
 }
 
-fn load_hybrid_terrain(
+fn resolve_data_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("PHOTOPLANNER_DATA_DIR") {
+        return PathBuf::from(p);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        // target/release/photoplanner -> raycaster -> repo root -> data
+        if let Some(repo_root) = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+        {
+            if repo_root.join("raycaster").exists() || repo_root.join("server.py").exists() {
+                return repo_root.join("data");
+            }
+        }
+    }
+    let cwd_data = PathBuf::from("data");
+    if cwd_data.exists() || PathBuf::from("server.py").exists() {
+        return cwd_data;
+    }
+    PathBuf::from("/tmp/photoplanner_data")
+}
+
+fn load_hybrid_terrain_with_corridor(
     elevation_dir: &PathBuf,
     center_lat: f64,
     center_lon: f64,
     near_grid_m: usize,
+    corridor_reach_km: f64,
+    az_sector_deg: Option<(f64, f64)>,
 ) -> HybridTerrain {
-    let mut srtm = SrtmCache::new(vec![elevation_dir.clone()]);
-    srtm.preload_bbox(
-        center_lat - 0.6,
-        center_lon - 0.6,
-        center_lat + 0.6,
-        center_lon + 0.6,
-    );
+    let data_dir = resolve_data_dir();
+    let srtm_cache_dir = data_dir.join("srtm_cache");
+    let mut search_dirs = Vec::new();
+    if let Ok(env_el) = std::env::var("PHOTOPLANNER_ELEVATION_DIR") {
+        search_dirs.push(PathBuf::from(env_el));
+    }
+    if elevation_dir.exists() {
+        search_dirs.push(elevation_dir.clone());
+    }
 
-    let cache_dir = PathBuf::from("/Users/lucasbrambrink/Coding/photoplanner/data/3dep_cache");
+    let mut srtm = SrtmCache::with_aws_skadi_cache(search_dirs, srtm_cache_dir);
+    if corridor_reach_km > 65.0 {
+        srtm.preload_corridor_wedge(center_lat, center_lon, corridor_reach_km, az_sector_deg);
+    } else {
+        srtm.preload_bbox(
+            center_lat - 0.6,
+            center_lon - 0.6,
+            center_lat + 0.6,
+            center_lon + 0.6,
+        );
+    }
+
+    let cache_dir = data_dir.join("3dep_cache");
     let near_1m = if near_grid_m > 0 {
         let clamped_m = near_grid_m.min(2000);
         Some(MaxMipmapGrid1m::fetch_or_load_3dep_1m(
@@ -222,6 +324,22 @@ fn load_hybrid_terrain(
     };
 
     HybridTerrain::new(near_1m, srtm)
+}
+
+fn load_hybrid_terrain(
+    elevation_dir: &PathBuf,
+    center_lat: f64,
+    center_lon: f64,
+    near_grid_m: usize,
+) -> HybridTerrain {
+    load_hybrid_terrain_with_corridor(
+        elevation_dir,
+        center_lat,
+        center_lon,
+        near_grid_m,
+        165.0,
+        None,
+    )
 }
 
 fn main() -> Result<()> {
@@ -698,7 +816,8 @@ fn main() -> Result<()> {
             json_out,
             bin_out,
         } => {
-            let terrain = load_hybrid_terrain(&cli.elevation_dir, lat, lon, 2000);
+            let terrain =
+                load_hybrid_terrain_with_corridor(&cli.elevation_dir, lat, lon, 2000, 25.0, None);
             let m_per_lat = METERS_PER_DEG_LAT;
             let m_per_lon = meters_per_deg_lon(lat);
 
@@ -802,6 +921,155 @@ fn main() -> Result<()> {
                 shoot_date,
             )?;
             std::fs::write(&json_out, serde_json::to_string(&report)?)?;
+        }
+
+        Commands::CorridorRaycast {
+            lat,
+            lon,
+            target_asl_m,
+            sun_az_deg,
+            sun_el_deg,
+            near_grid_m,
+            az_bins,
+            alt_bins,
+            corridor_json,
+            json_out,
+        } => {
+            let t0 = Instant::now();
+            let terrain = load_hybrid_terrain_with_corridor(
+                &cli.elevation_dir,
+                lat,
+                lon,
+                near_grid_m,
+                200.0,
+                None,
+            );
+            let terrain_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            let ground_asl_m = terrain.elevation_m(lat, lon);
+            let origin_asl_m = target_asl_m
+                .map(|z| z.max(ground_asl_m + 1.8))
+                .unwrap_or(ground_asl_m + 1.8);
+
+            let (corridor, hourly_evals) = if let Some(ref cpath) = corridor_json {
+                let raw = std::fs::read_to_string(cpath)?;
+                if let Ok(batch) = serde_json::from_str::<CorridorBatchInput>(&raw) {
+                    (batch.corridor, batch.hourly_evals)
+                } else {
+                    let single: AtmosphericCorridorState = serde_json::from_str(&raw)?;
+                    (single, Vec::new())
+                }
+            } else {
+                (
+                    AtmosphericCorridorState::clear_standard(lat, lon, origin_asl_m, sun_az_deg),
+                    Vec::new(),
+                )
+            };
+
+            let t_int = Instant::now();
+            let primary_ray = evaluate_corridor_ray(
+                &terrain,
+                &corridor,
+                lat,
+                lon,
+                origin_asl_m,
+                sun_az_deg,
+                sun_el_deg,
+            );
+            let overhead_canvas = evaluate_overhead_cloud_canvas(
+                &terrain,
+                &corridor,
+                lat,
+                lon,
+                sun_az_deg,
+                sun_el_deg,
+            );
+            let lut = compute_corridor_radiative_lut(
+                &terrain,
+                &corridor,
+                lat,
+                lon,
+                sun_el_deg,
+                az_bins,
+                alt_bins,
+            );
+
+            let mut hourly_outputs = Vec::with_capacity(hourly_evals.len());
+            for he in &hourly_evals {
+                let st_corr = he.corridor.as_ref().unwrap_or(&corridor);
+                let h_ray = evaluate_corridor_ray(
+                    &terrain,
+                    st_corr,
+                    lat,
+                    lon,
+                    origin_asl_m,
+                    he.sun_az_deg,
+                    he.sun_el_deg,
+                );
+                let h_canvas = evaluate_overhead_cloud_canvas(
+                    &terrain,
+                    st_corr,
+                    lat,
+                    lon,
+                    he.sun_az_deg,
+                    he.sun_el_deg,
+                );
+                let h_lut_b64 = if he.include_lut {
+                    Some(
+                        compute_corridor_radiative_lut(
+                            &terrain,
+                            st_corr,
+                            lat,
+                            lon,
+                            he.sun_el_deg,
+                            az_bins,
+                            alt_bins,
+                        )
+                        .to_base64(),
+                    )
+                } else {
+                    None
+                };
+                hourly_outputs.push(HourlyCorridorEvalOutput {
+                    hour_index: he.hour_index,
+                    time_local: he.time_local.clone(),
+                    sun_az_deg: he.sun_az_deg,
+                    sun_el_deg: he.sun_el_deg,
+                    ray: h_ray,
+                    overhead_canvas: h_canvas,
+                    lut_rgba8_b64: h_lut_b64,
+                });
+            }
+            let integrate_ms = t_int.elapsed().as_secs_f64() * 1000.0;
+
+            let payload = serde_json::json!({
+                "compute_backend": gpu_backend_info().unwrap_or_else(|| "Multi-Core Rayon CPU".to_string()),
+                "timing_ms": {
+                    "terrain_load_ms": (terrain_ms * 100.0).round() / 100.0,
+                    "corridor_integrate_ms": (integrate_ms * 100.0).round() / 100.0,
+                },
+                "srtm_tiles_loaded": terrain.far_srtm.tiles.len(),
+                "primary_ray": primary_ray,
+                "overhead_canvas": overhead_canvas,
+                "corridor_lut": {
+                    "az_bins": lut.az_bins,
+                    "alt_bins": lut.alt_bins,
+                    "start_distance_m": lut.start_distance_m,
+                    "max_altitude_asl_m": lut.max_altitude_asl_m,
+                    "altitude_gamma": lut.altitude_gamma,
+                    "horizon_min_deg": lut.horizon_min_deg,
+                    "horizon_span_deg": lut.horizon_span_deg,
+                    "sun_elevation_deg": lut.sun_elevation_deg,
+                    "rgba8_b64": lut.to_base64(),
+                },
+                "hourly_results": hourly_outputs,
+            });
+
+            if let Some(out_path) = json_out {
+                std::fs::write(&out_path, serde_json::to_string(&payload)?)?;
+            } else {
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            }
         }
     }
 
