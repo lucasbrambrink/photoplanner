@@ -763,8 +763,11 @@ fn integrate_atmospheric_corridor_range(
     let mut sum_cloud_hazard = 0.0_f64;
     let mut sum_uncond_cloudy_tau = 0.0_f64;
 
-    let mut worst_loss_score = 0.0_f64;
-    let mut worst_blocker: Option<(String, f64, f64, f64)> = None;
+    let mut worst_cloud_score = 0.0_f64;
+    let mut worst_cloud_blocker: Option<(String, f64, f64, f64)> = None;
+    let mut worst_aer_score = 0.0_f64;
+    let mut worst_aer_blocker: Option<(String, f64, f64, f64)> = None;
+    let mut max_col_aod_550 = 0.0_f64;
 
     // 6 diagnostic range buckets: [0-5, 5-25, 25-65, 65-130, 130-230, 230-380] km
     let seg_bounds_km: [(f64, f64); 6] = [
@@ -878,9 +881,14 @@ fn integrate_atmospheric_corridor_range(
                 + d_aer_b;
         }
 
-        if in_weather_corridor && d_aer_550 > 0.015 && d_aer_550 > worst_loss_score {
-            worst_loss_score = d_aer_550;
-            worst_blocker = Some(("aerosol_haze".to_string(), s_km, z_ray_m, d_aer_550));
+        if in_weather_corridor {
+            if st.aod_550nm > max_col_aod_550 {
+                max_col_aod_550 = st.aod_550nm;
+            }
+            if st.aod_550nm > 0.22 && d_aer_550 > 0.015 && d_aer_550 > worst_aer_score {
+                worst_aer_score = d_aer_550;
+                worst_aer_blocker = Some(("aerosol_haze".to_string(), s_km, z_ray_m, d_aer_550));
+            }
         }
 
         if !in_weather_corridor {
@@ -910,23 +918,26 @@ fn integrate_atmospheric_corridor_range(
                         (step_horiz_m / cell_d_m) * neg_ln_clear * (1.0 - 0.50 * c);
                     let d_lambda = w_st * (du_vert * du_vert + du_grazing * du_grazing).sqrt();
 
-                    // Delta-Eddington effective slant optical depth inside cloudy cores
-                    // Forward scattering f = g^2 (~0.72 liquid, ~0.60 ice) transmits thin cirrus/mist glow
-                    let g_asym = 0.85 * (1.0 - band.ice_fraction) + 0.77 * band.ice_fraction;
-                    let delta_eddington_factor = 1.0 - g_asym * g_asym * 0.88;
+                    // Delta-Eddington + circumsolar forward-scattering (< 3° aureole) & Cahalan 3D
+                    // filament channeling: hexagonal ice cirrus (`COD ~ 0.5-1.2`) transmits strong
+                    // forward golden-hour light whereas opaque anvil/stratus (`COD ~ 8-25`) extinguishes it.
+                    let delta_eddington_factor =
+                        0.30 * (1.0 - band.ice_fraction) + 0.20 * band.ice_fraction;
+                    let max_slant_airmass =
+                        7.5 * (1.0 - band.ice_fraction) + 4.2 * band.ice_fraction;
+                    let local_slant = (ds_path_m / dz_step_m.max(1e-3)).min(max_slant_airmass);
+                    let eff_band_frac = (dz_step_m / h_band) * local_slant;
                     let tau_core_vert = band.in_cloud_vertical_tau();
-                    let d_uncond_tau = w_st
-                        * c
-                        * (tau_core_vert / h_band)
-                        * ds_path_m.min(h_band * 12.0)
-                        * delta_eddington_factor;
+                    let d_uncond_tau =
+                        w_st * c * tau_core_vert * eff_band_frac * delta_eddington_factor;
 
                     step_hazard += d_lambda;
                     sum_uncond_cloudy_tau += d_uncond_tau;
 
-                    if d_lambda > worst_loss_score {
-                        worst_loss_score = d_lambda;
-                        worst_blocker = Some((band.label.clone(), s_km, z_ray_m, d_lambda));
+                    let loss_weight = d_lambda * (1.0 - (-tau_core_vert * 0.45).exp());
+                    if loss_weight > worst_cloud_score {
+                        worst_cloud_score = loss_weight;
+                        worst_cloud_blocker = Some((band.label.clone(), s_km, z_ray_m, loss_weight));
                     }
                 } else if collect_diagnostics
                     && (band.label == "fog" || band.label == "low")
@@ -960,7 +971,7 @@ fn integrate_atmospheric_corridor_range(
 
     let p_clear_cloud = (-sum_cloud_hazard).exp().clamp(0.0, 1.0);
     let mean_cloudy_tau = if p_clear_cloud < 0.998 && sum_uncond_cloudy_tau > 0.0 {
-        (sum_uncond_cloudy_tau / (1.0 - p_clear_cloud).max(0.01)).clamp(0.06, 40.0)
+        (sum_uncond_cloudy_tau / (1.0 - p_clear_cloud).max(0.01)).clamp(0.05, 40.0)
     } else {
         0.0
     };
@@ -976,14 +987,16 @@ fn integrate_atmospheric_corridor_range(
         expected_total_trans[b] = ts * expected_cloud_trans;
     }
 
-    let blocker_attr = worst_blocker.and_then(|(kind, dist_km, alt_m, _)| {
-        let cloud_loss_pct = (1.0 - expected_cloud_trans) * 100.0;
-        let aer_loss_pct = (1.0 - (-tau_aerosol_550).exp()) * 100.0;
-        let loss_pct = if kind == "aerosol_haze" {
-            aer_loss_pct
-        } else {
-            cloud_loss_pct
-        };
+    let cloud_loss_pct = (1.0 - expected_cloud_trans) * 100.0;
+    let aer_excess_loss_pct =
+        (1.0 - (-3.0 * (max_col_aod_550 - 0.065).max(0.0)).exp()) * 100.0;
+    let chosen_blocker = if cloud_loss_pct >= aer_excess_loss_pct || worst_aer_blocker.is_none() {
+        worst_cloud_blocker.map(|(k, d, a, _)| (k, d, a, cloud_loss_pct))
+    } else {
+        worst_aer_blocker.map(|(k, d, a, _)| (k, d, a, aer_excess_loss_pct))
+    };
+
+    let blocker_attr = chosen_blocker.and_then(|(kind, dist_km, alt_m, loss_pct)| {
         if loss_pct < 6.0 {
             None
         } else {
@@ -1168,11 +1181,11 @@ pub fn evaluate_corridor_ray(
         terrain_disk_visibility: (disk_vis * 1000.0).round() / 1000.0,
         clear_sky_rgb: clear_rgb,
         expected_beam_rgb: expected_rgb,
-        direct_beam_probability: ((disk_vis * p_clear_cloud) * 1000.0).round() / 1000.0,
-        transmittance_p10: (t_p10 * 1000.0).round() / 1000.0,
-        transmittance_p50: (t_p50 * 1000.0).round() / 1000.0,
-        transmittance_p90: (t_p90 * 1000.0).round() / 1000.0,
-        transmittance_expected: (expected_photopic * 1000.0).round() / 1000.0,
+        direct_beam_probability: disk_vis * p_clear_cloud,
+        transmittance_p10: t_p10,
+        transmittance_p50: t_p50,
+        transmittance_p90: t_p90,
+        transmittance_expected: expected_photopic,
         beam_color_kelvin: kelvin.round(),
         chappuis_rose_index: (rose_idx * 1000.0).round() / 1000.0,
         total_rayleigh_od_550: (rayleigh_od * 1000.0).round() / 1000.0,

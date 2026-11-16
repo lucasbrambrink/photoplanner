@@ -84,10 +84,29 @@ def bearing_offset_lat_lon_km(
     return offset_lat_lon_km(lat, lon, dist_km * math.sin(az_r), dist_km * math.cos(az_r))
 
 
-def _get_json(url: str, timeout: float = 9.0) -> Any:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+def _get_json(url: str, timeout: float = 10.0) -> Any:
+    import urllib.error
+
+    last_exc: Exception | None = None
+    for attempt in range(4):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            last_exc = exc
+            if exc.code in (429, 502, 503, 504) and attempt < 3:
+                time.sleep(1.8 * (2**attempt))
+                continue
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if attempt < 2:
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            raise
+    assert last_exc is not None
+    raise last_exc
 
 
 def _safe_arr_val(hourly: dict[str, Any], key: str, idx: int, default: float) -> float:
@@ -438,8 +457,20 @@ def fetch_24h_corridor_and_models(
     now_mono = time.monotonic()
     if cache_key in _MEM_CACHE:
         ts, cached = _MEM_CACHE[cache_key]
-        if now_mono - ts < _MEM_TTL_SECONDS:
+        if is_historical or (now_mono - ts < _MEM_TTL_SECONDS):
             return cached
+
+    disk_path = NWP_CACHE_DIR / f"{cache_key.replace(':', '_')}.json"
+    if disk_path.exists():
+        try:
+            age_s = time.time() - disk_path.stat().st_mtime
+            if is_historical or age_s < _MEM_TTL_SECONDS:
+                cached = json.loads(disk_path.read_text(encoding="utf-8"))
+                if cached.get("ok") and (not is_historical or cached.get("multimodel_doc") is not None):
+                    _MEM_CACHE[cache_key] = (now_mono, cached)
+                    return cached
+        except Exception:
+            pass
 
     # Assemble the 18 spatial coordinates for the single-batch Open-Meteo request:
     coords: list[tuple[str, float, float, float, float | None]] = []
@@ -522,7 +553,7 @@ def fetch_24h_corridor_and_models(
         return docs, f"ERA5 Historical Reanalysis ({d_iso})"
 
     def _fetch_multimodel() -> dict[str, Any] | None:
-        if is_historical and days_delta < -180:
+        if is_historical and days_delta < -1500:
             return None
         base_api = (
             "https://historical-forecast-api.open-meteo.com/v1/forecast"

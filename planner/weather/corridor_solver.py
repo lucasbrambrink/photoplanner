@@ -171,9 +171,11 @@ def _blend_nowcast_into_station(
                 (1.0 - w_obs) * st["rh_2m_pct"] + w_obs * float(station_obs["rh_pct"]), 1
             )
         if station_obs.get("visibility_m") is not None:
-            st["visibility_m"] = round(
-                (1.0 - w_obs) * st["visibility_m"] + w_obs * float(station_obs["visibility_m"]), 0
-            )
+            obs_vis_m = float(station_obs["visibility_m"])
+            if obs_vis_m < 15_250.0 or st["visibility_m"] < obs_vis_m:
+                st["visibility_m"] = round(
+                    (1.0 - w_obs) * st["visibility_m"] + w_obs * obs_vis_m, 0
+                )
         if station_obs.get("aod_550nm_proxy") is not None:
             rs["aod_550nm"] = round(
                 (1.0 - 0.55 * w_obs) * rs["aod_550nm"]
@@ -201,11 +203,18 @@ def _blend_nowcast_into_station(
 
         if station_obs is not None and dist_km <= 30.0:
             obs_low_pct = float(station_obs.get("low_cloud_fraction", 0.0)) * 100.0
-            sat_low_pct = 0.62 * sat_low_pct + 0.38 * obs_low_pct
+            sat_low_pct = 0.65 * sat_low_pct + 0.35 * obs_low_pct
 
-        new_low = int(round((1.0 - w_nowcast) * st["cloud_low_pct"] + w_nowcast * sat_low_pct))
-        new_mid = int(round((1.0 - w_nowcast) * st["cloud_mid_pct"] + w_nowcast * sat_mid_pct))
-        new_high = int(round((1.0 - w_nowcast) * st["cloud_high_pct"] + w_nowcast * sat_high_pct))
+        # Differentiate layer blend weights: pinned boundary-layer stratus persists longer
+        # than fast-moving upper-tropospheric cirrus (`25-45 m/s` jet advection).
+        pin_boost = 0.12 * float(adv.get("pin_weight_low", 0.0))
+        w_low_eff = min(0.96, w_nowcast * (1.06 + pin_boost))
+        w_mid_eff = min(0.94, w_nowcast * 0.96)
+        w_hi_eff = min(0.92, w_nowcast * 0.88)
+
+        new_low = int(round((1.0 - w_low_eff) * st["cloud_low_pct"] + w_low_eff * sat_low_pct))
+        new_mid = int(round((1.0 - w_mid_eff) * st["cloud_mid_pct"] + w_mid_eff * sat_mid_pct))
+        new_high = int(round((1.0 - w_hi_eff) * st["cloud_high_pct"] + w_hi_eff * sat_high_pct))
 
         st["cloud_low_pct"] = max(0, min(100, new_low))
         st["cloud_mid_pct"] = max(0, min(100, new_mid))
@@ -222,18 +231,52 @@ def _blend_nowcast_into_station(
             if (station_obs and station_obs.get("lowest_ceiling_asl_m") and dist_km <= 35.0)
             else None
         )
+        is_cal_l2 = bool(goes_data.get("is_calibrated_l2", False))
 
         if low_cf >= 0.03:
-            is_fog_like = elev_m < 850.0 and (st["inv_jump_k"] >= 1.0 or st["rh_2m_pct"] >= 88.0)
-            base_m = (
-                ceil_asl
-                if (ceil_asl is not None and ceil_asl > elev_m + 30.0)
-                else max(elev_m + (35.0 if is_fog_like else 220.0), st["lcl_asl_m"])
+            sat_low_top_m = float(adv.get("low_top_asl_m") or 0.0)
+            has_sat_low_top = (
+                is_cal_l2
+                and adv["low_cf"] >= 0.12
+                and sat_low_top_m > elev_m + 95.0
             )
-            top_m = max(base_m + (240.0 if is_fog_like else 580.0), st["inv_top_asl_m"])
+            is_fog_like = elev_m < 850.0 and (
+                st["inv_jump_k"] >= 1.0
+                or st["rh_2m_pct"] >= 86.0
+                or (has_sat_low_top and sat_low_top_m < elev_m + 950.0)
+            )
+            # When NWP predicted clear/dry air (`sounding["cloud_low_pct"] < 20`), NWP's dry `lcl_asl_m`
+            # (~1500-2200 m) does NOT represent the satellite-observed marine stratus deck!
+            nwp_had_low = int(sounding["cloud_low_pct"]) >= 20
+            raw_nwp_base = max(elev_m + (35.0 if is_fog_like else 220.0), st["lcl_asl_m"])
+            nwp_top_m = max(raw_nwp_base + (220.0 if is_fog_like else 520.0), st["inv_top_asl_m"])
+
+            if has_sat_low_top:
+                w_ht = 0.90 if not nwp_had_low else (0.78 * w_low_eff)
+                top_m = (1.0 - w_ht) * nwp_top_m + w_ht * sat_low_top_m
+            else:
+                top_m = nwp_top_m
+
+            if ceil_asl is not None and ceil_asl > elev_m + 25.0:
+                base_m = ceil_asl
+                top_m = max(base_m + 110.0, top_m)
+            elif has_sat_low_top and (not nwp_had_low or raw_nwp_base > top_m - 120.0):
+                deck_thick = 210.0 if is_fog_like else 380.0
+                base_m = max(elev_m + (35.0 if is_fog_like else 140.0), top_m - deck_thick)
+            else:
+                base_m = min(raw_nwp_base, top_m - 110.0)
+
+            top_m = max(base_m + 95.0, top_m)
+            st["inv_top_asl_m"] = round(top_m, 1)
+
             tau_nwp = low_cf * min(26.0, 0.022 * (top_m - base_m))
-            tau_sat = low_cf * max(1.5, min(28.0, adv["tau_total"] * 0.72))
-            tau_low = (1.0 - w_nowcast) * tau_nwp + w_nowcast * tau_sat
+            sat_tau_low = float(adv.get("tau_low", adv["tau_total"] * 0.72))
+            if adv["low_cf"] > 0.05:
+                incloud_low = max(1.2, min(32.0, sat_tau_low / adv["low_cf"]))
+                tau_sat = low_cf * incloud_low
+            else:
+                tau_sat = low_cf * 6.8
+            tau_low = (1.0 - w_low_eff) * tau_nwp + w_low_eff * tau_sat
             new_bands.append(
                 {
                     "label": "fog" if is_fog_like else "low",
@@ -247,28 +290,54 @@ def _blend_nowcast_into_station(
                 }
             )
         if mid_cf >= 0.03:
-            mid_base = max(elev_m + 900.0, 2900.0)
-            mid_top = mid_base + 1450.0
+            sat_mid_top = float(adv.get("mid_top_asl_m") or 4350.0)
+            mid_top = max(
+                elev_m + 1450.0,
+                (1.0 - 0.55 * w_mid_eff) * max(elev_m + 2350.0, 4350.0) + (0.55 * w_mid_eff) * sat_mid_top,
+            )
+            mid_base = max(elev_m + 750.0, mid_top - 1350.0)
+            tau_mid_nwp = mid_cf * 6.2
+            sat_tau_mid = float(adv.get("tau_mid", mid_cf * 5.6))
+            if adv["mid_cf"] > 0.05:
+                tau_mid_sat = mid_cf * max(0.8, min(24.0, sat_tau_mid / adv["mid_cf"]))
+            else:
+                tau_mid_sat = mid_cf * 5.4
+            tau_mid = (1.0 - w_mid_eff) * tau_mid_nwp + w_mid_eff * tau_mid_sat
             new_bands.append(
                 {
                     "label": "mid",
                     "base_asl_m": round(mid_base, 1),
                     "top_asl_m": round(mid_top, 1),
                     "cloud_fraction": round(mid_cf, 3),
-                    "optical_depth_vertical": round(mid_cf * 7.5, 2),
+                    "optical_depth_vertical": round(max(0.06, tau_mid), 2),
                     "aspect_ratio_h_over_d": 0.22,
                     "characteristic_cell_km": 6.5,
                     "ice_fraction": 0.35,
                 }
             )
         if high_cf >= 0.03:
+            sat_hi_top = float(adv.get("high_top_asl_m") or 10200.0)
+            hi_top = max(
+                7800.0,
+                (1.0 - 0.65 * w_hi_eff) * 10400.0 + (0.65 * w_hi_eff) * sat_hi_top,
+            )
+            hi_base = max(6600.0, hi_top - 2100.0)
+            tau_hi_nwp = high_cf * (0.55 + 1.35 * high_cf)
+            sat_tau_hi = float(adv.get("tau_high", tau_hi_nwp))
+            if is_cal_l2 and adv["high_cf"] > 0.05:
+                # ABI-L2-CODC distinguishes optically thin alpenglow cirrus (COD ~0.6) from opaque anvil (COD ~8)
+                incloud_hi = max(0.30, min(14.0, sat_tau_hi / adv["high_cf"]))
+                tau_hi_sat = high_cf * incloud_hi
+            else:
+                tau_hi_sat = tau_hi_nwp
+            tau_hi = (1.0 - w_hi_eff) * tau_hi_nwp + w_hi_eff * tau_hi_sat
             new_bands.append(
                 {
                     "label": "high",
-                    "base_asl_m": 8200.0,
-                    "top_asl_m": 10600.0,
+                    "base_asl_m": round(hi_base, 1),
+                    "top_asl_m": round(hi_top, 1),
                     "cloud_fraction": round(high_cf, 3),
-                    "optical_depth_vertical": round(high_cf * (0.55 + 1.40 * high_cf), 2),
+                    "optical_depth_vertical": round(max(0.05, tau_hi), 2),
                     "aspect_ratio_h_over_d": 0.08,
                     "characteristic_cell_km": 16.0,
                     "ice_fraction": 1.0,
@@ -466,6 +535,21 @@ def _invoke_rust_corridor_raycast(
                     pass
 
 
+# Empirically calibrated nowcast-to-NWP fusion & probabilistic interval parameters
+# (verified via `planner/weather/backtest.py` against held-out GOES-18 L2 + golden-hour DNI + ASOS)
+CALIBRATION_CONFIG: dict[str, float] = {
+    "nowcast_decay_hours": 2.65,
+    "nowcast_max_ensemble_weight": 0.92,
+    "coastal_hrrr_low_weight": 0.28,
+    "coastal_ecmwf_low_weight": 0.44,
+    "coastal_aifs_low_weight": 0.28,
+    "epistemic_base_spread_pct": 5.5,
+    "epistemic_lead_slope_pct_per_hr": 1.25,
+    "epistemic_model_spread_gain": 0.22,
+    "aod_excess_extinction_slope": 2.8,
+}
+
+
 def solve_weather_and_corridor(
     lat: float,
     lon: float,
@@ -475,13 +559,23 @@ def solve_weather_and_corridor(
     sun_el_deg: float = 0.4,
     target_elev_m: float = 2693.0,
     model_engine: str = "ensemble",
+    simulated_now_utc: dt.datetime | None = None,
+    calibration_overrides: dict[str, float] | None = None,
 ) -> bytes:
+    cal = {**CALIBRATION_CONFIG, **(calibration_overrides or {})}
     model_engine = (model_engine or "ensemble").lower().strip()
     is_coastal = _is_coastal_california(lat, lon)
     is_sunset = phase.lower().startswith("sunset") or sun_az_deg >= 180.0
 
     tz_obj, tz_name = local_tz_for_lon(lon)
-    now_utc = dt.datetime.now(dt.timezone.utc)
+    if simulated_now_utc is not None:
+        now_utc = (
+            simulated_now_utc.replace(tzinfo=dt.timezone.utc)
+            if simulated_now_utc.tzinfo is None
+            else simulated_now_utc.astimezone(dt.timezone.utc)
+        )
+    else:
+        now_utc = dt.datetime.now(dt.timezone.utc)
     now_local = now_utc.astimezone(tz_obj)
     try:
         req_date = dt.date.fromisoformat(date_str)
@@ -509,6 +603,7 @@ def solve_weather_and_corridor(
     is_today_or_near = -1.5 <= lead_hours <= 5.5
     should_query_live_obs = (req_date == now_local.date()) or (-2.0 <= lead_hours <= 6.5)
 
+    # Fetch 24h NWP soundings, METAR/ASOS surface obs, and 3-frame GOES-18/19 S3 L2 concurrently
     with ThreadPoolExecutor(max_workers=3) as pool:
         f_nwp = pool.submit(
             fetch_24h_corridor_and_models,
@@ -520,27 +615,31 @@ def solve_weather_and_corridor(
             is_coastal,
         )
         f_obs = (
-            pool.submit(fetch_nearest_station_observation, lat, lon)
+            pool.submit(
+                fetch_nearest_station_observation,
+                lat,
+                lon,
+                85.0,
+                simulated_now_utc,
+            )
+            if should_query_live_obs
+            else None
+        )
+        f_goes = (
+            pool.submit(
+                fetch_goes_corridor_nowcast,
+                lat,
+                lon,
+                15.0,
+                is_coastal,
+                simulated_now_utc,
+            )
             if should_query_live_obs
             else None
         )
         nwp_bundle = f_nwp.result()
         station_obs = f_obs.result() if f_obs else None
-
-    est_sfc_temp_c = 15.0
-    if station_obs and station_obs.get("temp_c") is not None:
-        est_sfc_temp_c = float(station_obs["temp_c"])
-    elif nwp_bundle["ok"]:
-        now_hr = max(0, min(23, now_local.hour))
-        est_sfc_temp_c = _safe_arr_val(
-            nwp_bundle["point_docs"][0].get("hourly") or {}, "temperature_2m", now_hr, 15.0
-        )
-
-    goes_data = (
-        fetch_goes_corridor_nowcast(lat, lon, surface_temp_c=est_sfc_temp_c, is_coastal=is_coastal)
-        if should_query_live_obs
-        else None
-    )
+        goes_data = f_goes.result() if f_goes else None
 
     if not nwp_bundle["ok"]:
         raise RuntimeError(
@@ -550,7 +649,7 @@ def solve_weather_and_corridor(
 
     point_docs = nwp_bundle["point_docs"]
     coords_meta = nwp_bundle["coords_meta"]
-    is_historical = bool(nwp_bundle["is_historical"])
+    is_historical = bool(nwp_bundle["is_historical"]) and (simulated_now_utc is None)
 
     st0_base = extract_hour_sounding(
         point_docs[0],
@@ -567,14 +666,20 @@ def solve_weather_and_corridor(
 
     mm_h = (nwp_bundle.get("multimodel_doc") or {}).get("hourly") or {}
 
-    def _model_lmh(suffix: str, fallback_low: int, fallback_mid: int, fallback_high: int) -> tuple[int, int, int, bool]:
+    def _model_lmh_at_hr(
+        suffix: str, hr_idx: int, fallback_low: int, fallback_mid: int, fallback_high: int
+    ) -> tuple[int, int, int, bool]:
         arr_tot = mm_h.get(f"cloud_cover_{suffix}") or []
-        if not any(v is not None for v in arr_tot):
+        arr_lo = mm_h.get(f"cloud_cover_low_{suffix}") or []
+        if not any(v is not None for v in arr_tot) and not any(v is not None for v in arr_lo):
             return fallback_low, fallback_mid, fallback_high, False
-        lo = int(round(max(0.0, min(100.0, _safe_arr_val(mm_h, f"cloud_cover_low_{suffix}", primary_hr_idx, fallback_low)))))
-        mi = int(round(max(0.0, min(100.0, _safe_arr_val(mm_h, f"cloud_cover_mid_{suffix}", primary_hr_idx, fallback_mid)))))
-        hi = int(round(max(0.0, min(100.0, _safe_arr_val(mm_h, f"cloud_cover_high_{suffix}", primary_hr_idx, fallback_high)))))
+        lo = int(round(max(0.0, min(100.0, _safe_arr_val(mm_h, f"cloud_cover_low_{suffix}", hr_idx, fallback_low)))))
+        mi = int(round(max(0.0, min(100.0, _safe_arr_val(mm_h, f"cloud_cover_mid_{suffix}", hr_idx, fallback_mid)))))
+        hi = int(round(max(0.0, min(100.0, _safe_arr_val(mm_h, f"cloud_cover_high_{suffix}", hr_idx, fallback_high)))))
         return lo, mi, hi, True
+
+    def _model_lmh(suffix: str, fallback_low: int, fallback_mid: int, fallback_high: int) -> tuple[int, int, int, bool]:
+        return _model_lmh_at_hr(suffix, primary_hr_idx, fallback_low, fallback_mid, fallback_high)
 
     hrrr_low, hrrr_mid, hrrr_high, has_hrrr = _model_lmh(
         "ncep_hrrr_conus",
@@ -609,7 +714,7 @@ def solve_weather_and_corridor(
             goes_data,
             lat,
             lon,
-            min(210.0, lead_minutes_primary),
+            min(220.0, lead_minutes_primary),
             st0_base["wind_850_uv_ms"],
             st0_base["wind_500_uv_ms"],
             st0_base["wind_250_uv_ms"],
@@ -617,7 +722,7 @@ def solve_weather_and_corridor(
         nowcast_low = int(round(adv0["low_cf"] * 100.0))
         if station_obs is not None:
             obs_low = float(station_obs.get("low_cloud_fraction", 0.0)) * 100.0
-            nowcast_low = int(round(0.60 * nowcast_low + 0.40 * obs_low))
+            nowcast_low = int(round(0.65 * nowcast_low + 0.35 * obs_low))
         nowcast_mid = int(round(adv0["mid_cf"] * 100.0))
         nowcast_high = int(round(adv0["high_cf"] * 100.0))
         has_live_nowcast = True
@@ -625,45 +730,78 @@ def solve_weather_and_corridor(
         nowcast_low, nowcast_mid, nowcast_high = hrrr_low, hrrr_mid, hrrr_high
         has_live_nowcast = False
 
+    decay_tau_hr = max(0.5, float(cal["nowcast_decay_hours"]))
+    max_ens_w = max(0.0, min(0.96, float(cal["nowcast_max_ensemble_weight"])))
     if has_live_nowcast and is_today_or_near:
-        base_w_now = math.exp(-max(0.0, lead_hours) / 2.2)
+        base_w_now = 1.0 / (1.0 + (max(0.0, lead_hours) / decay_tau_hr) ** 1.8)
     else:
         base_w_now = 0.0
 
     if model_engine == "nowcast" and has_live_nowcast:
-        w_nowcast_primary = 0.92 if is_today_or_near else 0.55
+        w_nowcast_primary = 0.94 if is_today_or_near else 0.55
     elif model_engine == "ensemble":
-        w_nowcast_primary = base_w_now * 0.72
+        w_nowcast_primary = base_w_now * max_ens_w
     else:
         w_nowcast_primary = 0.0
 
-    ens_nwp_low = int(round(0.45 * hrrr_low + 0.30 * ecmwf_low + 0.25 * aifs_low))
-    ens_nwp_mid = int(round(0.45 * hrrr_mid + 0.30 * ecmwf_mid + 0.25 * aifs_mid))
-    ens_nwp_high = int(round(0.40 * hrrr_high + 0.35 * ecmwf_high + 0.25 * aifs_high))
+    def _compute_nwp_consensus_for_hr(hr_idx: int, fb_lo: int, fb_mi: int, fb_hi: int) -> tuple[int, int, int]:
+        h_lo, h_mi, h_hi, ok_h = _model_lmh_at_hr("ncep_hrrr_conus", hr_idx, fb_lo, fb_mi, fb_hi)
+        e_lo, e_mi, e_hi, _ = _model_lmh_at_hr("ecmwf_ifs025", hr_idx, fb_lo, fb_mi, fb_hi)
+        a_lo, a_mi, a_hi, _ = _model_lmh_at_hr("ecmwf_aifs025_single", hr_idx, e_lo, e_mi, e_hi)
+        g_lo, g_mi, g_hi, ok_g = _model_lmh_at_hr("gfs_seamless", hr_idx, fb_lo, fb_mi, fb_hi)
+        if not ok_h and ok_g:
+            h_lo, h_mi, h_hi = g_lo, g_mi, g_hi
+        if model_engine == "graphcast":
+            return a_lo, a_mi, a_hi
+        if model_engine == "hrrr":
+            return h_lo, h_mi, h_hi
+        if model_engine == "ecmwf":
+            return e_lo, e_mi, e_hi
+        if is_coastal and (ok_h or ok_g):
+            w_h_lo = float(cal["coastal_hrrr_low_weight"])
+            w_e_lo = float(cal["coastal_ecmwf_low_weight"])
+            w_a_lo = float(cal["coastal_aifs_low_weight"])
+            c_lo = int(round(w_h_lo * h_lo + w_e_lo * e_lo + w_a_lo * a_lo))
+        else:
+            c_lo = int(round(0.45 * h_lo + 0.30 * e_lo + 0.25 * a_lo))
+        c_mi = int(round(0.45 * h_mi + 0.30 * e_mi + 0.25 * a_mi))
+        c_hi = int(round(0.40 * h_hi + 0.35 * e_hi + 0.25 * a_hi))
+        return c_lo, c_mi, c_hi
 
+    ens_nwp_low, ens_nwp_mid, ens_nwp_high = _compute_nwp_consensus_for_hr(
+        primary_hr_idx, st0_base["cloud_low_pct"], st0_base["cloud_mid_pct"], st0_base["cloud_high_pct"]
+    )
     ens_low = int(round((1.0 - w_nowcast_primary) * ens_nwp_low + w_nowcast_primary * nowcast_low))
     ens_mid = int(round((1.0 - w_nowcast_primary) * ens_nwp_mid + w_nowcast_primary * nowcast_mid))
     ens_high = int(round((1.0 - w_nowcast_primary) * ens_nwp_high + w_nowcast_primary * nowcast_high))
 
-    engine_target_lmh: dict[str, tuple[int, int, int]] = {
-        "ensemble": (ens_low, ens_mid, ens_high),
-        "graphcast": (aifs_low, aifs_mid, aifs_high),
-        "hrrr": (hrrr_low, hrrr_mid, hrrr_high),
-        "ecmwf": (ecmwf_low, ecmwf_mid, ecmwf_high),
-        "nowcast": (nowcast_low, nowcast_mid, nowcast_high),
-    }
-    sel_low, sel_mid, sel_high = engine_target_lmh.get(model_engine, (ens_low, ens_mid, ens_high))
-
-    def _apply_engine_choice(st: dict[str, Any], is_origin: bool = False) -> dict[str, Any]:
-        if model_engine == "ensemble" and abs(sel_low - st0_base["cloud_low_pct"]) <= 3:
+    def _apply_nwp_prior_scaling(
+        st: dict[str, Any],
+        base0_hr: dict[str, Any],
+        target_lmh_hr: tuple[int, int, int],
+        is_origin: bool,
+        pdist_km: float,
+    ) -> dict[str, Any]:
+        if model_engine == "nowcast":
             return st
+        t_lo, t_mi, t_hi = target_lmh_hr
+        b_lo = base0_hr["cloud_low_pct"]
+        b_mi = base0_hr["cloud_mid_pct"]
+        b_hi = base0_hr["cloud_high_pct"]
+        if abs(t_lo - b_lo) <= 2 and abs(t_mi - b_mi) <= 3 and abs(t_hi - b_hi) <= 3:
+            return st
+        # Attenuate origin multi-model correction with offshore distance (`e^(-d / 140 km)`)
+        spatial_w = 1.0 if (is_origin or model_engine != "ensemble") else math.exp(-pdist_km / 140.0)
         s_copy = json.loads(json.dumps(st))
-        r_low = (sel_low + 5.0) / (st0_base["cloud_low_pct"] + 5.0)
-        r_mid = (sel_mid + 5.0) / (st0_base["cloud_mid_pct"] + 5.0)
-        r_hi = (sel_high + 5.0) / (st0_base["cloud_high_pct"] + 5.0)
-        s_copy["cloud_low_pct"] = sel_low if is_origin else max(0, min(100, int(round(s_copy["cloud_low_pct"] * r_low))))
-        s_copy["cloud_mid_pct"] = sel_mid if is_origin else max(0, min(100, int(round(s_copy["cloud_mid_pct"] * r_mid))))
-        s_copy["cloud_high_pct"] = sel_high if is_origin else max(0, min(100, int(round(s_copy["cloud_high_pct"] * r_hi))))
+        raw_r_lo = (t_lo + 5.0) / (b_lo + 5.0)
+        raw_r_mi = (t_mi + 5.0) / (b_mi + 5.0)
+        raw_r_hi = (t_hi + 5.0) / (b_hi + 5.0)
+        r_low = 1.0 + spatial_w * (raw_r_lo - 1.0)
+        r_mid = 1.0 + spatial_w * (raw_r_mi - 1.0)
+        r_hi = 1.0 + spatial_w * (raw_r_hi - 1.0)
+        s_copy["cloud_low_pct"] = t_lo if is_origin else max(0, min(100, int(round(s_copy["cloud_low_pct"] * r_low))))
+        s_copy["cloud_mid_pct"] = t_mi if is_origin else max(0, min(100, int(round(s_copy["cloud_mid_pct"] * r_mid))))
+        s_copy["cloud_high_pct"] = t_hi if is_origin else max(0, min(100, int(round(s_copy["cloud_high_pct"] * r_hi))))
         for band in s_copy["rust_station"]["cloud_bands"]:
             lbl = band["label"]
             scale = r_low if lbl in ("fog", "low") else (r_mid if lbl == "mid" else r_hi)
@@ -680,14 +818,34 @@ def solve_weather_and_corridor(
         hr_mins = hr * 60 + 30
         hr_dt_local = dt.datetime(req_date.year, req_date.month, req_date.day, hr, 30, tzinfo=tz_obj)
         hr_lead_hr = (hr_dt_local.astimezone(dt.timezone.utc) - now_utc).total_seconds() / 3600.0
-        if has_live_nowcast and -0.8 <= hr_lead_hr <= 3.8:
+        if has_live_nowcast and -0.8 <= hr_lead_hr <= 4.5:
             w_hr_now = (
-                0.90
+                0.94
                 if model_engine == "nowcast"
-                else (0.72 * math.exp(-max(0.0, hr_lead_hr) / 2.2) if model_engine == "ensemble" else 0.0)
+                else (
+                    max_ens_w / (1.0 + (max(0.0, hr_lead_hr) / decay_tau_hr) ** 1.8)
+                    if model_engine == "ensemble"
+                    else 0.0
+                )
             )
         else:
             w_hr_now = 0.0
+
+        base0_hr = extract_hour_sounding(
+            point_docs[0],
+            hr,
+            0.0,
+            sun_az_deg,
+            lat,
+            lon,
+            aod_550nm=nwp_bundle["aod_0km_24h"][hr],
+            angstrom_exp=nwp_bundle["angstrom_24h"][hr],
+            ozone_du=nwp_bundle["ozone_du_24h"][hr],
+            is_coastal=is_coastal,
+        )
+        target_lmh_hr = _compute_nwp_consensus_for_hr(
+            hr, base0_hr["cloud_low_pct"], base0_hr["cloud_mid_pct"], base0_hr["cloud_high_pct"]
+        )
 
         rust_stations_hr: list[dict[str, Any]] = []
         st_primary_list_hr: list[dict[str, Any]] = []
@@ -699,18 +857,23 @@ def solve_weather_and_corridor(
                 if pdist_km < 50.0
                 else nwp_bundle["aod_100km_24h"][hr]
             )
-            snd = extract_hour_sounding(
-                point_docs[idx_pt],
-                hr,
-                pdist_km,
-                paz_deg,
-                plat,
-                plon,
-                aod_550nm=aod_interp,
-                angstrom_exp=nwp_bundle["angstrom_24h"][hr],
-                ozone_du=nwp_bundle["ozone_du_24h"][hr],
-                is_coastal=_is_coastal_california(plat, plon),
+            snd = (
+                base0_hr
+                if idx_pt == 0
+                else extract_hour_sounding(
+                    point_docs[idx_pt],
+                    hr,
+                    pdist_km,
+                    paz_deg,
+                    plat,
+                    plon,
+                    aod_550nm=aod_interp,
+                    angstrom_exp=nwp_bundle["angstrom_24h"][hr],
+                    ozone_du=nwp_bundle["ozone_du_24h"][hr],
+                    is_coastal=_is_coastal_california(plat, plon),
+                )
             )
+            snd = _apply_nwp_prior_scaling(snd, base0_hr, target_lmh_hr, is_origin=(idx_pt == 0), pdist_km=pdist_km)
             snd = _blend_nowcast_into_station(
                 snd,
                 goes_data,
@@ -718,8 +881,6 @@ def solve_weather_and_corridor(
                 max(0.0, hr_lead_hr * 60.0),
                 w_hr_now,
             )
-            if w_hr_now < 0.5:
-                snd = _apply_engine_choice(snd, is_origin=(idx_pt == 0))
             rust_stations_hr.append(snd["rust_station"])
             if idx_pt < 6:
                 st_primary_list_hr.append(snd)
@@ -825,24 +986,44 @@ def solve_weather_and_corridor(
         lon,
         meso_anchors,
         goes_data,
-        min(210.0, lead_minutes_primary),
+        min(220.0, lead_minutes_primary),
         w_nowcast_primary,
         st0["wind_850_uv_ms"],
         st0["wind_500_uv_ms"],
         st0["wind_250_uv_ms"],
     )
 
-    def _normalize_corridor_ray_pct(ray_doc: dict[str, Any]) -> tuple[int, int, int, int, int]:
+    spread_low_models = max(hrrr_low, ecmwf_low, aifs_low) - min(hrrr_low, ecmwf_low, aifs_low)
+    spread_high_models = max(hrrr_high, ecmwf_high, aifs_high) - min(hrrr_high, ecmwf_high, aifs_high)
+    model_disagreement_pct = 0.65 * spread_low_models + 0.35 * spread_high_models
+    epistemic_sigma_pct = max(
+        0.0,
+        min(
+            32.0,
+            float(cal["epistemic_base_spread_pct"])
+            + float(cal["epistemic_lead_slope_pct_per_hr"]) * min(18.0, max(0.0, lead_hours))
+            + float(cal["epistemic_model_spread_gain"]) * model_disagreement_pct,
+        ),
+    )
+
+    primary_col_aod = (
+        0.65 * float(st0["rust_station"]["aod_550nm"])
+        + 0.35 * float(nwp_bundle["aod_100km_24h"][primary_hr_idx])
+    )
+
+    def _normalize_corridor_ray_pct(
+        ray_doc: dict[str, Any], col_aod_550: float = primary_col_aod
+    ) -> tuple[int, int, int, int, int]:
         c_rgb = ray_doc.get("clear_sky_rgb") or [0.0, 0.0, 0.0]
         clear_photopic = 0.24 * float(c_rgb[0]) + 0.68 * float(c_rgb[1]) + 0.08 * float(c_rgb[2])
-        aer_od = float(ray_doc.get("total_aerosol_od_550") or 0.0)
-        ray_od = float(ray_doc.get("total_rayleigh_od_550") or 0.095)
-        slant_airmass = max(1.0, ray_od / 0.095)
-        equiv_vert_aod = aer_od / slant_airmass
-        aer_excess_trans = math.exp(-3.8 * max(0.0, equiv_vert_aod - 0.055))
+        aer_slope = float(cal["aod_excess_extinction_slope"])
+        aer_excess_trans = math.exp(-aer_slope * max(0.0, col_aod_550 - 0.065))
         direct_prob = max(0.0, min(1.0, float(ray_doc.get("direct_beam_probability") or 0.0)))
+        terr_vis = max(0.0, min(1.0, float(ray_doc.get("terrain_disk_visibility", 1.0))))
 
-        if clear_photopic > 1.5e-3:
+        # At sunset (sun_el ~ +0.4°..+1.0°), 380 km Rayleigh+Chappuis clear_photopic is ~1e-6..5e-4;
+        # always divide out clear_photopic when non-zero so translucent cirrus/mist transmittance survives!
+        if clear_photopic > 1e-11:
             scale = aer_excess_trans / clear_photopic
             exp_rel = float(ray_doc.get("transmittance_expected") or 0.0) * scale
             p10_rel = float(ray_doc.get("transmittance_p10") or 0.0) * scale
@@ -854,14 +1035,32 @@ def solve_weather_and_corridor(
             p50_rel = (1.0 if direct_prob >= 0.50 else 0.0) * aer_excess_trans
             p90_rel = (1.0 if direct_prob >= 0.12 else 0.0) * aer_excess_trans
 
-        e_pct = int(round(max(0.0, min(99.0, exp_rel * 100.0))))
+        e_f = max(0.0, min(99.0, exp_rel * 100.0))
+        q10_sub = max(0.0, min(99.0, p10_rel * 100.0))
+        q50_sub = max(q10_sub, min(99.0, p50_rel * 100.0))
+        q90_sub = max(q50_sub, min(99.0, p90_rel * 100.0))
+
+        # Combine sub-grid cloud-chord dispersion with epistemic forecast/advection uncertainty
+        if terr_vis > 0.05 and epistemic_sigma_pct > 0.05:
+            epi_eff = epistemic_sigma_pct * terr_vis
+            center_q = 0.55 * q50_sub + 0.45 * e_f
+            lo_half = math.hypot(max(0.0, center_q - q10_sub), epi_eff)
+            hi_half = math.hypot(max(0.0, q90_sub - center_q), epi_eff)
+            q10 = int(round(max(0.0, min(q50_sub, center_q - lo_half))))
+            q50 = int(round(max(q10, min(99.0, center_q))))
+            q90 = int(round(max(q50, min(99.0, center_q + hi_half))))
+        else:
+            q10 = int(round(q10_sub))
+            q50 = int(round(q50_sub))
+            q90 = int(round(q90_sub))
+
+        e_pct = int(round(e_f))
         pr_pct = int(round(direct_prob * 100.0))
-        q10 = int(round(max(0.0, min(99.0, p10_rel * 100.0))))
-        q50 = int(round(max(q10, min(99.0, p50_rel * 100.0))))
-        q90 = int(round(max(q50, min(99.0, p90_rel * 100.0))))
         return e_pct, pr_pct, q10, q50, q90
 
-    exp_trans_pct, direct_prob_pct, p10_pct, p50_pct, p90_pct = _normalize_corridor_ray_pct(primary_ray)
+    exp_trans_pct, direct_prob_pct, p10_pct, p50_pct, p90_pct = _normalize_corridor_ray_pct(
+        primary_ray, primary_col_aod
+    )
     kelvin = int(round(float(primary_ray["beam_color_kelvin"])))
     chappuis_rose = round(float(primary_ray["chappuis_rose_index"]), 3)
     dom_blk = primary_ray.get("dominant_blocker") or {}
@@ -1240,14 +1439,18 @@ def solve_weather_and_corridor(
         },
         "nowcast": {
             "id": "nowcast",
-            "name": "GOES-18/19 ABI + 2-Frame FFT Advection + NWS METAR",
-            "short_name": "📡 Live GOES Nowcast",
+            "name": "3-Frame GOES-18/19 L2 (ACTP+ACHA+COD) + Parallax & Orographic Pinning",
+            "short_name": "📡 Live GOES L2 Nowcast",
             "provider": (
-                f"{goes_data['satellite']} + {station_obs['station_id'] if station_obs else 'NWS Surface'}"
-                if has_live_nowcast
-                else "Outside 0-4h Live Satellite Window (HRRR Fallback)"
+                f"{goes_data['satellite']} L2 + {station_obs['station_id'] if station_obs else 'NWS Surface'}"
+                if (has_live_nowcast and goes_data and goes_data.get("is_calibrated_l2"))
+                else (
+                    f"{goes_data['satellite']} + {station_obs['station_id'] if station_obs else 'NWS Surface'}"
+                    if has_live_nowcast
+                    else "Outside 0-4h Live Satellite Window (HRRR Fallback)"
+                )
             ),
-            "resolution_3d": "Multi-spectral 0.64/3.9/8.4 µm + FFT Optical Flow",
+            "resolution_3d": "2 km COD/ACTP + 10 km ACHA Cloud-Top Parallax + Layered FFT Flow",
             "low": nowcast_low,
             "mid": nowcast_mid,
             "high": nowcast_high,
@@ -1347,7 +1550,11 @@ def solve_weather_and_corridor(
         h_ray = (r_out or {}).get("ray") or {}
         h_canv = (r_out or {}).get("overhead_canvas") or {}
         h_blk = h_ray.get("dominant_blocker") or {}
-        h_exp_pct, h_prob_pct, h_p10, h_p50, h_p90 = _normalize_corridor_ray_pct(h_ray)
+        hr_col_aod = (
+            0.65 * float(snd_h["rust_station"]["aod_550nm"])
+            + 0.35 * float(nwp_bundle["aod_100km_24h"][hr])
+        )
+        h_exp_pct, h_prob_pct, h_p10, h_p50, h_p90 = _normalize_corridor_ray_pct(h_ray, hr_col_aod)
         h_kelvin = int(round(float(h_ray.get("beam_color_kelvin") or 5400.0)))
         h_glow = int(round(float(h_canv.get("composite_canvas_score") or 40.0)))
         hourly_timeline.append(
@@ -1402,10 +1609,17 @@ def solve_weather_and_corridor(
         "lead_hours": round(lead_hours, 2),
         "nowcast_blend_weight": round(w_nowcast_primary, 3),
         "satellite": goes_data["satellite"] if goes_data else None,
+        "source": goes_data.get("source") if goes_data else None,
+        "is_calibrated_l2": bool(goes_data.get("is_calibrated_l2")) if goes_data else False,
+        "parallax_corrected": bool(goes_data.get("parallax_corrected")) if goes_data else False,
+        "history_span_minutes": goes_data.get("history_span_minutes") if goes_data else 0.0,
         "goes_scan_utc": goes_data["scan_timestamp_utc"] if goes_data else None,
         "goes_scan_age_minutes": goes_data["scan_age_minutes"] if goes_data else None,
         "goes_motion_uv_ms": [goes_data["motion_u_ms"], goes_data["motion_v_ms"]] if goes_data else None,
+        "low_motion_uv_ms": list(goes_data.get("low_motion_uv_ms") or [0.0, 0.0]) if goes_data else None,
+        "high_motion_uv_ms": list(goes_data.get("high_motion_uv_ms") or [0.0, 0.0]) if goes_data else None,
         "goes_motion_confidence": goes_data["motion_confidence"] if goes_data else 0.0,
+        "epistemic_sigma_pct": round(epistemic_sigma_pct, 2),
         "metar_station": (
             {
                 "id": station_obs["station_id"],
