@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { VolumetricAtmosphereEngine, WEATHER_REGIME_PRESETS } from "./volumetric-engine.js?v=20261115g";
+import { VolumetricAtmosphereEngine, WEATHER_REGIME_PRESETS } from "./volumetric-engine.js?v=20261115h";
 
 // Conditional Popover API polyfill loader (content-first-noise-reduction)
 if (!Object.hasOwn(HTMLElement.prototype, "popover")) {
@@ -119,11 +119,11 @@ const camera = new THREE.PerspectiveCamera(
 camera.position.set(-3400, 2500, -2900);
 
 const renderer = new THREE.WebGLRenderer({
-  antialias: true,
+  antialias: false,
   powerPreference: "high-performance",
   stencil: false,
 });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio || 2, 2));
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
 renderer.setSize(container.clientWidth, container.clientHeight);
 container.appendChild(renderer.domElement);
 
@@ -1028,10 +1028,11 @@ function buildTerrainMesh() {
   heightTex.minFilter = THREE.LinearFilter;
   heightTex.needsUpdate = true;
 
-  const geoKey = `${n}_${spanM}`;
+  const meshSegs = Math.min(299, Math.max(1, n - 1));
+  const geoKey = `${meshSegs}_${spanM}`;
   if (cachedTerrainPlaneKey !== geoKey || !cachedTerrainPlaneGeo) {
     cachedTerrainPlaneGeo?.dispose?.();
-    cachedTerrainPlaneGeo = new THREE.PlaneGeometry(spanM, spanM, n - 1, n - 1);
+    cachedTerrainPlaneGeo = new THREE.PlaneGeometry(spanM, spanM, meshSegs, meshSegs);
     cachedTerrainPlaneGeo.rotateX(-Math.PI / 2);
     cachedTerrainPlaneGeo.boundingSphere = new THREE.Sphere(
       new THREE.Vector3(0, 1500, 0),
@@ -1116,6 +1117,7 @@ function buildTerrainMesh() {
       if (terrainShaderMaterial) {
         terrainShaderMaterial.uniforms.uOrthoTex.value = orthoTex;
         terrainShaderMaterial.uniforms.uHasOrtho.value = 1.0;
+        wakeRenderLoop(false);
       }
     },
     undefined,
@@ -2174,6 +2176,15 @@ function ensureGpuMonolithGrazing() {
   gpuMonolithPersistentGroup.add(quadMesh);
 }
 
+let isScrubbingTime = false;
+let corridorGatesSubGroup = null;
+let nightAstroSubGroup = null;
+let customPinRaySubGroup = null;
+let _cachedCorridorGates = null;
+let _lastCorridorGatesStaticKey = "";
+let _lastNightAstroStaticKey = "";
+let _lastCustomPinRayKey = "";
+
 function syncGpuLightOverlaysDem(heightTex, gridSize, spanM, minZ) {
   if (gpuValleyLightMat) {
     gpuValleyLightMat.uniforms.uHeightTex.value = heightTex;
@@ -2189,6 +2200,9 @@ function syncGpuLightOverlaysDem(heightTex, gridSize, spanM, minZ) {
   }
   _lastValleyGapsKey = "";
   _lastSunBeamsExtrasKey = "";
+  _lastCorridorGatesStaticKey = "";
+  _lastNightAstroStaticKey = "";
+  _lastCustomPinRayKey = "";
 }
 
 function updateValleyLightField(sunDirWorld, elevationDeg) {
@@ -2512,6 +2526,22 @@ function applyHourlyWeatherAtMinutes(minutes) {
   };
 }
 
+const _hudTextCache = {
+  localTime: "",
+  phaseBadge: "",
+  sunAz: "",
+  sunEl: "",
+  cliffLit: "",
+  scrubberOut: "",
+};
+
+function setTextIfChanged(el, cacheField, nextVal) {
+  if (el && _hudTextCache[cacheField] !== nextVal) {
+    _hudTextCache[cacheField] = nextVal;
+    el.textContent = nextVal;
+  }
+}
+
 function updateSunRaysAndShader() {
   const hourlyMet = applyHourlyWeatherAtMinutes(state.currentMinutes);
   const { azimuthDeg, elevationDeg } = getSolarAnglesAtMinutes(state.currentMinutes);
@@ -2531,6 +2561,7 @@ function updateSunRaysAndShader() {
     volumetricEngine.updateTerrainBakeUniforms({
       sunDirENU: terrainShaderMaterial.uniforms.uSunDirENU.value,
       showViewshed: state.showViewshed,
+      isScrubbing: isScrubbingTime || state.isPlayingSun,
     });
   }
 
@@ -2630,6 +2661,14 @@ function updateSunRaysAndShader() {
 
   // Update GPU-driven Monolith Grazing Crepuscular Silhouettes & Sky Corridor Gates
   ensureGpuMonolithGrazing();
+  if (!corridorGatesSubGroup) {
+    corridorGatesSubGroup = new THREE.Group();
+    nightAstroSubGroup = new THREE.Group();
+    customPinRaySubGroup = new THREE.Group();
+    sunBeamsDynamicExtrasGroup.add(corridorGatesSubGroup);
+    sunBeamsDynamicExtrasGroup.add(nightAstroSubGroup);
+    sunBeamsDynamicExtrasGroup.add(customPinRaySubGroup);
+  }
 
   const astroDisclosureEl = document.getElementById("astro-disclosure");
   const shouldBuildSunBeams =
@@ -2640,9 +2679,13 @@ function updateSunRaysAndShader() {
   );
   gpuMonolithPersistentGroup.visible = hasDaySunBeams;
 
-  if (hasDaySunBeams) {
-    const lm = state.shootReport.target_landmark;
-    const targetWorld = latLonElevToWorld(lm.upper_face_lat, lm.upper_face_lon, lm.upper_face_z_m);
+  const lm = state.shootReport?.target_landmark;
+  const targetWorld =
+    lm && state.terrainPatch
+      ? latLonElevToWorld(lm.upper_face_lat, lm.upper_face_lon, lm.upper_face_z_m)
+      : null;
+
+  if (hasDaySunBeams && targetWorld) {
     const isGolden = elevationDeg <= 12.5;
     const isOvercast = state.showAtmosphere && activeMeanCloudTau >= 1.35;
 
@@ -2663,50 +2706,227 @@ function updateSunRaysAndShader() {
     mu.uIsOvercast.value = isOvercast ? 1.0 : 0.0;
   }
 
-  // Rebuild sparse label sprites / custom tripod ray / night astro streamlines ONLY when dirty
+  // Zero-allocation 3D Corridor Gates, Night Astro Streamlines & Custom Tripod Ray
   const astroAtm = state.weatherReport?.astro_atmosphere;
   const astroGeo = state.shootReport?.astro_night_summary;
   const showCorridorGates = Boolean(
     hasDaySunBeams &&
+      targetWorld &&
       (state.showAtmosphere || weatherDisclosure?.open) &&
       state.weatherReport?.ray_path_stations?.length === 3
   );
   const showNightAstro = Boolean(
     shouldBuildSunBeams &&
-      state.shootReport &&
+      targetWorld &&
       state.terrainPatch &&
       (astroDisclosureEl?.open || elevationDeg <= -0.5) &&
       astroAtm
   );
   const hasCustomPinRay = Boolean(
-    hasDaySunBeams && !inspectorCard.hidden && state.customTripodReport
+    hasDaySunBeams && targetWorld && !inspectorCard.hidden && state.customTripodReport
   );
 
   if (!showCorridorGates && !showNightAstro && !hasCustomPinRay) {
     sunBeamsDynamicExtrasGroup.visible = false;
   } else {
     sunBeamsDynamicExtrasGroup.visible = true;
-    const stKey = showCorridorGates
-      ? `${state.weatherReport.ray_path_stations[0].gate_transmittance_pct}_${state.weatherReport.ray_path_stations[1].gate_transmittance_pct}_${Math.round(activeFogTopLocalY)}`
-      : "0";
-    const pinKey = hasCustomPinRay
-      ? `${state.customTripodReport.tripod_lat.toFixed(4)}_${state.customTripodReport.tripod_lon.toFixed(4)}`
-      : "0";
-    const extrasKey = `${state.shootReport?.target_landmark?.name || ""}_${sunDirWorld.x.toFixed(3)}_${sunDirWorld.y.toFixed(3)}_${sunDirWorld.z.toFixed(3)}_${stKey}_${pinKey}_${showNightAstro ? 1 : 0}_${astroAtm?.jet_stream_250hpa_mph || 0}`;
+    const lmName = lm?.name || "";
 
-    if (extrasKey !== _lastSunBeamsExtrasKey) {
-      _lastSunBeamsExtrasKey = extrasKey;
-      disposeObjectTree(sunBeamsDynamicExtrasGroup);
+    // F. 3D Weather Corridor Cloud Gates — build meshes ONCE per forecast, update transforms in O(1) while scrubbing!
+    corridorGatesSubGroup.visible = showCorridorGates;
+    if (showCorridorGates) {
+      const stations = state.weatherReport.ray_path_stations;
+      const stFar = stations[0];
+      const stMid = stations[1];
+      const st0 = stations[2];
+      const corridorStaticKey = `${lmName}_${stFar.distance_km}_${stFar.gate_transmittance_pct}_${stMid.distance_km}_${stMid.gate_transmittance_pct}_${st0.cloud_high_pct}_${inv?.fog_top_ft || 0}`;
 
-      const lm = state.shootReport.target_landmark;
-      const targetWorld = latLonElevToWorld(lm.upper_face_lat, lm.upper_face_lon, lm.upper_face_z_m);
-      const SUN_DIST_M = 34000;
-      const propDir = sunDirWorld.clone().negate();
-      const halfSpan = state.terrainPatch.span_m * 0.485;
+      if (corridorStaticKey !== _lastCorridorGatesStaticKey || !_cachedCorridorGates) {
+        _lastCorridorGatesStaticKey = corridorStaticKey;
+        disposeObjectTree(corridorGatesSubGroup);
 
-      // E. Custom tripod uprange grazing ray
-      if (hasCustomPinRay) {
-        const rep = state.customTripodReport;
+        const gate18RingGeo = new THREE.RingGeometry(420, 780, 32);
+        const gate18RingMat = new THREE.MeshBasicMaterial({
+          color: 0x38bdf8,
+          transparent: true,
+          opacity: 0.22,
+          side: THREE.DoubleSide,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+        });
+        const gate18Ring = new THREE.Mesh(gate18RingGeo, gate18RingMat);
+        corridorGatesSubGroup.add(gate18Ring);
+
+        const gate18Sprite = makeTextSprite(
+          `${stMid.distance_km}km GATE: ${stMid.cloud_low_pct}%L/${stMid.cloud_mid_pct}%M/${stMid.cloud_high_pct}%H (${stMid.gate_transmittance_pct}% PASS)`,
+          "#0f172a",
+          "#38bdf8",
+          "#e0f2fe"
+        );
+        gate18Sprite.scale.set(1150, 235, 1);
+        corridorGatesSubGroup.add(gate18Sprite);
+
+        const gate75RingGeo = new THREE.RingGeometry(750, 1380, 32);
+        const gate75RingMat = new THREE.MeshBasicMaterial({
+          color: 0xf59e0b,
+          transparent: true,
+          opacity: 0.22,
+          side: THREE.DoubleSide,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+        });
+        const gate75Ring = new THREE.Mesh(gate75RingGeo, gate75RingMat);
+        corridorGatesSubGroup.add(gate75Ring);
+
+        const gate75Sprite = makeTextSprite(
+          `${stFar.distance_km}km ENTRY: ${stFar.cloud_low_pct}%L/${stFar.cloud_mid_pct}%M/${stFar.cloud_high_pct}%H (${stFar.gate_transmittance_pct}% PASS)`,
+          "#0f172a",
+          "#f59e0b",
+          "#fef3c7"
+        );
+        gate75Sprite.scale.set(1950, 400, 1);
+        corridorGatesSubGroup.add(gate75Sprite);
+
+        let fogSprite = null;
+        if (inv) {
+          const sign = inv.inversion_delta_t_f >= 0 ? "+" : "";
+          fogSprite = makeTextSprite(
+            `FOG TOP ${inv.fog_top_ft.toLocaleString()} ft • ΔT ${sign}${inv.inversion_delta_t_f}°F • ${wr.temp_sunset_f}°F (${st0.cloud_high_pct}%H/${st0.cloud_low_pct}%L)`,
+            "#0f172a",
+            "#34d399",
+            "#d1fae5"
+          );
+          fogSprite.scale.set(540, 110, 1);
+          corridorGatesSubGroup.add(fogSprite);
+        }
+
+        _cachedCorridorGates = {
+          gate18Ring,
+          gate18Sprite,
+          gate75Ring,
+          gate75Sprite,
+          fogSprite,
+        };
+      }
+
+      // Fast O(1) transform update along live solar azimuth/elevation (zero allocations!)
+      const cg = _cachedCorridorGates;
+      cg.gate18Ring.position.copy(targetWorld).addScaledVector(sunDirWorld, 10500);
+      cg.gate18Ring.lookAt(targetWorld);
+      cg.gate18Sprite.position.copy(cg.gate18Ring.position);
+      cg.gate18Sprite.position.y += 620;
+
+      cg.gate75Ring.position.copy(targetWorld).addScaledVector(sunDirWorld, 22500);
+      cg.gate75Ring.lookAt(targetWorld);
+      cg.gate75Sprite.position.copy(cg.gate75Ring.position);
+      cg.gate75Sprite.position.y += 1100;
+
+      if (cg.fogSprite) {
+        cg.fogSprite.position.set(
+          targetWorld.x + sunDirWorld.x * 1350,
+          activeFogTopLocalY + 95,
+          targetWorld.z + sunDirWorld.z * 1350
+        );
+      }
+    }
+
+    // Night Astrophotography Jet Stream Streamlines, AOD Badge & Galactic Core Vector (independent of sun scrubber!)
+    nightAstroSubGroup.visible = showNightAstro;
+    if (showNightAstro) {
+      const nightStaticKey = `${lmName}_${astroAtm.jet_stream_250hpa_mph}_${astroAtm.aod_550nm}_${astroGeo?.galactic_core_peak_az_deg ?? 205}`;
+      if (nightStaticKey !== _lastNightAstroStaticKey) {
+        _lastNightAstroStaticKey = nightStaticKey;
+        disposeObjectTree(nightAstroSubGroup);
+
+        const jetY = targetWorld.y + 1850;
+        const shearAmp = Math.min(180, Math.max(22, astroAtm.vertical_wind_shear_mph * 2.2));
+        for (let lane = -900; lane <= 900; lane += 450) {
+          const streamPts = [];
+          for (let x = -3400; x <= 3400; x += 220) {
+            const waveY = jetY + Math.sin(x * 0.0022 + lane * 0.01) * shearAmp;
+            const waveZ = targetWorld.z + lane + Math.cos(x * 0.0018) * (shearAmp * 0.65);
+            streamPts.push(new THREE.Vector3(targetWorld.x + x, waveY, waveZ));
+          }
+          const streamGeo = new THREE.BufferGeometry().setFromPoints(streamPts);
+          const streamMat = new THREE.LineBasicMaterial({
+            color: 0x818cf8,
+            transparent: true,
+            opacity: 0.55,
+            blending: THREE.AdditiveBlending,
+            depthWrite: false,
+          });
+          nightAstroSubGroup.add(new THREE.Line(streamGeo, streamMat));
+        }
+
+        const jetBadge = makeTextSprite(
+          `250hPa JET STREAM (${astroAtm.jet_stream_250hpa_mph} MPH • SEEING ${astroAtm.seeing_score}/100)`,
+          "#0f172a",
+          "#818cf8",
+          "#e0e7ff"
+        );
+        jetBadge.scale.set(460, 88, 1);
+        jetBadge.position.set(targetWorld.x - 450, jetY + 150, targetWorld.z - 250);
+        nightAstroSubGroup.add(jetBadge);
+
+        const hazeColor = astroAtm.aod_550nm < 0.12 ? "#34d399" : "#f59e0b";
+        const hazeBadge = makeTextSprite(
+          `UPPER HAZE / AOD ${astroAtm.aod_550nm} (${astroAtm.transparency_score}% TRANSPARENCY)`,
+          "#0f172a",
+          hazeColor,
+          "#ecfdf5"
+        );
+        hazeBadge.scale.set(450, 86, 1);
+        hazeBadge.position.set(targetWorld.x + 650, targetWorld.y + 820, targetWorld.z + 320);
+        nightAstroSubGroup.add(hazeBadge);
+
+        if (astroGeo) {
+          const gcPeakAz = astroGeo.galactic_core_peak_az_deg ?? 205;
+          const gcPeakEl = astroGeo.galactic_core_peak_el_deg ?? 14;
+          const gcClearDeg = astroGeo.galactic_core_clearance_deg ?? 0;
+          const gcAzRad = (gcPeakAz * Math.PI) / 180;
+          const gcElRad = (Math.max(6, gcPeakEl) * Math.PI) / 180;
+          const gcDirWorld = new THREE.Vector3(
+            Math.sin(gcAzRad) * Math.cos(gcElRad),
+            Math.sin(gcElRad),
+            -Math.cos(gcAzRad) * Math.cos(gcElRad)
+          ).normalize();
+          const gcEnd = targetWorld.clone().addScaledVector(gcDirWorld, 3400);
+          const gcCurve = new THREE.LineCurve3(targetWorld, gcEnd);
+          const gcTube = new THREE.TubeGeometry(gcCurve, 12, 10, 8, false);
+          const gcMat = new THREE.MeshBasicMaterial({
+            color: 0xc084fc,
+            transparent: true,
+            opacity: 0.42,
+            blending: THREE.AdditiveBlending,
+            depthWrite: false,
+          });
+          nightAstroSubGroup.add(new THREE.Mesh(gcTube, gcMat));
+
+          const gcSprite = makeTextSprite(
+            `🌌 GALACTIC CORE (AZ ${gcPeakAz}° • +${gcClearDeg}° CLEAR)`,
+            "#0f172a",
+            "#c084fc",
+            "#f3e8ff"
+          );
+          gcSprite.scale.set(450, 86, 1);
+          gcSprite.position.copy(gcEnd).add(new THREE.Vector3(0, 90, 0));
+          nightAstroSubGroup.add(gcSprite);
+        }
+      }
+    }
+
+    // E. Custom tripod uprange grazing ray (only active when custom pin inspector is open)
+    customPinRaySubGroup.visible = hasCustomPinRay;
+    if (hasCustomPinRay) {
+      const rep = state.customTripodReport;
+      const pinRayKey = `${rep.tripod_lat.toFixed(4)}_${rep.tripod_lon.toFixed(4)}_${sunDirWorld.x.toFixed(2)}_${sunDirWorld.y.toFixed(2)}_${sunDirWorld.z.toFixed(2)}`;
+      if (pinRayKey !== _lastCustomPinRayKey) {
+        _lastCustomPinRayKey = pinRayKey;
+        disposeObjectTree(customPinRaySubGroup);
+
+        const SUN_DIST_M = 34000;
+        const propDir = sunDirWorld.clone().negate();
+        const halfSpan = state.terrainPatch.span_m * 0.485;
         const pinWorld = latLonElevToWorld(rep.tripod_lat, rep.tripod_lon, rep.tripod_elevation_m);
         let maxObstructionScore = -Infinity;
         let occluderCrest = null;
@@ -2738,162 +2958,7 @@ function updateSunRaysAndShader() {
             blending: THREE.AdditiveBlending,
             depthWrite: false,
           });
-          sunBeamsDynamicExtrasGroup.add(new THREE.Line(customRayGeo, customRayMat));
-        }
-      }
-
-      // F. 3D Weather Corridor Cloud Gates (Far Corridor Entry, Mid Keyhole, 0 km Fog/Inversion Deck)
-      if (showCorridorGates) {
-        const stations = state.weatherReport.ray_path_stations;
-        const stFar = stations[0];
-        const stMid = stations[1];
-        const st0 = stations[2];
-
-        const gate18Pos = targetWorld.clone().addScaledVector(sunDirWorld, 10500);
-        const gate18RingGeo = new THREE.RingGeometry(420, 780, 32);
-        const gate18RingMat = new THREE.MeshBasicMaterial({
-          color: 0x38bdf8,
-          transparent: true,
-          opacity: 0.22,
-          side: THREE.DoubleSide,
-          blending: THREE.AdditiveBlending,
-          depthWrite: false,
-        });
-        const gate18Ring = new THREE.Mesh(gate18RingGeo, gate18RingMat);
-        gate18Ring.position.copy(gate18Pos);
-        gate18Ring.lookAt(targetWorld);
-        sunBeamsDynamicExtrasGroup.add(gate18Ring);
-
-        const gate18Sprite = makeTextSprite(
-          `${stMid.distance_km}km GATE: ${stMid.cloud_low_pct}%L/${stMid.cloud_mid_pct}%M/${stMid.cloud_high_pct}%H (${stMid.gate_transmittance_pct}% PASS)`,
-          "#0f172a",
-          "#38bdf8",
-          "#e0f2fe"
-        );
-        gate18Sprite.scale.set(1150, 235, 1);
-        gate18Sprite.position.copy(gate18Pos).add(new THREE.Vector3(0, 620, 0));
-        sunBeamsDynamicExtrasGroup.add(gate18Sprite);
-
-        const gate75Pos = targetWorld.clone().addScaledVector(sunDirWorld, 22500);
-        const gate75RingGeo = new THREE.RingGeometry(750, 1380, 32);
-        const gate75RingMat = new THREE.MeshBasicMaterial({
-          color: 0xf59e0b,
-          transparent: true,
-          opacity: 0.22,
-          side: THREE.DoubleSide,
-          blending: THREE.AdditiveBlending,
-          depthWrite: false,
-        });
-        const gate75Ring = new THREE.Mesh(gate75RingGeo, gate75RingMat);
-        gate75Ring.position.copy(gate75Pos);
-        gate75Ring.lookAt(targetWorld);
-        sunBeamsDynamicExtrasGroup.add(gate75Ring);
-
-        const gate75Sprite = makeTextSprite(
-          `${stFar.distance_km}km ENTRY: ${stFar.cloud_low_pct}%L/${stFar.cloud_mid_pct}%M/${stFar.cloud_high_pct}%H (${stFar.gate_transmittance_pct}% PASS)`,
-          "#0f172a",
-          "#f59e0b",
-          "#fef3c7"
-        );
-        gate75Sprite.scale.set(1950, 400, 1);
-        gate75Sprite.position.copy(gate75Pos).add(new THREE.Vector3(0, 1100, 0));
-        sunBeamsDynamicExtrasGroup.add(gate75Sprite);
-
-        if (inv) {
-          const sign = inv.inversion_delta_t_f >= 0 ? "+" : "";
-          const fogTopLocalY = activeFogTopLocalY;
-          const fogBadgePos = new THREE.Vector3(
-            targetWorld.x + sunDirWorld.x * 1350,
-            fogTopLocalY + 95,
-            targetWorld.z + sunDirWorld.z * 1350
-          );
-          const fogSprite = makeTextSprite(
-            `FOG TOP ${inv.fog_top_ft.toLocaleString()} ft • ΔT ${sign}${inv.inversion_delta_t_f}°F • ${wr.temp_sunset_f}°F (${st0.cloud_high_pct}%H/${st0.cloud_low_pct}%L)`,
-            "#0f172a",
-            "#34d399",
-            "#d1fae5"
-          );
-          fogSprite.scale.set(540, 110, 1);
-          fogSprite.position.copy(fogBadgePos);
-          sunBeamsDynamicExtrasGroup.add(fogSprite);
-        }
-      }
-
-      // Night Astrophotography Jet Stream Streamlines, AOD Badge & Galactic Core Vector
-      if (showNightAstro) {
-        const jetY = targetWorld.y + 1850;
-        const shearAmp = Math.min(180, Math.max(22, astroAtm.vertical_wind_shear_mph * 2.2));
-        for (let lane = -900; lane <= 900; lane += 450) {
-          const streamPts = [];
-          for (let x = -3400; x <= 3400; x += 220) {
-            const waveY = jetY + Math.sin(x * 0.0022 + lane * 0.01) * shearAmp;
-            const waveZ = targetWorld.z + lane + Math.cos(x * 0.0018) * (shearAmp * 0.65);
-            streamPts.push(new THREE.Vector3(targetWorld.x + x, waveY, waveZ));
-          }
-          const streamGeo = new THREE.BufferGeometry().setFromPoints(streamPts);
-          const streamMat = new THREE.LineBasicMaterial({
-            color: 0x818cf8,
-            transparent: true,
-            opacity: 0.55,
-            blending: THREE.AdditiveBlending,
-            depthWrite: false,
-          });
-          sunBeamsDynamicExtrasGroup.add(new THREE.Line(streamGeo, streamMat));
-        }
-
-        const jetBadge = makeTextSprite(
-          `250hPa JET STREAM (${astroAtm.jet_stream_250hpa_mph} MPH • SEEING ${astroAtm.seeing_score}/100)`,
-          "#0f172a",
-          "#818cf8",
-          "#e0e7ff"
-        );
-        jetBadge.scale.set(460, 88, 1);
-        jetBadge.position.set(targetWorld.x - 450, jetY + 150, targetWorld.z - 250);
-        sunBeamsDynamicExtrasGroup.add(jetBadge);
-
-        const hazeColor = astroAtm.aod_550nm < 0.12 ? "#34d399" : "#f59e0b";
-        const hazeBadge = makeTextSprite(
-          `UPPER HAZE / AOD ${astroAtm.aod_550nm} (${astroAtm.transparency_score}% TRANSPARENCY)`,
-          "#0f172a",
-          hazeColor,
-          "#ecfdf5"
-        );
-        hazeBadge.scale.set(450, 86, 1);
-        hazeBadge.position.set(targetWorld.x + 650, targetWorld.y + 820, targetWorld.z + 320);
-        sunBeamsDynamicExtrasGroup.add(hazeBadge);
-
-        if (astroGeo) {
-          const gcPeakAz = astroGeo.galactic_core_peak_az_deg ?? 205;
-          const gcPeakEl = astroGeo.galactic_core_peak_el_deg ?? 14;
-          const gcClearDeg = astroGeo.galactic_core_clearance_deg ?? 0;
-          const gcAzRad = (gcPeakAz * Math.PI) / 180;
-          const gcElRad = (Math.max(6, gcPeakEl) * Math.PI) / 180;
-          const gcDirWorld = new THREE.Vector3(
-            Math.sin(gcAzRad) * Math.cos(gcElRad),
-            Math.sin(gcElRad),
-            -Math.cos(gcAzRad) * Math.cos(gcElRad)
-          ).normalize();
-          const gcEnd = targetWorld.clone().addScaledVector(gcDirWorld, 3400);
-          const gcCurve = new THREE.LineCurve3(targetWorld, gcEnd);
-          const gcTube = new THREE.TubeGeometry(gcCurve, 12, 10, 8, false);
-          const gcMat = new THREE.MeshBasicMaterial({
-            color: 0xc084fc,
-            transparent: true,
-            opacity: 0.42,
-            blending: THREE.AdditiveBlending,
-            depthWrite: false,
-          });
-          sunBeamsDynamicExtrasGroup.add(new THREE.Mesh(gcTube, gcMat));
-
-          const gcSprite = makeTextSprite(
-            `🌌 GALACTIC CORE (AZ ${gcPeakAz}° • +${gcClearDeg}° CLEAR)`,
-            "#0f172a",
-            "#c084fc",
-            "#f3e8ff"
-          );
-          gcSprite.scale.set(450, 86, 1);
-          gcSprite.position.copy(gcEnd).add(new THREE.Vector3(0, 90, 0));
-          sunBeamsDynamicExtrasGroup.add(gcSprite);
+          customPinRaySubGroup.add(new THREE.Line(customRayGeo, customRayMat));
         }
       }
     }
@@ -2901,7 +2966,7 @@ function updateSunRaysAndShader() {
 
   sunBeamsGroup.visible = shouldBuildSunBeams && state.cameraMode === "orbit";
 
-  // Update unified bottom Scrubber & telemetry readouts
+  // Update unified bottom Scrubber & telemetry readouts (diff-guarded against unnecessary DOM layout)
   const hhmm = formatMinutesToHHMM(state.currentMinutes);
   const comp = compassLabel(azimuthDeg);
   const elSign = elevationDeg >= 0 ? "+" : "";
@@ -2944,13 +3009,13 @@ function updateSunRaysAndShader() {
     if (!hourlyMet) cliffLitLabel = "88% Rim Light";
   }
 
-  document.getElementById("hud-local-time").textContent = `${hhmm} Local`;
-  document.getElementById("hud-phase-badge").textContent = phaseLabel;
-  document.getElementById("hud-sun-az").textContent = `${azimuthDeg.toFixed(1)}° ${comp}`;
-  document.getElementById("hud-sun-el").textContent = `${elSign}${elevationDeg.toFixed(1)}°`;
-  document.getElementById("hud-cliff-lit").textContent = cliffLitLabel;
-
-  timeOutput.textContent = `${hhmm} • ${phaseLabel}`;
+  setTextIfChanged(document.getElementById("hud-local-time"), "localTime", `${hhmm} Local`);
+  setTextIfChanged(document.getElementById("hud-phase-badge"), "phaseBadge", phaseLabel);
+  setTextIfChanged(document.getElementById("hud-sun-az"), "sunAz", `${azimuthDeg.toFixed(1)}° ${comp}`);
+  setTextIfChanged(document.getElementById("hud-sun-el"), "sunEl", `${elSign}${elevationDeg.toFixed(1)}°`);
+  setTextIfChanged(document.getElementById("hud-cliff-lit"), "cliffLit", cliffLitLabel);
+  setTextIfChanged(timeOutput, "scrubberOut", `${hhmm} • ${phaseLabel}`);
+  wakeRenderLoop(false);
 }
 
 // ============================================================================
@@ -2958,6 +3023,7 @@ function updateSunRaysAndShader() {
 // ============================================================================
 function setCameraMode(mode) {
   state.cameraMode = mode;
+  volumetricEngine.invalidateTemporalHistory();
 
   if (mode === "orbit") {
     if (btnOrbitMode) btnOrbitMode.hidden = true;
@@ -3054,6 +3120,7 @@ function selectViewpoint(idx, focusOrbit = true) {
   const vp = state.shootReport?.top_viewpoints?.[idx];
   const lm = state.shootReport?.target_landmark;
   if (focusOrbit && vp && lm) {
+    volumetricEngine.invalidateTemporalHistory();
     state.cameraMode = "orbit";
     if (btnOrbitMode) btnOrbitMode.hidden = true;
     if (hudClickModeGroup) hudClickModeGroup.hidden = false;
@@ -3983,16 +4050,40 @@ renderer.domElement.addEventListener("pointerup", async (e) => {
 syncSliderValue(timeScrubber);
 
 let scrubberRafPending = false;
+let scrubberSettleTimer = 0;
+
+function scheduleScrubberSettleBake() {
+  if (scrubberSettleTimer) clearTimeout(scrubberSettleTimer);
+  scrubberSettleTimer = setTimeout(() => {
+    scrubberSettleTimer = 0;
+    isScrubbingTime = false;
+    if (terrainShaderMaterial) {
+      volumetricEngine.updateTerrainBakeUniforms({
+        sunDirENU: terrainShaderMaterial.uniforms.uSunDirENU.value,
+        showViewshed: state.showViewshed,
+        isScrubbing: false,
+      });
+    }
+    wakeRenderLoop(false);
+  }, 95);
+}
 
 timeScrubber.addEventListener("input", () => {
+  isScrubbingTime = true;
+  wakeRenderLoop(true);
   state.currentMinutes = parseFloat(timeScrubber.value);
   syncSliderValue(timeScrubber);
+  scheduleScrubberSettleBake();
   if (scrubberRafPending) return;
   scrubberRafPending = true;
   requestAnimationFrame(() => {
     scrubberRafPending = false;
     updateSunRaysAndShader();
   });
+});
+
+timeScrubber.addEventListener("change", () => {
+  scheduleScrubberSettleBake();
 });
 
 document.getElementById("query-form").addEventListener("submit", (e) => {
@@ -4483,12 +4574,14 @@ volumetricEngine.onTelemetryCallback = (tel) => {
 
   const stepStr = (tel.stepMs || 0.28).toFixed(2);
   const solverTag = tel.gpuFluidActive ? "GPU 128×128×48 Fluid" : "WASM Fluid (Worker)";
-  if (fluidPerfBadge) {
-    fluidPerfBadge.textContent = `${Math.round(rollingFps)} FPS`;
-    fluidPerfBadge.title = `${solverTag} Step: ${stepStr} ms`;
-  }
-  if (viewportGpuPill) {
-    viewportGpuPill.textContent = `⚡ ${Math.round(rollingFps)} FPS · ${stepStr}ms`;
+  if (!isRenderLoopSleeping) {
+    if (fluidPerfBadge) {
+      fluidPerfBadge.textContent = `${Math.round(rollingFps)} FPS`;
+      fluidPerfBadge.title = `${solverTag} Step: ${stepStr} ms`;
+    }
+    if (viewportGpuPill) {
+      viewportGpuPill.textContent = `⚡ ${Math.round(rollingFps)} FPS · ${stepStr}ms`;
+    }
   }
   if (fluidSummarySub) {
     fluidSummarySub.textContent = `1.0m Detail • 0–${topKm} km 3D Cirrus • Low ${lowPct}% / High ${highPct}%`;
@@ -4502,16 +4595,30 @@ window.addEventListener("resize", () => {
   camera.updateProjectionMatrix();
   renderer.setSize(w, h);
   volumetricEngine.resize();
+  wakeRenderLoop(true);
 });
 
 // ============================================================================
-// Main GPU Volumetric + Navier-Stokes Render Loop (Paused when Hidden/Offscreen)
+// Adaptive 3-Tier GPU Render Loop:
+//   Tier 1 (Active):       60 FPS while orbiting, scrubbing, or animating sun
+//   Tier 2 (Gentle Drift): 20 FPS low-power cloud evolution when hands-off (<8s)
+//   Tier 3 (Idle Sleep):    0 FPS (0W GPU) after 8s idle or when hidden; <16ms wake!
 // ============================================================================
-let lastFrameTimeMs = performance.now();
+let lastRenderedFrameMs = performance.now();
+let lastUserActivityMs = performance.now();
+let camSettledAtMs = performance.now();
 let fpsAccumFrames = 0;
 let fpsAccumMs = 0;
 let activeAnimRafId = 0;
 let stageIntersecting = true;
+let isRenderLoopSleeping = false;
+const _lastCamPos = camera.position.clone();
+const _lastCamQuat = camera.quaternion.clone();
+
+const ACTIVE_BOOST_WINDOW_MS = 950;
+const CAM_SETTLE_TAIL_MS = 340;
+const GENTLE_DRIFT_WINDOW_MS = 8000;
+const GENTLE_DRIFT_MIN_INTERVAL_MS = 47.5; // ~20 FPS
 
 function shouldRunRenderLoop() {
   return !document.hidden && stageIntersecting;
@@ -4519,10 +4626,49 @@ function shouldRunRenderLoop() {
 
 function ensureRenderLoopRunning() {
   if (activeAnimRafId === 0 && shouldRunRenderLoop()) {
-    lastFrameTimeMs = performance.now();
+    isRenderLoopSleeping = false;
+    lastRenderedFrameMs = performance.now() - 16.7;
     activeAnimRafId = requestAnimationFrame(animate);
   }
 }
+
+function wakeRenderLoop(markFullActive = true) {
+  const now = performance.now();
+  if (markFullActive) {
+    lastUserActivityMs = now;
+    camSettledAtMs = now;
+  } else {
+    // Programmatic/hover wake: ensure at least a crisp convergence burst without pinning 60 FPS indefinitely
+    camSettledAtMs = Math.max(camSettledAtMs, now);
+    if (now - lastUserActivityMs >= GENTLE_DRIFT_WINDOW_MS) {
+      lastUserActivityMs = now - (ACTIVE_BOOST_WINDOW_MS + 50);
+    }
+  }
+  ensureRenderLoopRunning();
+}
+
+// Instant (<16ms) wakeup on any pointer, wheel, touch, keyboard, or UI control interaction
+controls.addEventListener("start", () => wakeRenderLoop(true));
+controls.addEventListener("change", () => {
+  camSettledAtMs = performance.now();
+  ensureRenderLoopRunning();
+});
+
+["pointerdown", "wheel", "touchstart", "keydown", "input", "change", "click"].forEach((evt) => {
+  window.addEventListener(evt, () => wakeRenderLoop(true), { passive: true });
+});
+
+container?.addEventListener(
+  "pointermove",
+  (e) => {
+    if (e.buttons !== 0) {
+      wakeRenderLoop(true);
+    } else if (isRenderLoopSleeping) {
+      wakeRenderLoop(false);
+    }
+  },
+  { passive: true }
+);
 
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
@@ -4531,7 +4677,7 @@ document.addEventListener("visibilitychange", () => {
       activeAnimRafId = 0;
     }
   } else {
-    ensureRenderLoopRunning();
+    wakeRenderLoop(true);
   }
 });
 
@@ -4545,7 +4691,7 @@ if (typeof IntersectionObserver !== "undefined" && container) {
         cancelAnimationFrame(activeAnimRafId);
         activeAnimRafId = 0;
       } else if (stageIntersecting) {
-        ensureRenderLoopRunning();
+        wakeRenderLoop(false);
       }
     },
     { threshold: 0.01 }
@@ -4558,10 +4704,47 @@ function animate(nowMs = performance.now()) {
     activeAnimRafId = 0;
     return;
   }
+
+  const idleElapsedMs = nowMs - lastUserActivityMs;
+  const camSettleElapsedMs = nowMs - camSettledAtMs;
+  const isHighRateActive =
+    state.isPlayingSun ||
+    isScrubbingTime ||
+    idleElapsedMs < ACTIVE_BOOST_WINDOW_MS ||
+    camSettleElapsedMs < CAM_SETTLE_TAIL_MS;
+
+  const canGentleDrift =
+    volumetricEngine.evolveFluid &&
+    state.showAtmosphere &&
+    idleElapsedMs < GENTLE_DRIFT_WINDOW_MS;
+
+  // Tier 3: Deep 0-FPS Idle Sleep after 8s hands-off (0 GPU watts, instant <16ms wake on input!)
+  if (!isHighRateActive && !canGentleDrift) {
+    activeAnimRafId = 0;
+    isRenderLoopSleeping = true;
+    rollingFps = 0;
+    fpsAccumFrames = 0;
+    fpsAccumMs = 0;
+    if (fluidPerfBadge) {
+      fluidPerfBadge.textContent = "Idle (0W)";
+    }
+    if (viewportGpuPill) {
+      viewportGpuPill.textContent = "⚡ Idle · 0 GPU";
+    }
+    return;
+  }
+
   activeAnimRafId = requestAnimationFrame(animate);
 
-  const dtMs = Math.min(100, Math.max(0.5, nowMs - lastFrameTimeMs));
-  lastFrameTimeMs = nowMs;
+  // Tier 2: Gentle 20 FPS Cloud Drift when camera is stationary & hands-off (saves ~65% GPU power)
+  const sinceLastRenderMs = nowMs - lastRenderedFrameMs;
+  if (!isHighRateActive && sinceLastRenderMs < GENTLE_DRIFT_MIN_INTERVAL_MS) {
+    return;
+  }
+
+  isRenderLoopSleeping = false;
+  const dtMs = Math.min(100, Math.max(0.5, sinceLastRenderMs));
+  lastRenderedFrameMs = nowMs;
   const dtRealS = dtMs * 0.001;
 
   fpsAccumFrames += 1;
@@ -4574,8 +4757,9 @@ function animate(nowMs = performance.now()) {
     const solverTag = volumetricEngine.telemetry.gpuFluidActive
       ? "GPU 128×128×48 Fluid"
       : "WASM Fluid (Worker)";
+    const tierSuffix = isHighRateActive ? "" : " (Eco)";
     if (fluidPerfBadge) {
-      fluidPerfBadge.textContent = `${Math.round(rollingFps)} FPS`;
+      fluidPerfBadge.textContent = `${Math.round(rollingFps)} FPS${tierSuffix}`;
       fluidPerfBadge.title = `${solverTag} Step: ${stepStr} ms`;
     }
     if (viewportGpuPill) {
@@ -4602,6 +4786,15 @@ function animate(nowMs = performance.now()) {
   }
 
   controls.update();
+  if (
+    camera.position.distanceToSquared(_lastCamPos) > 1e-4 ||
+    1.0 - Math.abs(camera.quaternion.dot(_lastCamQuat)) > 1e-6
+  ) {
+    _lastCamPos.copy(camera.position);
+    _lastCamQuat.copy(camera.quaternion);
+    camSettledAtMs = nowMs;
+  }
+
   volumetricEngine.renderPipeline(worldScene, overlayScene, dtRealS, state.showAtmosphere);
 }
 
