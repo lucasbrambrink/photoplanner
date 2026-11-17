@@ -23,6 +23,7 @@ from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 from planner.weather import (
+    BENCHMARK_REPORT_JSON_PATH,
     SUMMARY_JSON_PATH,
     run_full_backtest_suite,
     solve_weather_and_corridor,
@@ -1253,13 +1254,15 @@ def compute_weather_and_alpenglow(
     target_elev_m: float = 2693.0,
     model_engine: str = "ensemble",
     sim_now_utc_str: str | None = None,
+    replay_mode: str = "auto",
 ) -> bytes:
     """
-    Evaluates the live GOES-18/19 ABI L2 + NWS METAR/ASOS + 24h multi-model NWP + CAMS aerosol
-    atmosphere and integrates the full 0–380 km curved-Earth Sun-to-Landmark radiative corridor
-    via the Rust `photoplanner corridor-raycast` engine.
+    Evaluates the live/archived GOES-18/19 ABI L2 (CCLC+BTD) + NWS/IEM ASOS + 00Z/12Z RAOB balloon
+    + 24h multi-model NWP / Previous-Runs hindcast + CAMS aerosol atmosphere and integrates the full
+    0–380 km curved-Earth Sun-to-Landmark radiative corridor via Rust `photoplanner corridor-raycast`.
     """
     model_engine = (model_engine or "ensemble").lower().strip()
+    replay_mode = (replay_mode or "auto").lower().strip()
     today_str = _current_pacific_date_str()
     resolved_date = (date_str or today_str).strip()
     sim_dt: dt.datetime | None = None
@@ -1267,8 +1270,9 @@ def compute_weather_and_alpenglow(
         sim_dt = dt.datetime.fromisoformat(sim_now_utc_str.replace("Z", "+00:00"))
 
     cache_key = (
-        f"weather_corridor_v7:{lat:.3f}:{lon:.3f}:{resolved_date}:{phase.lower()}:"
-        f"{sun_az_deg:.1f}:{sun_el_deg:.1f}:{target_elev_m:.0f}:{model_engine}:{sim_now_utc_str or 'live'}"
+        f"weather_corridor_v8:{lat:.3f}:{lon:.3f}:{resolved_date}:{phase.lower()}:"
+        f"{sun_az_deg:.1f}:{sun_el_deg:.1f}:{target_elev_m:.0f}:{model_engine}:"
+        f"{replay_mode}:{sim_now_utc_str or 'live'}"
     )
     is_live_or_future = (sim_dt is None) and (resolved_date >= today_str)
     ttl_sec = 300.0 if is_live_or_future else 3600.0
@@ -1288,6 +1292,7 @@ def compute_weather_and_alpenglow(
         target_elev_m=target_elev_m,
         model_engine=model_engine,
         simulated_now_utc=sim_dt,
+        replay_mode=replay_mode,
     )
     _WEATHER_TTL_CACHE[cache_key] = (now_mono, payload)
     return payload
@@ -1401,6 +1406,7 @@ class PhotoPlannerHandler(BaseHTTPRequestHandler):
                 target_elev_m = float(qs.get("elev_m", ["2693.0"])[0])
                 model_engine = qs.get("engine", ["ensemble"])[0]
                 sim_now_utc_str = qs.get("sim_now_utc", [None])[0]
+                replay_mode = qs.get("replay_mode", ["auto"])[0]
                 data = compute_weather_and_alpenglow(
                     lat,
                     lon,
@@ -1411,6 +1417,7 @@ class PhotoPlannerHandler(BaseHTTPRequestHandler):
                     target_elev_m,
                     model_engine,
                     sim_now_utc_str=sim_now_utc_str,
+                    replay_mode=replay_mode,
                 )
                 self._send_json(data)
                 return
@@ -1419,6 +1426,8 @@ class PhotoPlannerHandler(BaseHTTPRequestHandler):
                 refresh = qs.get("refresh", ["0"])[0] == "1"
                 if (not refresh) and SUMMARY_JSON_PATH.exists():
                     data = SUMMARY_JSON_PATH.read_bytes()
+                elif (not refresh) and BENCHMARK_REPORT_JSON_PATH.exists():
+                    data = BENCHMARK_REPORT_JSON_PATH.read_bytes()
                 else:
                     data = json.dumps(run_full_backtest_suite()).encode("utf-8")
                 self._send_json(data, cache_control="public, max-age=3600")

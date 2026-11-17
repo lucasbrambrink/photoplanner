@@ -30,6 +30,9 @@ const state = {
   date: savedDate,
   maxMiles: 16.0,
   weatherEngine: "ensemble", // "ensemble" | "graphcast" | "hrrr" | "ecmwf" | "nowcast"
+  replayMode: "truth", // "truth" | "nowcast_1h" | "hindcast_24h" | "hindcast_72h" (for past dates)
+  cachedTruthReport: null,
+  cachedTruthKey: "",
   shootReport: null,
   terrainPatch: null,
   weatherReport: null,
@@ -49,6 +52,10 @@ const state = {
   showSightlines: true,
   highlightLandingZone: false,
 };
+
+function isPastShootDate(dateStr = state.date) {
+  return Boolean(dateStr && dateStr < todayIso);
+}
 
 const VP_COLORS = [0x38bdf8, 0xa855f7, 0x22c55e];
 const VP_HEX = ["#38bdf8", "#a855f7", "#22c55e"];
@@ -3194,7 +3201,13 @@ function renderWeatherCard(w) {
   // Populate 380 km Curved-Earth Bimodal & Spectral Telemetry (#corridor-bimodal-box)
   const nowcastPillEl = document.getElementById("corridor-nowcast-pill");
   if (nowcastPillEl) {
-    if (w.nowcast_status?.active) {
+    if (w.historical_replay?.is_observed_truth && w.nowcast_status?.active) {
+      const stId = w.nowcast_status.metar_station?.id || "ABI";
+      const raobId = w.nowcast_status.raob_station?.id ? `+${w.nowcast_status.raob_station.id}` : "";
+      nowcastPillEl.textContent = `📡 Observed Truth (${stId}${raobId})`;
+    } else if ((w.historical_replay?.hindcast_lead_days || 0) > 0) {
+      nowcastPillEl.textContent = `⏪ +${w.historical_replay.hindcast_lead_days * 24}h Hindcast`;
+    } else if (w.nowcast_status?.active) {
       const stId = w.nowcast_status.metar_station?.id || "ABI";
       const wtPct = Math.round((w.nowcast_status.nowcast_blend_weight || 0) * 100);
       nowcastPillEl.textContent = `📡 GOES-18 + ${stId} (${wtPct}%)`;
@@ -3462,7 +3475,84 @@ function renderWeatherCard(w) {
 
   state.activeAtmosphericLayers = w.atmospheric_layers || null;
   renderUnifiedAtmosphereStack(state.activeAtmosphericLayers);
+  renderHistoricalReplayPanel(w);
   renderAstroCard(w, state.shootReport);
+}
+
+function formatSignedInt(val, suffix = "") {
+  const n = Math.round(val || 0);
+  return `${n >= 0 ? "+" : ""}${n.toLocaleString()}${suffix}`;
+}
+
+function renderHistoricalReplayPanel(w) {
+  const panelEl = document.getElementById("historical-replay-panel");
+  if (!panelEl) return;
+  if (!isPastShootDate(state.date)) {
+    panelEl.hidden = true;
+    return;
+  }
+  panelEl.hidden = false;
+
+  const activeMode = state.replayMode || "truth";
+  panelEl.querySelectorAll("[data-replay-mode]").forEach((btn) => {
+    btn.classList.toggle("is-active", btn.dataset.replayMode === activeMode);
+  });
+
+  const badgeEl = document.getElementById("historical-replay-badge");
+  if (badgeEl) {
+    if (activeMode === "truth") {
+      badgeEl.textContent = "Observed Truth";
+      badgeEl.className = "conf-pill conf-high";
+    } else if (activeMode === "nowcast_1h") {
+      badgeEl.textContent = "+1h vs. Truth";
+      badgeEl.className = "conf-pill conf-high";
+    } else if (activeMode === "hindcast_24h") {
+      badgeEl.textContent = "+24h vs. Truth";
+      badgeEl.className = "conf-pill conf-moderate";
+    } else {
+      badgeEl.textContent = "+72h vs. Truth";
+      badgeEl.className = "conf-pill conf-low";
+    }
+  }
+
+  const deltaEl = document.getElementById("historical-delta-strip");
+  if (!deltaEl) return;
+  const truth = state.cachedTruthReport;
+  if (activeMode === "truth" || !w || !truth) {
+    deltaEl.hidden = true;
+    return;
+  }
+
+  const dLow = (w.cloud_low_pct ?? 0) - (truth.cloud_low_pct ?? 0);
+  const dHigh = (w.cloud_high_pct ?? 0) - (truth.cloud_high_pct ?? 0);
+  const wLid = w.inversion_model?.fog_top_ft ?? w.fog_top_ft ?? 0;
+  const tLid = truth.inversion_model?.fog_top_ft ?? truth.fog_top_ft ?? 0;
+  const dLid = wLid - tLid;
+  const dBeam = (w.ray_transmittance_pct ?? 0) - (truth.ray_transmittance_pct ?? 0);
+  const dGlow = (w.alpenglow_score ?? 0) - (truth.alpenglow_score ?? 0);
+
+  const clsPct = (err) => (Math.abs(err) <= 12 ? "delta-good" : Math.abs(err) >= 28 ? "delta-warn" : "");
+  const clsFt = (err) => (Math.abs(err) <= 350 ? "delta-good" : Math.abs(err) >= 900 ? "delta-warn" : "");
+
+  deltaEl.hidden = false;
+  deltaEl.innerHTML = `
+    <div class="hist-delta-cell" title="Forecast Low/Fog coverage minus Observed Truth (${truth.cloud_low_pct ?? 0}%)">
+      <span>Low/Fog Δ</span>
+      <strong class="${clsPct(dLow)}">${formatSignedInt(dLow, "pp")}</strong>
+    </div>
+    <div class="hist-delta-cell" title="Forecast High Cirrus coverage minus Observed Truth (${truth.cloud_high_pct ?? 0}%)">
+      <span>Cirrus Δ</span>
+      <strong class="${clsPct(dHigh)}">${formatSignedInt(dHigh, "pp")}</strong>
+    </div>
+    <div class="hist-delta-cell" title="Forecast Fog/Inversion Lid minus Balloon+ASOS Observed Lid (${tLid.toLocaleString()} ft)">
+      <span>Fog Lid Δ</span>
+      <strong class="${clsFt(dLid)}">${formatSignedInt(dLid, " ft")}</strong>
+    </div>
+    <div class="hist-delta-cell" title="Forecast Beam Transmittance &amp; Alpenglow Score minus Observed Truth">
+      <span>Beam / Glow Δ</span>
+      <strong class="${clsPct(dBeam)}">${formatSignedInt(dBeam, "%")} · ${formatSignedInt(dGlow)}</strong>
+    </div>
+  `;
 }
 
 function escapeHtmlText(str) {
@@ -3754,6 +3844,10 @@ function renderAstroCard(w, shootReport) {
   }
 }
 
+function buildTruthCacheKey(lat, lon, dateStr, phase) {
+  return `${Number(lat).toFixed(4)}:${Number(lon).toFixed(4)}:${dateStr}:${phase.toLowerCase()}`;
+}
+
 async function fetchWeatherForCorridor(phase = "sunset") {
   const lm = state.shootReport?.target_landmark;
   if (!lm) return;
@@ -3767,10 +3861,28 @@ async function fetchWeatherForCorridor(phase = "sunset") {
   document.getElementById("tab-corridor-sunset")?.classList.toggle("is-active", phase === "sunset");
   document.getElementById("tab-corridor-sunrise")?.classList.toggle("is-active", phase === "sunrise");
 
-  const url = `/api/weather-forecast?lat=${lm.summit_lat}&lon=${lm.summit_lon}&date=${encodeURIComponent(state.date)}&phase=${phase}&sun_az=${sunAz}&sun_el=${sunEl}&elev_m=${lm.summit_elevation_m}&engine=${encodeURIComponent(state.weatherEngine)}`;
-  const res = await fetch(url);
+  const isPast = isPastShootDate(state.date);
+  const effectiveReplay = isPast ? (state.replayMode || "truth") : "auto";
+  const truthKey = buildTruthCacheKey(lm.summit_lat, lm.summit_lon, state.date, phase);
+  const baseUrl = `/api/weather-forecast?lat=${lm.summit_lat}&lon=${lm.summit_lon}&date=${encodeURIComponent(state.date)}&phase=${phase}&sun_az=${sunAz}&sun_el=${sunEl}&elev_m=${lm.summit_elevation_m}&engine=${encodeURIComponent(state.weatherEngine)}`;
+
+  const needBgTruth = isPast && effectiveReplay !== "truth" && state.cachedTruthKey !== truthKey;
+  const [res, bgTruthRes] = await Promise.all([
+    fetch(`${baseUrl}&replay_mode=${encodeURIComponent(effectiveReplay)}`),
+    needBgTruth ? fetch(`${baseUrl}&replay_mode=truth`) : Promise.resolve(null),
+  ]);
+
+  if (bgTruthRes && bgTruthRes.ok) {
+    state.cachedTruthReport = await bgTruthRes.json();
+    state.cachedTruthKey = truthKey;
+  }
+
   if (res.ok) {
     state.weatherReport = await res.json();
+    if (isPast && effectiveReplay === "truth") {
+      state.cachedTruthReport = state.weatherReport;
+      state.cachedTruthKey = truthKey;
+    }
     _activeCorridorLutSector = null;
     _lastSyncedFluidMinutes = -999;
     volumetricEngine.setLiveWeatherReport(state.weatherReport);
@@ -3921,6 +4033,10 @@ async function loadLandmarkScenario(customCoord = null) {
   window.getSelection?.()?.removeAllRanges?.();
   disposeObjectTree(customPinGroup);
 
+  state.replayMode = "truth";
+  state.cachedTruthReport = null;
+  state.cachedTruthKey = "";
+
   const lmSel = document.getElementById("landmark-select");
   const dtInp = document.getElementById("shoot-date");
   if (lmSel && !customCoord) lmSel.value = state.landmark;
@@ -3950,16 +4066,23 @@ async function loadLandmarkScenario(customCoord = null) {
     const sunsetWin = report.golden_hour_windows?.[0];
     const initAz = sunsetWin ? sunsetWin.sun_azimuth_deg : 259.1;
     const initEl = sunsetWin ? sunsetWin.sun_elevation_deg : 0.4;
+    const isPast = isPastShootDate(state.date);
+    const initReplay = isPast ? "truth" : "auto";
+    const truthKey = buildTruthCacheKey(lm.summit_lat, lm.summit_lon, state.date, "sunset");
 
     const [terrainPatchData, weatherRes] = await Promise.all([
       fetchBinaryOrJsonTerrainPatch(lm.summit_lat, lm.summit_lon, 9200, 600),
-      fetch(`/api/weather-forecast?lat=${lm.summit_lat}&lon=${lm.summit_lon}&date=${encodeURIComponent(state.date)}&phase=sunset&sun_az=${initAz}&sun_el=${initEl}&elev_m=${lm.summit_elevation_m}&engine=${encodeURIComponent(state.weatherEngine)}`),
+      fetch(`/api/weather-forecast?lat=${lm.summit_lat}&lon=${lm.summit_lon}&date=${encodeURIComponent(state.date)}&phase=sunset&sun_az=${initAz}&sun_el=${initEl}&elev_m=${lm.summit_elevation_m}&engine=${encodeURIComponent(state.weatherEngine)}&replay_mode=${initReplay}`),
     ]);
 
     state.terrainPatch = terrainPatchData;
 
     if (weatherRes.ok) {
       state.weatherReport = await weatherRes.json();
+      if (isPast) {
+        state.cachedTruthReport = state.weatherReport;
+        state.cachedTruthKey = truthKey;
+      }
       _activeCorridorLutSector = null;
       _lastSyncedFluidMinutes = -999;
       volumetricEngine.setLiveWeatherReport(state.weatherReport);
@@ -4607,6 +4730,24 @@ document.getElementById("ai-models-comparison-grid")?.addEventListener("click", 
   const card = e.target.closest("[data-select-engine]");
   if (card) {
     selectWeatherPredictionEngine(card.dataset.selectEngine);
+  }
+});
+
+function selectHistoricalReplayMode(mode) {
+  if (!mode || !isPastShootDate(state.date)) return;
+  state.replayMode = mode;
+  document.querySelectorAll("#historical-replay-btns [data-replay-mode]").forEach((btn) => {
+    btn.classList.toggle("is-active", btn.dataset.replayMode === mode);
+  });
+  hideCloudHoverTooltip(true);
+  const isSunriseActive = document.getElementById("tab-corridor-sunrise")?.classList.contains("is-active");
+  fetchWeatherForCorridor(isSunriseActive ? "sunrise" : "sunset");
+}
+
+document.getElementById("historical-replay-btns")?.addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-replay-mode]");
+  if (btn) {
+    selectHistoricalReplayMode(btn.dataset.replayMode);
   }
 });
 

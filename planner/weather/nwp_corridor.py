@@ -244,11 +244,47 @@ def extract_hour_sounding(
     dz_free_km = max(1.0, (z500 - z700) / 1000.0)
     lapse_k_km = max(3.5, min(9.6, (t700 - t500) / dz_free_km))
 
-    # Thermal inversion detection (`+Delta T` across boundary layer)
-    if elev_m < 650.0:
+    # Thermal inversion & boundary-layer lid detection (`+Delta T` + vertical hydrolapse)
+    if is_coastal and elev_m < 1350.0:
+        # Pacific marine boundary layer is sea-level-referenced (`0 m ASL`), NOT `elev_m + pbl`!
+        # Elevated coastal peaks (e.g. Mt. Tamalpais 784 m, Montara Mtn 578 m) frequently poke ABOVE
+        # shallow 250–700 m marine stratus decks (`rh975/rh950` moist while `rh925/summit` is dry).
+        inv_jump_k = max(
+            0.0,
+            max(t950, t925, t850) - t2m_c,
+            max(t925, t850) - t950 + (1.2 if rh975 >= 78.0 and rh925 < 55.0 else 0.0),
+        )
+        z925_eff = max(720.0, z925)
+        z850_eff = max(1350.0, z850)
+        if elev_m >= 350.0 and rh2m >= 85.0 and rh975 < 75.0:
+            # Deep post-frontal moist boundary layer immersing an elevated coastal summit
+            marine_lid_asl_m = elev_m + min(550.0, max(160.0, pbl_agl_m * 1.45))
+        elif rh850 >= 66.0:
+            marine_lid_asl_m = z850_eff + 200.0
+        elif rh925 >= 66.0:
+            marine_lid_asl_m = z925_eff + ((rh925 - 66.0) / max(4.0, rh925 - rh850)) * (z850_eff - z925_eff)
+        elif rh950 >= 66.0:
+            marine_lid_asl_m = 540.0 + ((rh950 - 66.0) / max(4.0, rh950 - rh925)) * (z925_eff - 540.0)
+        elif rh975 >= 66.0:
+            marine_lid_asl_m = 320.0 + ((rh975 - 66.0) / max(4.0, rh975 - rh950)) * 220.0
+        elif t925 > t950 or t850 > t950 or (rh975 - rh950) >= 12.0:
+            # Very shallow heat-wave marine inversion capped below 975 hPa (~320 m ASL)
+            marine_lid_asl_m = max(185.0, min(360.0, 320.0 * (max(25.0, rh975) / 50.0)))
+        else:
+            marine_lid_asl_m = max(360.0, min(1350.0, z925_eff + pbl_agl_m * 0.75))
+
+        if elev_m >= 320.0 and rh2m >= 88.0:
+            # Summit station itself is saturated inside fog
+            marine_lid_asl_m = max(marine_lid_asl_m, elev_m + min(260.0, max(55.0, pbl_agl_m * 0.85)))
+        elif elev_m < 220.0 and rh975 >= 75.0 and pbl_agl_m > 80.0:
+            marine_lid_asl_m = 0.72 * marine_lid_asl_m + 0.28 * (elev_m + pbl_agl_m + 180.0)
+
+        inv_top_asl_m = max(185.0, min(1550.0, marine_lid_asl_m))
+        inv_base_asl_m = max(70.0, inv_top_asl_m - 210.0)
+    elif elev_m < 650.0:
         inv_jump_k = max(0.0, max(t950, t925, t850) - t2m_c)
         inv_base_asl_m = elev_m + min(950.0, max(110.0, pbl_agl_m * 0.88))
-        inv_top_asl_m = inv_base_asl_m + (220.0 if is_coastal else 310.0)
+        inv_top_asl_m = inv_base_asl_m + 310.0
     else:
         # High-elevation valley / basin inversion
         inv_jump_k = max(0.0, max(t850, t700) - t2m_c)
@@ -261,8 +297,8 @@ def extract_hour_sounding(
 
     # Effective low/mid/high cloud percentages incorporating pressure-level saturation
     eff_low_pct = max(cc_low, c925 * 0.9, c850 * 0.82)
-    if elev_m < 450.0 and max(rh975, rh950) >= 88.0:
-        eff_low_pct = max(eff_low_pct, min(98.0, (max(rh975, rh950) - 72.0) * 3.2))
+    if (is_coastal or elev_m < 450.0) and max(rh975, rh950) >= 85.0:
+        eff_low_pct = max(eff_low_pct, min(98.0, (max(rh975, rh950) - 70.0) * 3.2))
     eff_mid_pct = max(cc_mid, c700 * 0.92, c500 * 0.85)
     eff_high_pct = max(cc_high, c300 * 0.95)
 
@@ -270,14 +306,24 @@ def extract_hour_sounding(
     cloud_bands: list[dict[str, Any]] = []
 
     # Band 1: Boundary-layer marine stratus / Tule radiation fog (when inversion or low saturation present)
-    is_low_marine_or_valley = elev_m < 950.0 and (
-        (inv_jump_k >= 0.8 and eff_low_pct >= 12.0) or rh2m >= 91.0 or rh975 >= 89.0
+    is_low_marine_or_valley = (
+        is_coastal
+        and elev_m < 1350.0
+        and ((inv_jump_k >= 0.6 and eff_low_pct >= 8.0) or rh975 >= 78.0 or rh2m >= 88.0)
+    ) or (
+        elev_m < 950.0
+        and ((inv_jump_k >= 0.8 and eff_low_pct >= 12.0) or rh2m >= 91.0 or rh975 >= 89.0)
     )
     if is_low_marine_or_valley:
-        fog_top_m = max(elev_m + 140.0, min(inv_top_asl_m, elev_m + 1150.0))
-        if rh950 < 68.0 and fog_top_m > 520.0 and elev_m < 250.0:
-            fog_top_m = 460.0
-        fog_base_m = max(elev_m + 20.0, min(fog_top_m - 90.0, lcl_asl_m))
+        if is_coastal and elev_m < 1350.0:
+            fog_top_m = max(185.0, min(1550.0, inv_top_asl_m))
+            sea_lcl_m = lcl_asl_m if elev_m < 240.0 else max(80.0, min(fog_top_m - 130.0, fog_top_m * 0.42))
+            fog_base_m = max(55.0, min(fog_top_m - 85.0, sea_lcl_m))
+        else:
+            fog_top_m = max(elev_m + 140.0, min(inv_top_asl_m, elev_m + 1150.0))
+            if rh950 < 68.0 and fog_top_m > 520.0 and elev_m < 250.0:
+                fog_top_m = 460.0
+            fog_base_m = max(elev_m + 20.0, min(fog_top_m - 90.0, lcl_asl_m))
         fog_cf = max(0.0, min(1.0, eff_low_pct / 100.0))
         if fog_cf >= 0.03:
             fog_thick_m = max(70.0, fog_top_m - fog_base_m)
@@ -443,6 +489,236 @@ def extract_hour_sounding(
     }
 
 
+def _partition_prev_run_cloud_layers(
+    tot_cc: float,
+    rh_2m: float,
+    temp_2m: float,
+    dew_2m: float,
+    dni_wm2: float,
+    dhi_wm2: float,
+    base_low: float,
+    base_mid: float,
+    base_high: float,
+    is_coastal_pt: bool,
+) -> tuple[float, float, float]:
+    """
+    Partitions `cloud_cover_previous_day{k}` (`0..100`) into `(low_pct, mid_pct, high_pct)`
+    using physical boundary-layer saturation (`rh_2m`, `temp_2m - dew_2m`) and the Day-k
+    radiative forward-scattering signature (`dni_wm2` vs `dhi_wm2`) without leaking Day-0 truth.
+    """
+    tot = max(0.0, min(100.0, tot_cc))
+    if tot <= 1.5:
+        return 0.0, 0.0, 0.0
+
+    spread_c = max(0.0, temp_2m - dew_2m)
+    bl_moist = max(0.0, min(1.0, (rh_2m - 72.0) / 22.0)) * max(0.0, min(1.0, (5.5 - spread_c) / 4.2))
+    if is_coastal_pt and rh_2m >= 82.0:
+        bl_moist = max(bl_moist, min(1.0, (rh_2m - 74.0) / 18.0))
+
+    # Optically thin ice cirrus transmits substantial DNI (> 140 W/m^2) while boosting diffuse DHI
+    translucent_cirrus = 0.0
+    if dni_wm2 > 130.0 and tot >= 25.0:
+        translucent_cirrus = max(0.0, min(1.0, (dni_wm2 - 110.0) / 320.0)) * (1.0 - 0.65 * bl_moist)
+
+    w_low = 0.18 + 0.82 * bl_moist
+    w_high = 0.22 + 0.72 * translucent_cirrus + 0.28 * (1.0 - bl_moist)
+    w_mid = 0.20 + 0.35 * (1.0 - abs(bl_moist - 0.45))
+    w_sum = max(1e-4, w_low + w_mid + w_high)
+
+    # Allow realistic multi-layer overlap (sum of layers ~ 1.0..1.35 * tot when tot is high)
+    overlap_gain = 1.0 + 0.28 * (tot / 100.0)
+    low_p = max(0.0, min(100.0, tot * overlap_gain * (w_low / w_sum) * 1.35))
+    mid_p = max(0.0, min(100.0, tot * overlap_gain * (w_mid / w_sum) * 1.15))
+    high_p = max(0.0, min(100.0, tot * overlap_gain * (w_high / w_sum) * 1.25))
+
+    # Ensure maximum layer reaches at least `0.88 * tot`
+    cur_max = max(low_p, mid_p, high_p, 1.0)
+    if cur_max < 0.88 * tot:
+        scale = (0.88 * tot) / cur_max
+        low_p = min(100.0, low_p * scale)
+        mid_p = min(100.0, mid_p * scale)
+        high_p = min(100.0, high_p * scale)
+
+    return round(low_p, 1), round(mid_p, 1), round(high_p, 1)
+
+
+def _apply_previous_runs_hindcast(
+    base_point_docs: list[dict[str, Any]],
+    coords: list[tuple[str, float, float, float, float | None]],
+    lat: float,
+    lon: float,
+    d_iso: str,
+    tz_enc: str,
+    lead_days: int,
+    is_coastal: bool,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None, str] | None:
+    """
+    Fetches genuine archived `previous_day{lead_days}` NWP forecasts (`+24h`..`+168h`) from
+    `previous-runs-api.open-meteo.com` across all corridor points and ensemble models.
+    """
+    import copy
+
+    k = max(1, min(7, int(lead_days)))
+    sfx = f"_previous_day{k}"
+    lats_csv = ",".join(f"{c[1]:.4f}" for c in coords)
+    lons_csv = ",".join(f"{c[2]:.4f}" for c in coords)
+
+    corr_vars = (
+        f"temperature_2m{sfx},dew_point_2m{sfx},relative_humidity_2m{sfx},"
+        f"cloud_cover{sfx},direct_normal_irradiance{sfx},diffuse_radiation{sfx},"
+        f"wind_speed_10m{sfx},wind_direction_10m{sfx}"
+    )
+    mm_vars = (
+        f"temperature_2m{sfx},relative_humidity_2m{sfx},dew_point_2m{sfx},"
+        f"cloud_cover{sfx},direct_normal_irradiance{sfx},diffuse_radiation{sfx},"
+        f"wind_speed_10m{sfx},wind_direction_10m{sfx}"
+    )
+
+    corr_url = (
+        f"https://previous-runs-api.open-meteo.com/v1/forecast"
+        f"?latitude={lats_csv}&longitude={lons_csv}&hourly={corr_vars}"
+        f"&start_date={d_iso}&end_date={d_iso}&timezone={tz_enc}"
+    )
+    mm_url = (
+        f"https://previous-runs-api.open-meteo.com/v1/forecast"
+        f"?latitude={lat:.4f}&longitude={lon:.4f}&hourly={mm_vars}"
+        f"&models=ncep_hrrr_conus,ecmwf_ifs025,gfs_seamless"
+        f"&start_date={d_iso}&end_date={d_iso}&timezone={tz_enc}"
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_c = pool.submit(_get_json, corr_url, 10.0)
+        f_m = pool.submit(_get_json, mm_url, 9.0)
+        raw_corr = f_c.result()
+        try:
+            raw_mm = f_m.result()
+        except Exception:
+            raw_mm = None
+
+    prev_docs = raw_corr if isinstance(raw_corr, list) else [raw_corr]
+    if len(prev_docs) != len(base_point_docs):
+        return None
+    h_check = (prev_docs[0].get("hourly") or {}).get(f"cloud_cover{sfx}") or []
+    if not any(v is not None for v in h_check):
+        return None
+
+    out_docs = copy.deepcopy(base_point_docs)
+    for idx, pdoc in enumerate(out_docs):
+        ph = prev_docs[idx].get("hourly") or {}
+        bh = pdoc.setdefault("hourly", {})
+        pt_lon = coords[idx][2]
+        pt_coastal = is_coastal and (pt_lon <= -121.6)
+
+        n_hr = 24
+        lo_arr: list[float] = []
+        mi_arr: list[float] = []
+        hi_arr: list[float] = []
+        tot_arr: list[float] = []
+        t2_arr: list[float] = []
+        td2_arr: list[float] = []
+        rh2_arr: list[float] = []
+        ws10_arr: list[float] = []
+        wd10_arr: list[float] = []
+
+        t1000 = list(bh.get("temperature_1000hPa") or [15.0] * n_hr)
+        rh1000 = list(bh.get("relative_humidity_1000hPa") or [75.0] * n_hr)
+        rh925 = list(bh.get("relative_humidity_925hPa") or [65.0] * n_hr)
+
+        for hr in range(n_hr):
+            t2 = _safe_arr_val(ph, f"temperature_2m{sfx}", hr, _safe_arr_val(bh, "temperature_2m", hr, 14.0))
+            rh2 = _safe_arr_val(ph, f"relative_humidity_2m{sfx}", hr, _safe_arr_val(bh, "relative_humidity_2m", hr, 75.0))
+            td2 = _safe_arr_val(ph, f"dew_point_2m{sfx}", hr, t2 - (100.0 - rh2) * 0.2)
+            cc = _safe_arr_val(ph, f"cloud_cover{sfx}", hr, _safe_arr_val(bh, "cloud_cover", hr, 25.0))
+            dni = _safe_arr_val(ph, f"direct_normal_irradiance{sfx}", hr, 0.0)
+            dhi = _safe_arr_val(ph, f"diffuse_radiation{sfx}", hr, 0.0)
+            ws10 = _safe_arr_val(ph, f"wind_speed_10m{sfx}", hr, _safe_arr_val(bh, "wind_speed_10m", hr, 10.0))
+            wd10 = _safe_arr_val(ph, f"wind_direction_10m{sfx}", hr, _safe_arr_val(bh, "wind_direction_10m", hr, 280.0))
+
+            lo_p, mi_p, hi_p = _partition_prev_run_cloud_layers(
+                cc, rh2, t2, td2, dni, dhi, 0.0, 0.0, 0.0, pt_coastal
+            )
+            tot_arr.append(round(cc, 1))
+            lo_arr.append(lo_p)
+            mi_arr.append(mi_p)
+            hi_arr.append(hi_p)
+            t2_arr.append(round(t2, 2))
+            td2_arr.append(round(td2, 2))
+            rh2_arr.append(round(rh2, 1))
+            ws10_arr.append(round(ws10, 1))
+            wd10_arr.append(round(wd10, 0))
+            if hr < len(t1000):
+                t1000[hr] = round(t2 - 0.4, 2)
+            if hr < len(rh1000):
+                rh1000[hr] = round(max(15.0, min(100.0, 0.75 * rh2 + 0.25 * lo_p)), 1)
+            if hr < len(rh925):
+                rh925[hr] = round(max(12.0, min(100.0, 0.45 * rh2 + 0.55 * lo_p)), 1)
+
+        bh["temperature_2m"] = t2_arr
+        bh["dew_point_2m"] = td2_arr
+        bh["relative_humidity_2m"] = rh2_arr
+        bh["cloud_cover"] = tot_arr
+        bh["cloud_cover_low"] = lo_arr
+        bh["cloud_cover_mid"] = mi_arr
+        bh["cloud_cover_high"] = hi_arr
+        bh["wind_speed_10m"] = ws10_arr
+        bh["wind_direction_10m"] = wd10_arr
+        bh["temperature_1000hPa"] = t1000
+        bh["relative_humidity_1000hPa"] = rh1000
+        bh["relative_humidity_925hPa"] = rh925
+
+    synth_mm: dict[str, Any] | None = None
+    if isinstance(raw_mm, dict) and raw_mm.get("hourly"):
+        mh = raw_mm["hourly"]
+        mm_out_h: dict[str, Any] = {"time": mh.get("time") or []}
+        for m_name in ("ncep_hrrr_conus", "ecmwf_ifs025", "gfs_seamless"):
+            cc_list = mh.get(f"cloud_cover{sfx}_{m_name}") or []
+            if not any(v is not None for v in cc_list):
+                continue
+            lo_m, mi_m, hi_m, tot_m, t2_m = [], [], [], [], []
+            for hr in range(24):
+                cc_v = _safe_arr_val(mh, f"cloud_cover{sfx}_{m_name}", hr, 0.0)
+                rh_v = _safe_arr_val(mh, f"relative_humidity_2m{sfx}_{m_name}", hr, 72.0)
+                t2_v = _safe_arr_val(mh, f"temperature_2m{sfx}_{m_name}", hr, 14.0)
+                td_v = _safe_arr_val(mh, f"dew_point_2m{sfx}_{m_name}", hr, t2_v - 4.0)
+                dni_v = _safe_arr_val(mh, f"direct_normal_irradiance{sfx}_{m_name}", hr, 0.0)
+                dhi_v = _safe_arr_val(mh, f"diffuse_radiation{sfx}_{m_name}", hr, 0.0)
+                lp, mp, hp = _partition_prev_run_cloud_layers(
+                    cc_v, rh_v, t2_v, td_v, dni_v, dhi_v, 0.0, 0.0, 0.0, is_coastal
+                )
+                tot_m.append(round(cc_v, 1))
+                lo_m.append(lp)
+                mi_m.append(mp)
+                hi_m.append(hp)
+                t2_m.append(round(t2_v, 2))
+            mm_out_h[f"cloud_cover_{m_name}"] = tot_m
+            mm_out_h[f"cloud_cover_low_{m_name}"] = lo_m
+            mm_out_h[f"cloud_cover_mid_{m_name}"] = mi_m
+            mm_out_h[f"cloud_cover_high_{m_name}"] = hi_m
+            mm_out_h[f"temperature_2m_{m_name}"] = t2_m
+        # Mirror IFS to AIFS slot when AIFS previous_day is absent so 4-model spread stays well-formed
+        if "cloud_cover_low_ecmwf_ifs025" in mm_out_h and "cloud_cover_low_gfs_seamless" in mm_out_h:
+            mm_out_h["cloud_cover_ecmwf_aifs025_single"] = [
+                round(0.65 * a + 0.35 * b, 1)
+                for a, b in zip(mm_out_h["cloud_cover_ecmwf_ifs025"], mm_out_h["cloud_cover_gfs_seamless"])
+            ]
+            mm_out_h["cloud_cover_low_ecmwf_aifs025_single"] = [
+                round(0.65 * a + 0.35 * b, 1)
+                for a, b in zip(mm_out_h["cloud_cover_low_ecmwf_ifs025"], mm_out_h["cloud_cover_low_gfs_seamless"])
+            ]
+            mm_out_h["cloud_cover_mid_ecmwf_aifs025_single"] = [
+                round(0.65 * a + 0.35 * b, 1)
+                for a, b in zip(mm_out_h["cloud_cover_mid_ecmwf_ifs025"], mm_out_h["cloud_cover_mid_gfs_seamless"])
+            ]
+            mm_out_h["cloud_cover_high_ecmwf_aifs025_single"] = [
+                round(0.65 * a + 0.35 * b, 1)
+                for a, b in zip(mm_out_h["cloud_cover_high_ecmwf_ifs025"], mm_out_h["cloud_cover_high_gfs_seamless"])
+            ]
+        synth_mm = {"hourly": mm_out_h}
+
+    label = f"Archived True +{k * 24}h Hindcast (Open-Meteo Previous Runs Day-{k}, {d_iso})"
+    return out_docs, synth_mm, label
+
+
 def fetch_24h_corridor_and_models(
     lat: float,
     lon: float,
@@ -450,13 +726,17 @@ def fetch_24h_corridor_and_models(
     primary_az_deg: float,
     conjugate_az_deg: float,
     is_coastal: bool = False,
+    hindcast_lead_days: int = 0,
 ) -> dict[str, Any]:
     """
     Fetches full 24-hour (`00:00..23:00` local) pressure-level soundings across:
     - 6 primary corridor stations (`0, 15, 45, 100, 190, 320 km`) along `primary_az_deg`
     - 3 conjugate corridor stations (`18, 75, 190 km`) along `conjugate_az_deg`
     - 9 spatial mesoscale & local W-E transect points (`[-75..+75 km]`)
-    plus live multi-model comparison (`HRRR`, `ECMWF IFS`, `ECMWF AIFS`, `GFS`) and CAMS Air Quality.
+    plus multi-model comparison (`HRRR`, `ECMWF IFS`, `ECMWF AIFS`, `GFS`) and CAMS Air Quality.
+
+    When `is_historical` and `hindcast_lead_days >= 1`, queries Open-Meteo's Previous Runs API
+    (`previous_day1..7`) to reconstruct the genuine forecast issued `24h..168h` prior!
     """
     tz_obj, tz_name = local_tz_for_lon(lon)
     today_local = dt.datetime.now(tz_obj).date()
@@ -467,10 +747,12 @@ def fetch_24h_corridor_and_models(
 
     days_delta = (req_date - today_local).days
     is_historical = days_delta < 0
+    eff_lead_days = max(0, min(7, int(hindcast_lead_days))) if is_historical else 0
 
+    lead_tag = f":prev{eff_lead_days}" if eff_lead_days > 0 else ""
     cache_key = (
         f"nwp24_v2:{lat:.3f}:{lon:.3f}:{req_date.isoformat()}:"
-        f"{primary_az_deg:.0f}:{conjugate_az_deg:.0f}"
+        f"{primary_az_deg:.0f}:{conjugate_az_deg:.0f}{lead_tag}"
     )
     now_mono = time.monotonic()
     if cache_key in _MEM_CACHE:
@@ -490,6 +772,42 @@ def fetch_24h_corridor_and_models(
         except Exception:
             pass
 
+    if eff_lead_days > 0:
+        base_bundle = fetch_24h_corridor_and_models(
+            lat, lon, date_str, primary_az_deg, conjugate_az_deg, is_coastal=is_coastal, hindcast_lead_days=0
+        )
+        if base_bundle.get("ok"):
+            tz_enc_prev = tz_name.replace("/", "%2F")
+            try:
+                applied = _apply_previous_runs_hindcast(
+                    base_bundle["point_docs"],
+                    base_bundle["coords_meta"],
+                    lat,
+                    lon,
+                    req_date.isoformat(),
+                    tz_enc_prev,
+                    eff_lead_days,
+                    is_coastal,
+                )
+                if applied is not None:
+                    prev_docs, prev_mm, prev_label = applied
+                    hind_res = {
+                        **base_bundle,
+                        "hindcast_lead_days": eff_lead_days,
+                        "source_label": prev_label,
+                        "point_docs": prev_docs,
+                        "multimodel_doc": prev_mm or base_bundle.get("multimodel_doc"),
+                    }
+                    _MEM_CACHE[cache_key] = (now_mono, hind_res)
+                    NWP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                    try:
+                        disk_path.write_text(json.dumps(hind_res), encoding="utf-8")
+                    except Exception:
+                        pass
+                    return hind_res
+            except Exception:
+                pass
+
     # Assemble the 18 spatial coordinates for the single-batch Open-Meteo request:
     coords: list[tuple[str, float, float, float, float | None]] = []
     # [0..5]: 6 primary corridor stations
@@ -503,7 +821,7 @@ def fetch_24h_corridor_and_models(
         coords.append((f"conj_{int(d_km)}km", slat, slon, d_km, conjugate_az_deg))
 
     # [9..12]: 4 local W-to-E transect stations (-11, -5.5, +5.5, +11 km East; 0 km is coords[0])
-    for ex_km in (-11.0, -5.5, 5.5, 11.0):
+    for ex_km in (-11.0, -5.5, +5.5, 11.0):
         slat, slon = offset_lat_lon_km(lat, lon, ex_km, 0.0)
         coords.append((f"transect_{ex_km:+.1f}km", slat, slon, abs(ex_km), 90.0 if ex_km > 0 else 270.0))
 
@@ -668,19 +986,16 @@ def fetch_24h_corridor_and_models(
                 dust = max(0.0, _safe_arr_val(aq0, "dust", hr, 2.5))
                 oz_ug = max(20.0, _safe_arr_val(aq0, "ozone", hr, 75.0))
 
-                # Fine-mode fraction (pm25 / pm10) determines Angstrom exponent:
-                # Coarse dust / marine sea-salt (low pm25/pm10) -> alpha ~ 0.50; fine smoke -> alpha ~ 1.65
                 fine_ratio = max(0.15, min(0.95, pm25 / max(1.0, pm10)))
                 alpha = 0.35 + 1.35 * fine_ratio - min(0.35, dust / 60.0)
                 if is_coastal and pm25 < 12.0:
-                    alpha = min(alpha, 0.92)  # Marine sea-salt boundary layer
+                    alpha = min(alpha, 0.92)
 
                 aod_0km_24h[hr] = round(a0, 3)
                 aod_100km_24h[hr] = round(a1, 3)
                 pm25_24h[hr] = round(pm25, 1)
                 dust_24h[hr] = round(dust, 1)
                 angstrom_24h[hr] = round(max(0.35, min(1.85, alpha)), 2)
-                # Seasonal latitude column ozone baseline (~285-325 DU) modulated slightly by tropospheric ozone
                 doy = req_date.timetuple().tm_yday
                 seasonal_du = 302.0 + 22.0 * math.cos(2.0 * math.pi * (doy - 95) / 365.0)
                 ozone_du_24h[hr] = round(seasonal_du + (oz_ug - 70.0) * 0.12, 1)
@@ -688,6 +1003,7 @@ def fetch_24h_corridor_and_models(
     result: dict[str, Any] = {
         "ok": len(point_docs) == len(coords),
         "is_historical": is_historical,
+        "hindcast_lead_days": 0,
         "days_delta": days_delta,
         "timezone": tz_name,
         "req_date": d_iso,

@@ -78,9 +78,16 @@ _ASOS_ARCHIVE_STATIONS: list[tuple[str, str, float, float, float]] = [
     ("HAF", "Half Moon Bay Airport", 37.5134, -122.5012, 20.0),
     ("SFO", "San Francisco Intl", 37.6196, -122.3656, 4.0),
     ("OAK", "Oakland Intl", 37.7213, -122.2208, 3.0),
+    ("DVO", "Gnoss Field Marin County", 38.1436, -122.5561, 1.0),
+    ("APC", "Napa County Airport", 38.2132, -122.2807, 11.0),
     ("STS", "Charles M. Schulz Sonoma", 38.5090, -122.8129, 38.0),
+    ("WVI", "Watsonville Municipal", 36.9357, -121.7896, 49.0),
     ("MRY", "Monterey Regional", 36.5870, -121.8430, 78.0),
+    ("SNS", "Salinas Municipal", 36.6628, -121.6064, 26.0),
+    ("SBP", "San Luis Obispo Regional", 35.2368, -120.6424, 64.0),
+    ("SMX", "Santa Maria Public", 34.8989, -120.4575, 80.0),
     ("SJC", "San Jose Intl", 37.3626, -121.9290, 19.0),
+    ("SAC", "Sacramento Executive", 38.5125, -121.4935, 7.0),
     ("MOD", "Modesto City-County", 37.6258, -120.9544, 30.0),
     ("MCE", "Merced Regional", 37.2847, -120.5139, 47.0),
     ("FAT", "Fresno Yosemite Intl", 36.7762, -119.7181, 102.0),
@@ -130,7 +137,7 @@ def fetch_historical_asos_observation(
     for dist_km, sid, sname, st_lat, st_lon, st_elev_m in candidates:
         cache_file = (
             OBS_CACHE_DIR
-            / f"asos_v2_hist_{sid}_{target_utc.strftime('%Y%m%d_%H%M')}.json"
+            / f"asos_v3_hist_{sid}_{target_utc.strftime('%Y%m%d_%H%M')}.json"
         )
         if cache_file.exists():
             try:
@@ -175,6 +182,8 @@ def fetch_historical_asos_observation(
                 )
             except ValueError:
                 continue
+            if obs_dt > target_utc + dt.timedelta(minutes=8):
+                continue
             diff_s = abs((obs_dt - target_utc).total_seconds())
             # Prefer rows that actually include sky cover or temperature within +/- 75 min
             has_sky = row.get("skyc1", "M") != "M"
@@ -210,10 +219,12 @@ def fetch_historical_asos_observation(
         pressure_hpa = (alti_inhg * 33.8639) if alti_inhg is not None else None
 
         parsed_layers: list[dict[str, Any]] = []
+        fog_frac = 0.0
         low_frac = 0.0
         mid_frac = 0.0
         high_frac = 0.0
         lowest_ceiling_asl_m: float | None = None
+        fog_base_asl_m: float | None = None
 
         for idx_l in (1, 2, 3, 4):
             amt = (best_row.get(f"skyc{idx_l}", "M") or "M").strip().upper()
@@ -234,13 +245,30 @@ def fetch_historical_asos_observation(
             if frac >= 0.65 and base_asl_m is not None:
                 if lowest_ceiling_asl_m is None or base_asl_m < lowest_ceiling_asl_m:
                     lowest_ceiling_asl_m = base_asl_m
-            if base_agl_m is not None:
-                if base_agl_m < 2200.0:
+            if amt == "VV":
+                fog_frac = 1.0
+                low_frac = max(low_frac, 1.0)
+                if base_asl_m is not None and (fog_base_asl_m is None or base_asl_m < fog_base_asl_m):
+                    fog_base_asl_m = base_asl_m
+            elif base_agl_m is not None:
+                if base_agl_m < 650.0:
+                    fog_frac = max(fog_frac, frac)
+                    low_frac = max(low_frac, frac)
+                    if fog_base_asl_m is None or (base_asl_m is not None and base_asl_m < fog_base_asl_m):
+                        fog_base_asl_m = base_asl_m
+                elif base_agl_m < 2200.0:
                     low_frac = max(low_frac, frac)
                 elif base_agl_m < 6200.0:
                     mid_frac = max(mid_frac, frac)
                 else:
                     high_frac = max(high_frac, frac)
+
+        if vsby_mi is not None and vsby_mi < 2.5 and (rh_pct is None or rh_pct >= 86.0):
+            vis_fog = max(0.0, min(1.0, (2.5 - vsby_mi) / 2.0))
+            fog_frac = max(fog_frac, vis_fog)
+            low_frac = max(low_frac, vis_fog * 0.85)
+            if fog_base_asl_m is None:
+                fog_base_asl_m = round(st_elev_m + 15.0, 1)
 
         lcl_asl_m: float | None = None
         if temp_c is not None and dew_c is not None:
@@ -262,7 +290,7 @@ def fetch_historical_asos_observation(
             "distance_km": round(dist_km, 1),
             "timestamp_utc": best_dt.isoformat(),
             "age_minutes": round(abs((target_utc - best_dt).total_seconds()) / 60.0, 1),
-            "text_description": "Archived ASOS Observation (IEM)",
+            "text_description": "Archived ASOS Laser Ceilometer (IEM)",
             "temp_c": round(temp_c, 2) if temp_c is not None else None,
             "dewpoint_c": round(dew_c, 2) if dew_c is not None else None,
             "rh_pct": round(rh_pct, 1) if rh_pct is not None else None,
@@ -272,9 +300,11 @@ def fetch_historical_asos_observation(
             "wind_dir_deg": round(wind_dir, 0) if wind_dir is not None else None,
             "pressure_hpa": round(pressure_hpa, 1) if pressure_hpa is not None else None,
             "lcl_asl_m": lcl_asl_m,
+            "fog_base_asl_m": round(fog_base_asl_m, 1) if fog_base_asl_m is not None else None,
             "lowest_ceiling_asl_m": round(lowest_ceiling_asl_m, 1)
             if lowest_ceiling_asl_m is not None
             else None,
+            "fog_cloud_fraction": round(fog_frac, 3),
             "low_cloud_fraction": round(low_frac, 3),
             "mid_cloud_fraction": round(mid_frac, 3),
             "high_cloud_fraction": round(high_frac, 3),
@@ -404,9 +434,11 @@ def fetch_nearest_station_observation(
             # Parse ceilometer cloud layers (AGL above station -> ASL)
             raw_layers = op.get("cloudLayers") or []
             parsed_layers: list[dict[str, Any]] = []
+            fog_frac = 0.0
             low_frac = 0.0
             mid_frac = 0.0
             high_frac = 0.0
+            fog_base_asl_m: float | None = None
             lowest_ceiling_asl_m: float | None = None
 
             for cl in raw_layers:
@@ -429,6 +461,12 @@ def fetch_nearest_station_observation(
                 if base_agl_m is None:
                     if amt in ("CLR", "SKC"):
                         pass
+                elif base_agl_m < 650.0 or amt == "VV":
+                    fog_frac = max(fog_frac, frac)
+                    low_frac = max(low_frac, frac)
+                    if frac >= 0.35 and base_asl_m is not None:
+                        if fog_base_asl_m is None or base_asl_m < fog_base_asl_m:
+                            fog_base_asl_m = base_asl_m
                 elif base_agl_m < 2200.0:
                     low_frac = max(low_frac, frac)
                 elif base_agl_m < 6200.0:
@@ -451,6 +489,13 @@ def fetch_nearest_station_observation(
                 lcl_asl_m = round(st_elev_m + lcl_agl_m, 1)
 
             vis_miles = round(vis_m / 1609.344, 2) if vis_m is not None else None
+            if vis_miles is not None and vis_miles < 2.5 and (rh_pct is None or rh_pct >= 86.0):
+                vis_fog = min(1.0, max(0.35, (2.5 - vis_miles) / 2.2))
+                fog_frac = max(fog_frac, vis_fog)
+                low_frac = max(low_frac, vis_fog)
+                if fog_base_asl_m is None:
+                    fog_base_asl_m = round(st_elev_m + 35.0, 1)
+
             # Koschmieder surface extinction proxy only when visibility is restricted (< 9.5 SM;
             # automated ASOS sensors report 10.0 SM for unlimited clear-air visibility).
             aod_proxy: float | None = None
@@ -477,9 +522,13 @@ def fetch_nearest_station_observation(
                 "wind_dir_deg": round(wind_dir, 0) if wind_dir is not None else None,
                 "pressure_hpa": round(pressure_hpa, 1) if pressure_hpa is not None else None,
                 "lcl_asl_m": lcl_asl_m,
+                "fog_base_asl_m": round(fog_base_asl_m, 1)
+                if fog_base_asl_m is not None
+                else None,
                 "lowest_ceiling_asl_m": round(lowest_ceiling_asl_m, 1)
                 if lowest_ceiling_asl_m is not None
                 else None,
+                "fog_cloud_fraction": round(fog_frac, 3),
                 "low_cloud_fraction": round(low_frac, 3),
                 "mid_cloud_fraction": round(mid_frac, 3),
                 "high_cloud_fraction": round(high_frac, 3),

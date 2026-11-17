@@ -262,6 +262,40 @@ def _box3x3_smooth(arr: np.ndarray) -> np.ndarray:
     ) / 9.0
 
 
+def _solar_elevation_grid_utc(
+    lat_grid: np.ndarray, lon_grid: np.ndarray, when_utc: dt.datetime
+) -> np.ndarray:
+    """Vectorized solar elevation angle (deg) across `(lat_grid, lon_grid)` at `when_utc`."""
+    doy = when_utc.timetuple().tm_yday
+    frac_hr = when_utc.hour + when_utc.minute / 60.0 + when_utc.second / 3600.0
+    gamma = 2.0 * math.pi / 365.0 * (doy - 1 + (frac_hr - 12.0) / 24.0)
+    eqtime = 229.18 * (
+        0.000075
+        + 0.001868 * math.cos(gamma)
+        - 0.032077 * math.sin(gamma)
+        - 0.014615 * math.cos(2.0 * gamma)
+        - 0.040849 * math.sin(2.0 * gamma)
+    )
+    decl = (
+        0.006918
+        - 0.399912 * math.cos(gamma)
+        + 0.070257 * math.sin(gamma)
+        - 0.006758 * math.cos(2.0 * gamma)
+        + 0.000907 * math.sin(2.0 * gamma)
+        - 0.002697 * math.cos(3.0 * gamma)
+        + 0.001480 * math.sin(3.0 * gamma)
+    )
+    tst = np.mod(frac_hr * 60.0 + eqtime + 4.0 * lon_grid, 1440.0)
+    ha = np.radians(tst / 4.0 - 180.0)
+    lat_r = np.radians(lat_grid)
+    cos_z = np.clip(
+        np.sin(lat_r) * math.sin(decl) + np.cos(lat_r) * math.cos(decl) * np.cos(ha),
+        -1.0,
+        1.0,
+    )
+    return (90.0 - np.degrees(np.arccos(cos_z))).astype(np.float32)
+
+
 def _decode_goes_l2_frame(
     actpc_bytes: bytes,
     achac_bytes: bytes | None,
@@ -270,11 +304,16 @@ def _decode_goes_l2_frame(
     lon_grid: np.ndarray,
     is_coastal: bool,
     enable_parallax: bool = True,
+    cclc_bytes: bytes | None = None,
+    cmip_c07_bytes: bytes | None = None,
+    cmip_c13_bytes: bytes | None = None,
+    scan_utc: dt.datetime | None = None,
+    enable_multilayer_fusion: bool = True,
 ) -> dict[str, Any]:
     """
-    Decodes a single timestamp's GOES L2 `ACTPC` + `ACHAC` (+ optional `CODC`) granules
-    onto the `(grid_px, grid_px)` geographic corridor grid with 3D cloud-top parallax
-    correction and `3 x 3` (`2 km` -> `6 km`) sub-cell aerial cloud-fraction averaging.
+    Decodes a single timestamp's GOES L2 `ACTPC` + `ACHAC` (+ optional `CODC`, 5-layer `CCLC`,
+    and twilight `CMIPC C13 - C07` IR brightness-temperature difference) onto the
+    `(grid_px, grid_px)` geographic corridor grid with 3D cloud-top parallax correction.
     """
     assert h5py is not None
 
@@ -395,6 +434,9 @@ def _decode_goes_l2_frame(
         except Exception:
             cod_full = None
 
+    # High-cordillera snowpack/high-terrain mask (Sierra Nevada crest > ~2.4 km ASL)
+    alpine_snow_zone = (lat_grid >= 36.0) & (lat_grid <= 41.5) & (lon_grid >= -120.25) & (lon_grid <= -118.1)
+
     def _sample_layer_3x3(
         h_layer_m: np.ndarray | float,
         layer_kind: str,
@@ -417,9 +459,6 @@ def _decode_goes_l2_frame(
             ht_loc = ht_grid
 
         has_ht = np.isfinite(ht_loc)
-        # High-cordillera snowpack guard (Sierra Nevada / Cascades / Rockies): 0°C alpine granite/snow
-        # margins can trigger ACTP Phase 2/3 without an elevated cloud top above the ~4,000 m crest.
-        alpine_snow_zone = (lat_grid >= 36.0) & (lat_grid <= 41.5) & (lon_grid >= -120.25) & (lon_grid <= -118.1)
 
         for dr in (-1, 0, 1):
             rr = r0 + dr
@@ -472,26 +511,184 @@ def _decode_goes_l2_frame(
             default_incloud_tau = 1.15
 
         incloud_tau = np.where(cod_cnt > 0.5, cod_acc / np.maximum(1.0, cod_cnt), default_incloud_tau)
-        # Convert in-cloud optical depth to grid-box mean vertical optical depth
         tau_layer = np.clip(cf_layer * incloud_tau, 0.0, 48.0).astype(np.float32)
         return cf_layer.astype(np.float32), tau_layer
 
-    low_cf, tau_low = _sample_layer_3x3(low_top_m, "low")
-    mid_cf, tau_mid = _sample_layer_3x3(mid_top_m, "mid")
-    high_cf, tau_high = _sample_layer_3x3(high_top_m, "high")
+    actp_low_cf, tau_low = _sample_layer_3x3(low_top_m, "low")
+    actp_mid_cf, tau_mid = _sample_layer_3x3(mid_top_m, "mid")
+    actp_high_cf, tau_high = _sample_layer_3x3(high_top_m, "high")
+
+    low_cf = actp_low_cf.copy()
+    mid_cf = actp_mid_cf.copy()
+    high_cf = actp_high_cf.copy()
+    fog_cf = np.where(low_top_m < 1450.0, actp_low_cf * 0.85, actp_low_cf * 0.35).astype(np.float32)
+    has_cclc = False
+    has_btd_fog = False
+
+    # --- Multi-Layer Upgrade 1: NOAA ABI-L2-CCLC (5-Band Cloud Cover Layers: CF1..CF5) ---
+    # Recovers sub-cirrus marine stratus (`CF1`: 0-5 kft / 0-1,524 m ASL, `CF2`: 5-10 kft) and
+    # mid-level altocumulus (`CF3`: 10-18 kft) obscured from single-layer top-down `ACTPC`!
+    if enable_multilayer_fusion and cclc_bytes is not None:
+        try:
+            with h5py.File(io.BytesIO(cclc_bytes), "r") as f_cc:
+                xc_10 = f_cc["x"][:].astype(np.float64) * float(
+                    f_cc["x"].attrs["scale_factor"][0]
+                ) + float(f_cc["x"].attrs["add_offset"][0])
+                yc_10 = f_cc["y"][:].astype(np.float64) * float(
+                    f_cc["y"].attrs["scale_factor"][0]
+                ) + float(f_cc["y"].attrs["add_offset"][0])
+                cc_dqf = f_cc["DQF"][:]
+                ok_cc = cc_dqf <= 1
+
+                def _proj_cclc_band(ds_name: str, h_band_m: float) -> np.ndarray:
+                    raw_b = f_cc[ds_name][:]
+                    fv_b = int(f_cc[ds_name].attrs["_FillValue"][0])
+                    arr_pct = np.where(
+                        (raw_b != fv_b) & ok_cc,
+                        np.clip(raw_b.astype(np.float32), 0.0, 100.0) / 100.0,
+                        np.nan,
+                    )
+                    xb, yb = _latlonh_to_goes_xy(
+                        lat_grid, lon_grid, h_band_m if enable_parallax else 0.0, proj_meta
+                    )
+                    rf_b, cf_b, val_b = _xy_to_fractional_indices(xb, yb, xc_10, yc_10)
+                    sampled = arr_pct[np.rint(rf_b).astype(np.int32), np.rint(cf_b).astype(np.int32)]
+                    return np.where(val_b & np.isfinite(sampled), sampled, 0.0).astype(np.float32)
+
+                cf1_0_5kft = _proj_cclc_band("CF1", 650.0)     # 0 - 1,524 m ASL (marine fog/stratus)
+                cf2_5_10kft = _proj_cclc_band("CF2", 2200.0)   # 1,524 - 3,048 m ASL (cumulus / lower deck)
+                cf3_10_18kft = _proj_cclc_band("CF3", 4200.0)  # 3,048 - 5,486 m ASL (altocumulus / altostratus)
+                cf4_18_24kft = _proj_cclc_band("CF4", 6300.0)  # 5,486 - 7,315 m ASL (upper-mid / low cirrus)
+                cf5_gt24kft = _proj_cclc_band("CF5", 9800.0)   # > 7,315 m ASL (high ice cirrus)
+
+                # Mask CF1 (< 1,524 m ASL) and CF2 (< 3,048 m ASL) over high Sierra granite/snow
+                cf1_eff = np.where(alpine_snow_zone, 0.0, cf1_0_5kft)
+                cf2_eff = np.where(alpine_snow_zone, 0.0, cf2_5_10kft)
+                cclc_low = np.clip(np.maximum(cf1_eff, 0.88 * cf2_eff), 0.0, 1.0)
+                cclc_mid = np.clip(np.maximum(cf3_10_18kft, 0.62 * cf4_18_24kft), 0.0, 1.0)
+                cclc_high = np.clip(np.maximum(cf5_gt24kft, 0.65 * cf4_18_24kft), 0.0, 1.0)
+
+                # Blend 2 km sharp-edged ACTPC with 10 km multi-layer CCLC:
+                # Where upper decks obscure ACTPC (`high > 0.25` or `mid > 0.30`), trust CCLC's
+                # multi-layer retrieval to fill in obscured lower/middle cloud decks!
+                obscured_low = np.clip((actp_high_cf + 0.8 * actp_mid_cf) / 0.45, 0.0, 1.0)
+                low_cf = np.clip(
+                    np.maximum(
+                        actp_low_cf,
+                        cclc_low * (0.58 + 0.42 * obscured_low),
+                    ),
+                    0.0,
+                    1.0,
+                ).astype(np.float32)
+                obscured_mid = np.clip(actp_high_cf / 0.45, 0.0, 1.0)
+                mid_cf = np.clip(
+                    np.maximum(
+                        actp_mid_cf,
+                        cclc_mid * (0.55 + 0.45 * obscured_mid),
+                    ),
+                    0.0,
+                    1.0,
+                ).astype(np.float32)
+                high_cf = np.clip(np.maximum(actp_high_cf, 0.88 * cclc_high), 0.0, 1.0).astype(np.float32)
+                fog_cf = np.clip(np.maximum(fog_cf, cf1_eff * 0.94), 0.0, 1.0).astype(np.float32)
+                has_cclc = True
+        except Exception:
+            has_cclc = False
+
+    # --- Multi-Layer Upgrade 2: Twilight/Night `10.3 um - 3.9 um` (`C13 - C07`) Fog/Stratus BTD ---
+    # Solves sunset/sunrise terminator blindness (`sun_el <= 8.5 deg`) when visible `CODC` drops out
+    # and `ACTPC` surface-restoral (`DQF == 5`) erases shallow 200-600 m coastal stratus!
+    tb13_grid: np.ndarray | None = None
+    if (
+        enable_multilayer_fusion
+        and cmip_c07_bytes is not None
+        and cmip_c13_bytes is not None
+        and scan_utc is not None
+    ):
+        try:
+            with h5py.File(io.BytesIO(cmip_c07_bytes), "r") as f7, h5py.File(
+                io.BytesIO(cmip_c13_bytes), "r"
+            ) as f13:
+                r7 = f7["CMI"][r2_min:r2_max, c2_min:c2_max]
+                fv7 = int(f7["CMI"].attrs["_FillValue"][0])
+                sf7 = float(f7["CMI"].attrs["scale_factor"][0])
+                ao7 = float(f7["CMI"].attrs["add_offset"][0])
+                tb07_2km = np.where(r7 != fv7, r7.astype(np.float32) * sf7 + ao7, np.nan)
+
+                r13 = f13["CMI"][r2_min:r2_max, c2_min:c2_max]
+                fv13 = int(f13["CMI"].attrs["_FillValue"][0])
+                sf13 = float(f13["CMI"].attrs["scale_factor"][0])
+                ao13 = float(f13["CMI"].attrs["add_offset"][0])
+                tb13_2km = np.where(r13 != fv13, r13.astype(np.float32) * sf13 + ao13, np.nan)
+
+                xl_b, yl_b = _latlonh_to_goes_xy(
+                    lat_grid, lon_grid, 550.0 if enable_parallax else 0.0, proj_meta
+                )
+                rf_b, cf_b, val_b = _xy_to_fractional_indices(xl_b, yl_b, x_2km, y_2km)
+                ri_b = np.rint(rf_b).astype(np.int32)
+                ci_b = np.rint(cf_b).astype(np.int32)
+
+                tb07_px = tb07_2km[ri_b, ci_b]
+                tb13_px = tb13_2km[ri_b, ci_b]
+                tb13_grid = np.where(np.isfinite(tb13_px), tb13_px, np.nan).astype(np.float32)
+
+                sun_el_px = _solar_elevation_grid_utc(lat_grid, lon_grid, scan_utc)
+                # Warm boundary-layer top (`270 K .. 290 K`), excluding cold mid/high ice clouds (`< 266 K`)
+                warm_bl_top = (tb13_px >= 270.0) & (tb13_px <= 290.5) & (~alpine_snow_zone) & val_b
+
+                # 1) Dark/civil-twilight emissive droplet regime (`sun_el <= 1.2 deg`):
+                # Liquid stratus has lower 3.9 um emissivity than 10.3 um -> `tb13 - tb07 >= +1.6 K`
+                btd_emissive = tb13_px - tb07_px
+                night_fog = np.where(
+                    warm_bl_top & (sun_el_px <= 1.2),
+                    np.clip((btd_emissive - 1.55) / 2.55, 0.0, 1.0),
+                    0.0,
+                )
+                # 2) Grazing low-sun twilight regime (`1.2 < sun_el <= 7.5 deg` over cool marine sector):
+                # Small liquid stratus droplets strongly scatter 3.9 um (`tb07 - tb13 >= +6.5 K`) while
+                # `tb13` stays cool-marine (`271..285.5 K`, ruling out sun-heated inland soil)
+                ocean_or_coast = lon_grid <= -121.65 if is_coastal else np.zeros_like(warm_bl_top)
+                grazing_fog = np.where(
+                    warm_bl_top & ocean_or_coast & (tb13_px <= 285.5) & (sun_el_px > 1.2) & (sun_el_px <= 7.5),
+                    np.clip(((tb07_px - tb13_px) - 6.5) / 9.5, 0.0, 0.92),
+                    0.0,
+                )
+                btd_fog = _box3x3_smooth(np.maximum(night_fog, grazing_fog)).astype(np.float32)
+                low_cf = np.clip(np.maximum(low_cf, btd_fog), 0.0, 1.0).astype(np.float32)
+                fog_cf = np.clip(np.maximum(fog_cf, btd_fog * 0.95), 0.0, 1.0).astype(np.float32)
+                has_btd_fog = True
+        except Exception:
+            has_btd_fog = False
+
+    # Keep optical depths consistent when CCLC or BTD uncovers obscured low/mid decks
+    tau_low = np.maximum(tau_low, (low_cf * 6.4).astype(np.float32))
+    tau_mid = np.maximum(tau_mid, (mid_cf * 4.8).astype(np.float32))
+    tau_high = np.maximum(tau_high, (high_cf * 1.15).astype(np.float32))
     tau_total = np.clip(tau_low + tau_mid + tau_high, 0.0, 52.0).astype(np.float32)
 
-    # Effective brightness temperature proxy from cloud-top height for backward schema compatibility
-    tb_k_proxy = np.where(
-        high_cf > 0.20,
-        288.0 - 0.0062 * high_top_m,
-        np.where(mid_cf > 0.20, 288.0 - 0.0060 * mid_top_m, 290.0 - 0.0055 * low_top_m * low_cf),
-    ).astype(np.float32)
+    if tb13_grid is not None and np.any(np.isfinite(tb13_grid)):
+        tb_k_proxy = np.where(
+            np.isfinite(tb13_grid),
+            tb13_grid,
+            288.0 - 0.0062 * high_top_m * high_cf,
+        ).astype(np.float32)
+    else:
+        tb_k_proxy = np.where(
+            high_cf > 0.20,
+            288.0 - 0.0062 * high_top_m,
+            np.where(mid_cf > 0.20, 288.0 - 0.0060 * mid_top_m, 290.0 - 0.0055 * low_top_m * low_cf),
+        ).astype(np.float32)
 
     return {
+        "fog_cf": fog_cf,
         "low_cf": low_cf,
         "mid_cf": mid_cf,
         "high_cf": high_cf,
+        "actp_low_cf": actp_low_cf,
+        "actp_mid_cf": actp_mid_cf,
+        "actp_high_cf": actp_high_cf,
+        "has_cclc": has_cclc,
+        "has_btd_fog": has_btd_fog,
         "tau_low": tau_low,
         "tau_mid": tau_mid,
         "tau_high": tau_high,
@@ -792,6 +989,39 @@ def _fetch_iem_wms_fallback(
     }
 
 
+def _list_cmipc_c07_c13_keys(
+    bucket: str, ref_utc: dt.datetime, lookback_minutes: int = 28
+) -> tuple[list[tuple[dt.datetime, dt.datetime, str]], list[tuple[dt.datetime, dt.datetime, str]]]:
+    """Lists `ABI-L2-CMIPC` Channel 07 (`3.9 um`) and Channel 13 (`10.3 um`) keys in one pass."""
+    t_earliest = ref_utc - dt.timedelta(minutes=lookback_minutes)
+    cur = t_earliest.replace(minute=0, second=0, microsecond=0)
+    end_hr = ref_utc.replace(minute=0, second=0, microsecond=0)
+    c07_list: list[tuple[dt.datetime, dt.datetime, str]] = []
+    c13_list: list[tuple[dt.datetime, dt.datetime, str]] = []
+    while cur <= end_hr:
+        yr, doy, hh = cur.year, cur.timetuple().tm_yday, cur.hour
+        for band_code, target_list in (("C07_", c07_list), ("C13_", c13_list)):
+            prefix = f"ABI-L2-CMIPC/{yr}/{doy:03d}/{hh:02d}/OR_ABI-L2-CMIPC-M6{band_code}"
+            url = f"https://{bucket}.s3.amazonaws.com/?list-type=2&prefix={prefix}"
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+                with urllib.request.urlopen(req, timeout=5.5) as resp:
+                    xml_bytes = resp.read()
+                root = ET.fromstring(xml_bytes)
+                for item in root.findall("s3:Contents", _S3_NS):
+                    k_el = item.find("s3:Key", _S3_NS)
+                    if k_el is not None and k_el.text:
+                        parsed = _parse_goes_scan_times(k_el.text)
+                        if parsed is not None:
+                            target_list.append((parsed[0], parsed[1], k_el.text))
+            except Exception:
+                continue
+        cur += dt.timedelta(hours=1)
+    c07_list.sort(key=lambda t: t[0])
+    c13_list.sort(key=lambda t: t[0])
+    return c07_list, c13_list
+
+
 def fetch_goes_corridor_nowcast(
     lat: float,
     lon: float,
@@ -800,12 +1030,14 @@ def fetch_goes_corridor_nowcast(
     target_utc: dt.datetime | None = None,
     enable_parallax: bool = True,
     enable_multiscale_flow: bool = True,
+    enable_multilayer_fusion: bool = True,
 ) -> dict[str, Any] | None:
     """
     Fetches 3-frame (`t - 30m`, `t - 15m`, `t_0`) calibrated NOAA GOES-18/19 S3 Level-2
-    products over a `768 km x 768 km` (`128 x 128`, `6.0 km/px`) domain around `(lat, lon)`.
+    products (`ACTPC` + `ACHAC` + `CODC` + 5-layer `CCLC` + twilight `CMIPC C13 - C07` fog BTD)
+    over a `768 km x 768 km` (`128 x 128`, `6.0 km/px`) domain around `(lat, lon)`.
 
-    When `target_utc` is provided (e.g., historical backtesting), strictly enforces
+    When `target_utc` is provided (e.g., historical replay or backtesting), strictly enforces
     causal scan selection (`scan_end_utc <= target_utc`) with zero future data leakage.
     """
     if not (21.0 <= lat <= 53.0 and -138.0 <= lon <= -65.0):
@@ -828,8 +1060,8 @@ def fetch_goes_corridor_nowcast(
         else ref_utc.strftime("%Y%m%d_%H%M")
     )
     cache_key = (
-        f"goes_v5_{lat:.2f}_{lon:.2f}_{time_bucket_str}_"
-        f"p{int(enable_parallax)}_m{int(enable_multiscale_flow)}"
+        f"goes_v6_{lat:.2f}_{lon:.2f}_{time_bucket_str}_"
+        f"p{int(enable_parallax)}_m{int(enable_multiscale_flow)}_ml{int(enable_multilayer_fusion)}"
     )
     now_mono = time.monotonic()
     if cache_key in _MEM_CACHE:
@@ -837,8 +1069,8 @@ def fetch_goes_corridor_nowcast(
         if (not is_live_mode) or (now_mono - ts < _MEM_TTL_SECONDS):
             return cached
 
-    npz_cache_file = GOES_CACHE_DIR / "decoded_v5" / f"{cache_key}.npz"
-    meta_cache_file = GOES_CACHE_DIR / "decoded_v5" / f"{cache_key}.json"
+    npz_cache_file = GOES_CACHE_DIR / "decoded_v6" / f"{cache_key}.npz"
+    meta_cache_file = GOES_CACHE_DIR / "decoded_v6" / f"{cache_key}.json"
     if npz_cache_file.exists() and meta_cache_file.exists():
         age_disk = time.time() - meta_cache_file.stat().st_mtime
         if (not is_live_mode) or (age_disk < _MEM_TTL_SECONDS):
@@ -865,15 +1097,30 @@ def fetch_goes_corridor_nowcast(
     dlon = half_km / max(25.0, 111.41284 * math.cos(math.radians(lat)))
     bbox = (lon - dlon, lat - dlat, lon + dlon, lat + dlat)
 
+    sun_el_ref = _solar_elevation_utc(lat, lon, ref_utc)
+    need_twilight_btd = enable_multilayer_fusion and (sun_el_ref <= 8.5)
+
     if HAS_H5PY:
         try:
-            with ThreadPoolExecutor(max_workers=3) as list_pool:
+            with ThreadPoolExecutor(max_workers=5) as list_pool:
                 f_ctp_keys = list_pool.submit(_list_s3_product_keys_for_window, bucket, "ABI-L2-ACTPC", ref_utc, 55)
                 f_ach_keys = list_pool.submit(_list_s3_product_keys_for_window, bucket, "ABI-L2-ACHAC", ref_utc, 55)
                 f_cod_keys = list_pool.submit(_list_s3_product_keys_for_window, bucket, "ABI-L2-CODC", ref_utc, 35)
+                f_ccl_keys = (
+                    list_pool.submit(_list_s3_product_keys_for_window, bucket, "ABI-L2-CCLC", ref_utc, 55)
+                    if enable_multilayer_fusion
+                    else None
+                )
+                f_btd_keys = (
+                    list_pool.submit(_list_cmipc_c07_c13_keys, bucket, ref_utc, 28)
+                    if need_twilight_btd
+                    else None
+                )
                 ctp_entries = f_ctp_keys.result()
                 ach_entries = f_ach_keys.result()
                 cod_entries = f_cod_keys.result()
+                ccl_entries = f_ccl_keys.result() if f_ccl_keys is not None else []
+                c07_entries, c13_entries = f_btd_keys.result() if f_btd_keys is not None else ([], [])
 
             pick_0 = _pick_closest_causal_key(ctp_entries, ref_utc, ref_utc, max_slop_minutes=22.0)
             if pick_0 is not None:
@@ -898,14 +1145,19 @@ def fetch_goes_corridor_nowcast(
                 ach_15 = _pick_closest_causal_key(ach_entries, t_15_dt, ref_utc, 12.0)
                 ach_30 = _pick_closest_causal_key(ach_entries, t_30_dt, ref_utc, 12.0)
                 cod_0 = _pick_closest_causal_key(cod_entries, t_0_dt, ref_utc, 15.0)
+                ccl_0 = _pick_closest_causal_key(ccl_entries, t_0_dt, ref_utc, 12.0) if ccl_entries else None
+                ccl_15 = _pick_closest_causal_key(ccl_entries, t_15_dt, ref_utc, 12.0) if ccl_entries else None
+                ccl_30 = _pick_closest_causal_key(ccl_entries, t_30_dt, ref_utc, 12.0) if ccl_entries else None
+                c07_0 = _pick_closest_causal_key(c07_entries, t_0_dt, ref_utc, 10.0) if c07_entries else None
+                c13_0 = _pick_closest_causal_key(c13_entries, t_0_dt, ref_utc, 10.0) if c13_entries else None
 
                 needed_keys: set[str] = {ctp_key_0, ctp_key_15, ctp_key_30}
-                for opt_p in (ach_0, ach_15, ach_30, cod_0):
+                for opt_p in (ach_0, ach_15, ach_30, cod_0, ccl_0, ccl_15, ccl_30, c07_0, c13_0):
                     if opt_p is not None:
                         needed_keys.add(opt_p[1])
 
                 downloaded: dict[str, bytes] = {}
-                with ThreadPoolExecutor(max_workers=min(7, len(needed_keys))) as dl_pool:
+                with ThreadPoolExecutor(max_workers=min(8, len(needed_keys))) as dl_pool:
                     fut_map = {k: dl_pool.submit(_download_s3_bytes, bucket, k) for k in needed_keys}
                     for k, fut in fut_map.items():
                         downloaded[k] = fut.result()
@@ -922,6 +1174,11 @@ def fetch_goes_corridor_nowcast(
                     lon_grid,
                     is_coastal,
                     enable_parallax=enable_parallax,
+                    cclc_bytes=downloaded.get(ccl_0[1]) if ccl_0 else None,
+                    cmip_c07_bytes=downloaded.get(c07_0[1]) if c07_0 else None,
+                    cmip_c13_bytes=downloaded.get(c13_0[1]) if c13_0 else None,
+                    scan_utc=t_0_dt,
+                    enable_multilayer_fusion=enable_multilayer_fusion,
                 )
                 dec_15 = (
                     dec_0
@@ -934,6 +1191,9 @@ def fetch_goes_corridor_nowcast(
                         lon_grid,
                         is_coastal,
                         enable_parallax=enable_parallax,
+                        cclc_bytes=downloaded.get(ccl_15[1]) if ccl_15 else None,
+                        scan_utc=t_15_dt,
+                        enable_multilayer_fusion=enable_multilayer_fusion,
                     )
                 )
                 dec_30 = (
@@ -947,6 +1207,9 @@ def fetch_goes_corridor_nowcast(
                         lon_grid,
                         is_coastal,
                         enable_parallax=enable_parallax,
+                        cclc_bytes=downloaded.get(ccl_30[1]) if ccl_30 else None,
+                        scan_utc=t_30_dt,
+                        enable_multilayer_fusion=enable_multilayer_fusion,
                     )
                 )
 
@@ -999,11 +1262,20 @@ def fetch_goes_corridor_nowcast(
 
                 sun_el_now = _solar_elevation_utc(lat, lon, t_0_dt)
                 age_min = max(0.0, (ref_utc - t_0_dt).total_seconds() / 60.0)
+                prod_tags = ["ACTP", "ACHA", "COD"]
+                if dec_0.get("has_cclc"):
+                    prod_tags.append("CCLC-5Layer")
+                if dec_0.get("has_btd_fog"):
+                    prod_tags.append("C13-C07-BTD")
 
                 result: dict[str, Any] = {
-                    "satellite": f"NOAA {sat_short} ABI L2 (ACTP+ACHA+COD)",
+                    "satellite": f"NOAA {sat_short} ABI L2 ({'+'.join(prod_tags)})",
                     "is_west": is_west,
                     "is_calibrated_l2": True,
+                    "has_cclc": bool(dec_0.get("has_cclc")),
+                    "has_cclc_multilayer": bool(dec_0.get("has_cclc")),
+                    "has_btd_fog": bool(dec_0.get("has_btd_fog")),
+                    "has_twilight_btd_fog": bool(dec_0.get("has_btd_fog")),
                     "parallax_corrected": enable_parallax,
                     "multiscale_flow": enable_multiscale_flow,
                     "scan_timestamp_utc": t_0_dt.isoformat(),
@@ -1026,9 +1298,14 @@ def fetch_goes_corridor_nowcast(
                     "u_high_grid": u_hi_g,
                     "v_high_grid": v_hi_g,
                     "conf_high_grid": c_hi_g,
+                    "fog_cf_grid": dec_0["fog_cf"],
                     "low_cf_grid": dec_0["low_cf"],
                     "mid_cf_grid": dec_0["mid_cf"],
                     "high_cf_grid": dec_0["high_cf"],
+                    "actp_low_cf_grid": dec_0["actp_low_cf"],
+                    "actp_mid_cf_grid": dec_0["actp_mid_cf"],
+                    "actp_high_cf_grid": dec_0["actp_high_cf"],
+                    "fog_m30_grid": dec_30["fog_cf"],
                     "low_m30_grid": dec_30["low_cf"],
                     "mid_m30_grid": dec_30["mid_cf"],
                     "high_m30_grid": dec_30["high_cf"],
@@ -1121,14 +1398,10 @@ def sample_advected_goes_state(
             v_sat = float(goes_data.get("motion_v_ms", 0.0))
             conf = float(goes_data.get("motion_confidence", 0.0))
 
-        # High-confidence satellite phase correlation (`conf -> 0.95`) dominates over free-troposphere
-        # NWP wind (`850 hPa` sits above coastal marine inversions!), falling back smoothly on clear sky
         w_eff = max(0.0, min(0.96, (conf / 0.95) * sat_max_weight))
         u_raw = w_eff * u_sat + (1.0 - w_eff) * w_nwp_uv[0]
         v_raw = w_eff * v_sat + (1.0 - w_eff) * w_nwp_uv[1]
 
-        # Test continuity over the observed 30-min window (`t_-30 -> t_0`) to detect
-        # coastally trapped stratus banks and terrain-locked Sierra lee-wave clouds!
         w_pin = 0.0
         if (
             enable_pinning
@@ -1155,7 +1428,6 @@ def sample_advected_goes_state(
         src_lon = q_lon - (u_eff * dt_sec) / m_per_lon
         cf_adv = _sample_grid_bilinear(cf0_grid, bbox, src_lat, src_lon)
 
-        # Damped Lagrangian growth/dissipation tendency along the parcel back-trajectory
         if (
             enable_growth_decay
             and dt_sec > 60.0
@@ -1187,6 +1459,21 @@ def sample_advected_goes_state(
         wind_low_uv_ms,
         0.95,
     )
+    fog_grid = goes_data.get("fog_cf_grid")
+    if fog_grid is not None:
+        fog_cf, _, _, _ = _advect_layer(
+            fog_grid,
+            goes_data.get("fog_m30_grid"),
+            goes_data.get("euler_low_grid"),
+            goes_data.get("u_low_grid"),
+            goes_data.get("v_low_grid"),
+            goes_data.get("conf_low_grid"),
+            wind_low_uv_ms,
+            0.95,
+        )
+    else:
+        fog_cf = low_cf * 0.80
+
     mid_cf, lat_mi, lon_mi, _ = _advect_layer(
         goes_data["mid_cf_grid"],
         goes_data.get("mid_m30_grid"),
@@ -1241,6 +1528,7 @@ def sample_advected_goes_state(
     tb_k = _sample_grid_bilinear(goes_data["tb_k_grid"], bbox, lat_hi, lon_hi)
 
     return {
+        "fog_cf": fog_cf,
         "low_cf": low_cf,
         "mid_cf": mid_cf,
         "high_cf": high_cf,

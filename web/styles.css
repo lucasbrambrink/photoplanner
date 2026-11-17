@@ -899,6 +899,93 @@ input:not(input[type="range"]):user-invalid {
   font-variant-numeric: tabular-nums;
 }
 
+/* Historical Verification & Hindcast Comparison Toggle (Past Dates) */
+.historical-replay-panel {
+  margin-block-start: 0.5rem;
+  padding: 0.44rem 0.54rem;
+  border-radius: 8px;
+  background: color-mix(in oklch, var(--accent-cyan) 7%, var(--surface-tile));
+  border: 1px solid color-mix(in oklch, var(--accent-cyan) 32%, var(--border-subtle));
+  display: grid;
+  gap: 0.34rem;
+}
+
+.historical-replay-panel[hidden] {
+  display: none;
+}
+
+.historical-replay-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+}
+
+.historical-replay-eyebrow {
+  font-size: 0.63rem;
+  font-weight: 800;
+  letter-spacing: 0.055em;
+  text-transform: uppercase;
+  color: var(--accent-cyan);
+  white-space: nowrap;
+  overflow: clip;
+  text-overflow: ellipsis;
+}
+
+.historical-replay-btns {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.28rem;
+}
+
+.historical-replay-btns .corridor-tab {
+  font-size: 0.67rem;
+  padding: 0.24rem 0.32rem;
+  text-align: center;
+}
+
+.historical-delta-strip {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.24rem 0.4rem;
+  padding-block-start: 0.28rem;
+  border-block-start: 1px solid var(--border-subtle);
+  font-size: 0.65rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+}
+
+.historical-delta-strip[hidden] {
+  display: none;
+}
+
+.hist-delta-cell {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.25rem;
+  min-inline-size: 0;
+}
+
+.hist-delta-cell span {
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.hist-delta-cell strong {
+  font-weight: 700;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+.hist-delta-cell strong.delta-good {
+  color: var(--accent-emerald);
+}
+
+.hist-delta-cell strong.delta-warn {
+  color: var(--accent-gold);
+}
+
 /* Unified 4-Layer Physical Atmosphere Stack, Provenance Banner & Confidence Pills */
 .atmo-provenance-banner {
   margin-block-start: 0.5rem;

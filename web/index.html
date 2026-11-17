@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="color-scheme" content="light dark" />
   <title>PhotoPlanner 3D — GPU Volumetric Cloud, 3D Cirrus &amp; Topographic Ray Engine</title>
-  <link rel="stylesheet" href="/styles.css?v=20261116u" />
+  <link rel="stylesheet" href="/styles.css?v=20261117a" />
   <script type="importmap">
     {
       "imports": {
@@ -120,7 +120,7 @@
         <strong>Unified 4-Layer 128×128×48 GPU Moist Navier-Stokes:</strong> Simultaneously resolves sub-inversion marine stratus/fog, boundary-layer cumulus, mid-level altocumulus/lenticular waves, and upper-tropospheric 3D ice cirrus at their exact pressure-level ASL altitudes from <code>0 m</code> to <code>12.2 km</code>.
       </li>
       <li>
-        <strong>Transparent Data Provenance &amp; Hover Picker:</strong> Hovering any 3D cloud executes an asynchronous 2×1 GPU ray probe to report calibrated layer confidence (<code>20–94%</code>), ASL altitude, data sources (GOES-18/19 ABI L2, METAR ceilometers, HRRR 3 km, ECMWF IFS/AIFS, GFS), and what is measured vs. physically simulated.
+        <strong>Multi-Sensor Ground Truth &amp; Historical Hindcasts:</strong> Fuses 5-band GOES-18/19 <code>ABI-L2-CCLC</code> + twilight 3.9 µm fog <code>BTD</code>, 5-minute ASOS laser ceilometers, and <code>00Z/12Z</code> NWS radiosonde balloons, with instant 3D comparison against archived <code>+1h</code>, <code>+24h</code>, and <code>+72h</code> hindcasts.
       </li>
       <li>
         <strong>1m USGS 3DEP Terrain + GPU Sightline Ray-Caster:</strong> Click any point on the 3D terrain in <strong>Inspect</strong> mode for sub-millisecond curved-Earth sightline profiling, 360° horizon notches, and trailhead routing.
@@ -129,7 +129,7 @@
     <div class="telemetry-grid popover-telemetry-grid" id="telemetry-details">
       <div><span>Near-Field DEM</span> <strong>USGS 3DEP 1m F32 Binary Stream</strong></div>
       <div><span>3D Fluid Column</span> <strong>128×128×48 GPU + 160 km Mesoscale Grid</strong></div>
-      <div><span>Cloud Provenance</span> <strong>GOES-18 ABI L2 + METAR + 4-Model NWP</strong></div>
+      <div><span>Cloud Provenance</span> <strong>GOES-18 CCLC/BTD + ASOS + 00Z Balloon</strong></div>
       <div><span>Solar Ephemeris</span> <strong>380 km Curved-Earth 6-Band Radiative LUT</strong></div>
     </div>
   </div>
@@ -214,49 +214,49 @@
       </button>
     </div>
     <p class="popover-lead">
-      Jump directly to live forecasts or calibrated historical multi-layer cloud, marine fog-sea, and Sierra alpenglow dates:
+      Jump directly to live forecasts or multi-sensor archived ground truth (GOES-18 CCLC + ASOS + 00Z Balloon) vs. historical hindcasts:
     </p>
     <div class="scenario-preset-list">
       <button type="button" class="scenario-preset-card" id="btn-vp-yesterday-pedro">
         <span class="scenario-preset-icon" aria-hidden="true">🌅</span>
         <span class="scenario-preset-body">
           <strong>Pedro Point Yesterday Sunset</strong>
-          <span>Archived HRRR + 380 km Offshore Pacific Corridor Backtest</span>
+          <span>Observed GOES-18 CCLC + KHAF + KOAK Truth vs. +24h/+72h Hindcast</span>
         </span>
       </button>
       <button type="button" class="scenario-preset-card" id="btn-vp-today-sf">
         <span class="scenario-preset-icon" aria-hidden="true">🔥</span>
         <span class="scenario-preset-body">
           <strong>Montara Mountain Live Today</strong>
-          <span>Live GOES-18 ABI L2 + METAR + 4-Model Coastal Column</span>
+          <span>Live GOES-18 CCLC/BTD + METAR + 4-Model Coastal Column</span>
         </span>
       </button>
       <button type="button" class="scenario-preset-card" id="btn-vp-fog-sea">
         <span class="scenario-preset-icon" aria-hidden="true">☁️</span>
         <span class="scenario-preset-body">
           <strong>Montara Marine Cloud-Sea ('25)</strong>
-          <span>Jun 5, 2025 • Sub-Inversion Stratus Sea + Upper Cirrus</span>
+          <span>Jun 5, 2025 • KOAK 00Z Balloon Lid (2,020 ft) vs. NWP Hindcast</span>
         </span>
       </button>
       <button type="button" class="scenario-preset-card" id="btn-vp-clear-slot">
         <span class="scenario-preset-icon" aria-hidden="true">✨</span>
         <span class="scenario-preset-body">
           <strong>Pedro Point Crimson Cirrus ('25)</strong>
-          <span>May 16, 2025 • Clear Horizon Slot + High Ice Mares' Tails</span>
+          <span>May 16, 2025 • Multi-Layer CCLC Cirrus + Sub-Inversion Slot</span>
         </span>
       </button>
       <button type="button" class="scenario-preset-card" id="btn-vp-halfdome-alpenglow">
         <span class="scenario-preset-icon" aria-hidden="true">🏔️</span>
         <span class="scenario-preset-body">
           <strong>Half Dome Cumulus &amp; Cirrus ('25)</strong>
-          <span>May 25, 2025 • Yosemite Valley Sounding + High Ice Canopy</span>
+          <span>May 25, 2025 • GOES-18 + KREV Balloon Truth vs. +24h/+72h Forecast</span>
         </span>
       </button>
       <button type="button" class="scenario-preset-card" id="btn-vp-clouds-rest-wave">
         <span class="scenario-preset-icon" aria-hidden="true">🌬️</span>
         <span class="scenario-preset-body">
           <strong>Clouds Rest Sierra Wave ('25)</strong>
-          <span>Jun 7, 2025 • High-Elevation Westerly Flow + Multi-Layer Ice</span>
+          <span>Jun 7, 2025 • Standing Lee-Wave Ice Canopy Truth vs. Hindcast</span>
         </span>
       </button>
     </div>
@@ -296,6 +296,29 @@
         </summary>
 
         <div class="weather-expanded-body">
+          <!-- Historical Verification: Observed Multi-Sensor Truth vs. Archived Hindcasts (Past Dates Only) -->
+          <div class="historical-replay-panel" id="historical-replay-panel" hidden>
+            <div class="historical-replay-header">
+              <span class="historical-replay-eyebrow">HISTORICAL VERIFICATION • 3D REPLAY</span>
+              <span class="conf-pill conf-high" id="historical-replay-badge">Observed Truth</span>
+            </div>
+            <div class="historical-replay-btns" id="historical-replay-btns" role="group" aria-label="Historical Truth vs Hindcast Mode">
+              <button type="button" class="corridor-tab is-active" data-replay-mode="truth" title="Archived GOES-18 5-Layer CCLC + 3.9µm BTD + ASOS Ceilometer + 00Z/12Z Weather Balloon">
+                Observed Truth
+              </button>
+              <button type="button" class="corridor-tab" data-replay-mode="nowcast_1h" title="Causal +1h satellite optical-flow &amp; METAR/balloon nowcast before golden hour">
+                +1h Nowcast
+              </button>
+              <button type="button" class="corridor-tab" data-replay-mode="hindcast_24h" title="Genuine Day-1 (+24h) archived NWP forecast run issued the day prior">
+                +24h Forecast
+              </button>
+              <button type="button" class="corridor-tab" data-replay-mode="hindcast_72h" title="Genuine Day-3 (+72h) archived NWP forecast run issued 3 days prior">
+                +72h Forecast
+              </button>
+            </div>
+            <div class="historical-delta-strip" id="historical-delta-strip" hidden></div>
+          </div>
+
           <!-- Honest Data Provenance & Overall Confidence Banner -->
           <div class="atmo-provenance-banner" id="atmo-provenance-banner">
             <div class="atmo-provenance-top">
@@ -874,6 +897,6 @@
     </section>
   </main>
 
-  <script type="module" src="/app.js?v=20261116u"></script>
+  <script type="module" src="/app.js?v=20261117a"></script>
 </body>
 </html>
