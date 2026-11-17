@@ -938,7 +938,7 @@ def _evaluate_multisensor_solver_event(ev: dict[str, Any], refresh: bool = False
     Plus backward-compatible `1.0h, 3.0h, 24.0h` calibrated vs uncalibrated DNI/Raycast metrics.
     """
     BACKTEST_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    ev_cache = BACKTEST_CACHE_DIR / f"rc_ev_v4_{ev['id']}.json"
+    ev_cache = BACKTEST_CACHE_DIR / f"rc_ev_v41_{ev['id']}.json"
     if (not refresh) and ev_cache.exists():
         try:
             cached = json.loads(ev_cache.read_text(encoding="utf-8"))
@@ -990,15 +990,20 @@ def _evaluate_multisensor_solver_event(ev: dict[str, Any], refresh: bool = False
         "truth": truth_doc,
         "ablation_single_layer": ablation_doc,
     }
-    for m_key in ("nowcast_1h", "nowcast_3h", "hindcast_24h", "hindcast_72h", "nwp_only"):
-        mode_docs[m_key] = json.loads(
-            solve_weather_and_corridor(
+    rem_modes = ("nowcast_1h", "nowcast_3h", "hindcast_24h", "hindcast_72h", "nwp_only")
+    with ThreadPoolExecutor(max_workers=2) as m_pool:
+        m_futs = {
+            m_key: m_pool.submit(
+                solve_weather_and_corridor,
                 lat, lon, d_str, phase="sunset", sun_az_deg=sun_az, sun_el_deg=sun_el,
                 target_elev_m=elev_m, model_engine="ensemble", replay_mode=m_key,
             )
-        )
+            for m_key in rem_modes
+        }
+        for m_key, m_fut in m_futs.items():
+            mode_docs[m_key] = json.loads(m_fut.result())
 
-    # Uncalibrated baseline runs for Track 3 interval calibration comparison
+    # Uncalibrated baseline runs for Track 3 interval calibration comparison (pre-HRRR-S3 baseline)
     uncal_docs: dict[str, dict[str, Any]] = {}
     for lead_hr, l_key in ((1.0, "1.0h"), (3.0, "3.0h"), (24.0, "24.0h")):
         t_issue = t_sunset_utc - dt.timedelta(hours=lead_hr)
@@ -1008,6 +1013,7 @@ def _evaluate_multisensor_solver_event(ev: dict[str, Any], refresh: bool = False
                 target_elev_m=elev_m, model_engine="ensemble", simulated_now_utc=t_issue,
                 replay_mode="hindcast_24h" if lead_hr >= 20.0 else "auto",
                 calibration_overrides=UNCALIBRATED_BASELINE_OVERRIDES,
+                enable_hrrr_s3=False,
             )
         )
 
@@ -1503,7 +1509,7 @@ def run_full_backtest_suite(
 
     elapsed_s = round(time.perf_counter() - t_start, 2)
     summary = {
-        "schema_version": "v4.0",
+        "schema_version": "v4.1",
         "generated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "elapsed_seconds": elapsed_s,
         "n_events": len(BENCHMARK_EVENTS),
@@ -1529,8 +1535,8 @@ def run_full_backtest_suite(
 
 
 if __name__ == "__main__":
-    print("Running PhotoPlanner v4.0 Multi-Sensor Historical Benchmark (N=24 events across 4 seasons)...", flush=True)
-    res = run_full_backtest_suite(max_workers=3)
+    print("Running PhotoPlanner v4.1 Multi-Sensor + Native HRRR S3 Benchmark (N=24 events across 4 seasons)...", flush=True)
+    res = run_full_backtest_suite(max_workers=2)
     print(f"\nCompleted in {res['elapsed_seconds']}s — saved to {SUMMARY_JSON_PATH} and {BENCHMARK_REPORT_JSON_PATH}", flush=True)
     print("\n=== TRACK 1: Vertical Altitude & Inversion Accuracy vs 00Z RAOB Balloons & ASOS ===")
     for mk, mv in res["vertical_inversion_verification"].items():

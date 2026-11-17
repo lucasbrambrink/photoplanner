@@ -620,19 +620,22 @@ def _apply_previous_runs_hindcast(
         ws10_arr: list[float] = []
         wd10_arr: list[float] = []
 
-        t1000 = list(bh.get("temperature_1000hPa") or [15.0] * n_hr)
-        rh1000 = list(bh.get("relative_humidity_1000hPa") or [75.0] * n_hr)
-        rh925 = list(bh.get("relative_humidity_925hPa") or [65.0] * n_hr)
+        t1000 = [15.0] * n_hr
+        rh975 = [70.0] * n_hr
+        rh950 = [58.0] * n_hr
+        rh925 = [45.0] * n_hr
+        rh850 = [32.0] * n_hr
+        pbl_arr = [450.0 if pt_coastal else 950.0] * n_hr
 
         for hr in range(n_hr):
-            t2 = _safe_arr_val(ph, f"temperature_2m{sfx}", hr, _safe_arr_val(bh, "temperature_2m", hr, 14.0))
-            rh2 = _safe_arr_val(ph, f"relative_humidity_2m{sfx}", hr, _safe_arr_val(bh, "relative_humidity_2m", hr, 75.0))
+            t2 = _safe_arr_val(ph, f"temperature_2m{sfx}", hr, 14.0)
+            rh2 = _safe_arr_val(ph, f"relative_humidity_2m{sfx}", hr, 72.0)
             td2 = _safe_arr_val(ph, f"dew_point_2m{sfx}", hr, t2 - (100.0 - rh2) * 0.2)
-            cc = _safe_arr_val(ph, f"cloud_cover{sfx}", hr, _safe_arr_val(bh, "cloud_cover", hr, 25.0))
+            cc = _safe_arr_val(ph, f"cloud_cover{sfx}", hr, 25.0)
             dni = _safe_arr_val(ph, f"direct_normal_irradiance{sfx}", hr, 0.0)
             dhi = _safe_arr_val(ph, f"diffuse_radiation{sfx}", hr, 0.0)
-            ws10 = _safe_arr_val(ph, f"wind_speed_10m{sfx}", hr, _safe_arr_val(bh, "wind_speed_10m", hr, 10.0))
-            wd10 = _safe_arr_val(ph, f"wind_direction_10m{sfx}", hr, _safe_arr_val(bh, "wind_direction_10m", hr, 280.0))
+            ws10 = _safe_arr_val(ph, f"wind_speed_10m{sfx}", hr, 10.0)
+            wd10 = _safe_arr_val(ph, f"wind_direction_10m{sfx}", hr, 280.0)
 
             lo_p, mi_p, hi_p = _partition_prev_run_cloud_layers(
                 cc, rh2, t2, td2, dni, dhi, 0.0, 0.0, 0.0, pt_coastal
@@ -646,12 +649,21 @@ def _apply_previous_runs_hindcast(
             rh2_arr.append(round(rh2, 1))
             ws10_arr.append(round(ws10, 1))
             wd10_arr.append(round(wd10, 0))
-            if hr < len(t1000):
-                t1000[hr] = round(t2 - 0.4, 2)
-            if hr < len(rh1000):
-                rh1000[hr] = round(max(15.0, min(100.0, 0.75 * rh2 + 0.25 * lo_p)), 1)
-            if hr < len(rh925):
-                rh925[hr] = round(max(12.0, min(100.0, 0.45 * rh2 + 0.55 * lo_p)), 1)
+
+            t1000[hr] = round(t2 - 0.4, 2)
+            if pt_coastal:
+                # Realistic marine boundary-layer hydrolapse without leaking Day-0 pressure levels
+                rh975[hr] = round(max(18.0, min(99.0, 0.52 * rh2 + 0.46 * lo_p)), 1)
+                rh950[hr] = round(max(15.0, min(96.0, 0.34 * rh2 + 0.54 * lo_p)), 1)
+                rh925[hr] = round(max(12.0, min(92.0, 0.22 * rh2 + 0.48 * lo_p)), 1)
+                rh850[hr] = round(max(10.0, min(88.0, 0.14 * rh2 + 0.34 * lo_p + 0.18 * mi_p)), 1)
+                pbl_arr[hr] = round(max(180.0, min(1150.0, 220.0 + ws10 * 14.0 + lo_p * 2.4)), 1)
+            else:
+                rh975[hr] = round(max(15.0, min(98.0, 0.72 * rh2 + 0.25 * lo_p)), 1)
+                rh950[hr] = round(max(14.0, min(96.0, 0.60 * rh2 + 0.32 * lo_p)), 1)
+                rh925[hr] = round(max(12.0, min(94.0, 0.48 * rh2 + 0.40 * lo_p)), 1)
+                rh850[hr] = round(max(10.0, min(92.0, 0.32 * rh2 + 0.50 * lo_p)), 1)
+                pbl_arr[hr] = round(max(260.0, min(2200.0, 520.0 + max(0.0, t2 - 8.0) * 48.0 + ws10 * 12.0)), 1)
 
         bh["temperature_2m"] = t2_arr
         bh["dew_point_2m"] = td2_arr
@@ -663,8 +675,11 @@ def _apply_previous_runs_hindcast(
         bh["wind_speed_10m"] = ws10_arr
         bh["wind_direction_10m"] = wd10_arr
         bh["temperature_1000hPa"] = t1000
-        bh["relative_humidity_1000hPa"] = rh1000
+        bh["relative_humidity_975hPa"] = rh975
+        bh["relative_humidity_950hPa"] = rh950
         bh["relative_humidity_925hPa"] = rh925
+        bh["relative_humidity_850hPa"] = rh850
+        bh["boundary_layer_height"] = pbl_arr
 
     synth_mm: dict[str, Any] | None = None
     if isinstance(raw_mm, dict) and raw_mm.get("hourly"):
@@ -719,6 +734,51 @@ def _apply_previous_runs_hindcast(
     return out_docs, synth_mm, label
 
 
+def build_corridor_coords_meta(
+    lat: float,
+    lon: float,
+    primary_az_deg: float,
+    conjugate_az_deg: float,
+) -> list[tuple[str, float, float, float, float | None]]:
+    """
+    Constructs the canonical 21-point spatial coordinate grid (`corr_0km..320km`,
+    `conj_18km..190km`, `transect_-11..+11km`, and `meso_*` 160 km box anchors)
+    shared by Open-Meteo NWP soundings and native 3 km NOAA HRRR S3 extraction.
+    """
+    coords: list[tuple[str, float, float, float, float | None]] = []
+    # [0..5]: 6 primary corridor stations
+    for d_km in CORRIDOR_DISTANCES_KM:
+        slat, slon = bearing_offset_lat_lon_km(lat, lon, primary_az_deg, d_km)
+        coords.append((f"corr_{int(d_km)}km", slat, slon, d_km, primary_az_deg))
+
+    # [6..8]: 3 conjugate-sector corridor stations
+    for d_km in CONJUGATE_DISTANCES_KM:
+        slat, slon = bearing_offset_lat_lon_km(lat, lon, conjugate_az_deg, d_km)
+        coords.append((f"conj_{int(d_km)}km", slat, slon, d_km, conjugate_az_deg))
+
+    # [9..12]: 4 local W-to-E transect stations (-11, -5.5, +5.5, +11 km East; 0 km is coords[0])
+    for ex_km in (-11.0, -5.5, +5.5, 11.0):
+        slat, slon = offset_lat_lon_km(lat, lon, ex_km, 0.0)
+        coords.append((f"transect_{ex_km:+.1f}km", slat, slon, abs(ex_km), 90.0 if ex_km > 0 else 270.0))
+
+    # [13..20]: 8 outer mesoscale 160 km box anchors
+    meso_offsets_km = [
+        (-68.0, -68.0),
+        (0.0, -68.0),
+        (68.0, -68.0),
+        (-68.0, 0.0),
+        (68.0, 0.0),
+        (-68.0, 68.0),
+        (0.0, 68.0),
+        (68.0, 68.0),
+    ]
+    for ex_km, ny_km in meso_offsets_km:
+        slat, slon = offset_lat_lon_km(lat, lon, ex_km, ny_km)
+        az_m = math.degrees(math.atan2(ex_km, ny_km)) % 360.0
+        coords.append((f"meso_{int(ex_km)}_{int(ny_km)}", slat, slon, math.hypot(ex_km, ny_km), az_m))
+    return coords
+
+
 def fetch_24h_corridor_and_models(
     lat: float,
     lon: float,
@@ -749,7 +809,7 @@ def fetch_24h_corridor_and_models(
     is_historical = days_delta < 0
     eff_lead_days = max(0, min(7, int(hindcast_lead_days))) if is_historical else 0
 
-    lead_tag = f":prev{eff_lead_days}" if eff_lead_days > 0 else ""
+    lead_tag = f":prev_v3_{eff_lead_days}" if eff_lead_days > 0 else ""
     cache_key = (
         f"nwp24_v2:{lat:.3f}:{lon:.3f}:{req_date.isoformat()}:"
         f"{primary_az_deg:.0f}:{conjugate_az_deg:.0f}{lead_tag}"
@@ -808,38 +868,8 @@ def fetch_24h_corridor_and_models(
             except Exception:
                 pass
 
-    # Assemble the 18 spatial coordinates for the single-batch Open-Meteo request:
-    coords: list[tuple[str, float, float, float, float | None]] = []
-    # [0..5]: 6 primary corridor stations
-    for d_km in CORRIDOR_DISTANCES_KM:
-        slat, slon = bearing_offset_lat_lon_km(lat, lon, primary_az_deg, d_km)
-        coords.append((f"corr_{int(d_km)}km", slat, slon, d_km, primary_az_deg))
-
-    # [6..8]: 3 conjugate-sector corridor stations
-    for d_km in CONJUGATE_DISTANCES_KM:
-        slat, slon = bearing_offset_lat_lon_km(lat, lon, conjugate_az_deg, d_km)
-        coords.append((f"conj_{int(d_km)}km", slat, slon, d_km, conjugate_az_deg))
-
-    # [9..12]: 4 local W-to-E transect stations (-11, -5.5, +5.5, +11 km East; 0 km is coords[0])
-    for ex_km in (-11.0, -5.5, +5.5, 11.0):
-        slat, slon = offset_lat_lon_km(lat, lon, ex_km, 0.0)
-        coords.append((f"transect_{ex_km:+.1f}km", slat, slon, abs(ex_km), 90.0 if ex_km > 0 else 270.0))
-
-    # [13..20]: 8 outer mesoscale 160 km box anchors ((-68,-68), (0,-68), (+68,-68), (-68,0), (+68,0), (-68,+68), (0,+68), (+68,+68))
-    meso_offsets_km = [
-        (-68.0, -68.0),
-        (0.0, -68.0),
-        (68.0, -68.0),
-        (-68.0, 0.0),
-        (68.0, 0.0),
-        (-68.0, 68.0),
-        (0.0, 68.0),
-        (68.0, 68.0),
-    ]
-    for ex_km, ny_km in meso_offsets_km:
-        slat, slon = offset_lat_lon_km(lat, lon, ex_km, ny_km)
-        az_m = math.degrees(math.atan2(ex_km, ny_km)) % 360.0
-        coords.append((f"meso_{int(ex_km)}_{int(ny_km)}", slat, slon, math.hypot(ex_km, ny_km), az_m))
+    # Assemble the 21 spatial coordinates for the single-batch Open-Meteo request:
+    coords = build_corridor_coords_meta(lat, lon, primary_az_deg, conjugate_az_deg)
 
     lats_csv = ",".join(f"{c[1]:.4f}" for c in coords)
     lons_csv = ",".join(f"{c[2]:.4f}" for c in coords)

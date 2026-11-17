@@ -6,12 +6,14 @@ coupled to the Rust `pp-raycast` 0-380 km curved-Earth spectral & stochastic cor
 
 from .backtest import BENCHMARK_REPORT_JSON_PATH, SUMMARY_JSON_PATH, run_full_backtest_suite
 from .corridor_solver import CALIBRATION_CONFIG, solve_weather_and_corridor
+from .hrrr_s3 import fetch_hrrr_s3_corridor
 from .raob_sounding import fetch_raob_sounding
 
 __all__ = [
     "BENCHMARK_REPORT_JSON_PATH",
     "CALIBRATION_CONFIG",
     "SUMMARY_JSON_PATH",
+    "fetch_hrrr_s3_corridor",
     "fetch_raob_sounding",
     "run_full_backtest_suite",
     "solve_weather_and_corridor",
