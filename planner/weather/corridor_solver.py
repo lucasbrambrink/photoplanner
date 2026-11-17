@@ -221,6 +221,10 @@ def _blend_nowcast_into_station(
         st["cloud_high_pct"] = max(0, min(100, new_high))
 
         elev_m = float(rs["surface_elevation_m"])
+        orig_cu_band = next(
+            (b for b in rs.get("cloud_bands", []) if b.get("label") == "low"),
+            None,
+        )
         new_bands: list[dict[str, Any]] = []
         low_cf = st["cloud_low_pct"] / 100.0
         mid_cf = st["cloud_mid_pct"] / 100.0
@@ -289,6 +293,28 @@ def _blend_nowcast_into_station(
                     "ice_fraction": 0.0,
                 }
             )
+            # Preserve any distinct above-inversion cumulus/stratocumulus deck from 850 hPa sounding
+            if (
+                is_fog_like
+                and orig_cu_band is not None
+                and float(orig_cu_band["base_asl_m"]) > top_m + 130.0
+                and float(orig_cu_band["cloud_fraction"]) >= 0.05
+            ):
+                cu_base_m = max(top_m + 140.0, float(orig_cu_band["base_asl_m"]))
+                cu_top_m = max(cu_base_m + 360.0, float(orig_cu_band["top_asl_m"]))
+                cu_cf = max(0.04, min(0.85, float(orig_cu_band["cloud_fraction"]) * (1.0 - 0.35 * w_low_eff)))
+                new_bands.append(
+                    {
+                        "label": "low",
+                        "base_asl_m": round(cu_base_m, 1),
+                        "top_asl_m": round(cu_top_m, 1),
+                        "cloud_fraction": round(cu_cf, 3),
+                        "optical_depth_vertical": round(max(0.15, cu_cf * 8.5), 2),
+                        "aspect_ratio_h_over_d": float(orig_cu_band.get("aspect_ratio_h_over_d", 0.32)),
+                        "characteristic_cell_km": float(orig_cu_band.get("characteristic_cell_km", 2.8)),
+                        "ice_fraction": float(orig_cu_band.get("ice_fraction", 0.0)),
+                    }
+                )
         if mid_cf >= 0.03:
             sat_mid_top = float(adv.get("mid_top_asl_m") or 4350.0)
             mid_top = max(
@@ -353,12 +379,48 @@ def _build_fluid_params_from_sounding(
     is_coastal: bool,
     seed: int,
 ) -> dict[str, Any]:
-    """Maps a real pressure-level sounding + true vector winds into WebGL2/WASM fluid boundary params."""
+    """Maps a real multi-layer pressure-level sounding + GOES L2 cloud bands into unified 3D fluid boundary params."""
     u_sfc, v_sfc = st0["wind_sfc_uv_ms"]
     u_850, v_850 = st0["wind_850_uv_ms"]
     u_500, v_500 = st0["wind_500_uv_ms"]
     u_250, v_250 = st0["wind_250_uv_ms"]
     spd_850 = math.hypot(u_850, v_850)
+    spd_700 = float(st0.get("wind_700_kmh", spd_850 * 3.6)) / 3.6
+
+    rs = st0["rust_station"]
+    elev_m = float(rs.get("surface_elevation_m", 0.0))
+    bands = rs.get("cloud_bands") or []
+    fog_band = next((b for b in bands if b.get("label") == "fog"), None)
+    low_band = next((b for b in bands if b.get("label") == "low"), None)
+    mid_band = next((b for b in bands if b.get("label") == "mid"), None)
+    high_band = next((b for b in bands if b.get("label") == "high"), None)
+
+    fog_pct = round(float(fog_band["cloud_fraction"]) * 100.0, 1) if fog_band else 0.0
+    default_fog_top = max(elev_m + 130.0, float(st0.get("inv_top_asl_m", 480.0)))
+    default_fog_base = max(elev_m + 25.0, min(default_fog_top - 110.0, float(st0.get("lcl_asl_m", 220.0))))
+    fog_base_m = round(float(fog_band["base_asl_m"]), 1) if fog_band else round(default_fog_base, 1)
+    fog_top_m = round(max(fog_base_m + 90.0, float(fog_band["top_asl_m"])), 1) if fog_band else round(default_fog_top, 1)
+
+    if low_band is not None:
+        cu_pct = round(float(low_band["cloud_fraction"]) * 100.0, 1)
+        low_base_m = round(float(low_band["base_asl_m"]), 1)
+        low_top_m = round(max(low_base_m + 280.0, float(low_band["top_asl_m"])), 1)
+    else:
+        cu_pct = 0.0 if fog_band is not None else float(st0["cloud_low_pct"])
+        min_cu_base = (fog_top_m + 180.0) if fog_band is not None else (elev_m + 220.0)
+        low_base_m = round(max(min_cu_base, float(st0.get("lcl_asl_m", 1100.0))), 1)
+        conv_boost_m = min(1600.0, math.sqrt(max(0.0, float(st0.get("cape_j_kg", 0.0)))) * 40.0)
+        low_top_m = round(max(low_base_m + 520.0, low_base_m + 450.0 + conv_boost_m), 1)
+
+    mid_pct = round(float(mid_band["cloud_fraction"]) * 100.0, 1) if mid_band else float(st0["cloud_mid_pct"])
+    mid_base_m = round(float(mid_band["base_asl_m"]), 1) if mid_band else round(max(low_top_m + 350.0, elev_m + 1100.0, 3150.0), 1)
+    mid_top_m = round(max(mid_base_m + 520.0, float(mid_band["top_asl_m"])), 1) if mid_band else round(max(mid_base_m + 1150.0, 4650.0), 1)
+    mid_ice_frac = round(float(mid_band.get("ice_fraction", 0.30)), 2) if mid_band else 0.30
+
+    high_pct = round(float(high_band["cloud_fraction"]) * 100.0, 1) if high_band else float(st0["cloud_high_pct"])
+    high_base_m = round(float(high_band["base_asl_m"]), 1) if high_band else 7650.0
+    high_top_m = round(max(high_base_m + 1150.0, float(high_band["top_asl_m"])), 1) if high_band else 10350.0
+    high_tau = round(float(high_band["optical_depth_vertical"]), 2) if high_band else round((high_pct / 100.0) * 1.15, 2)
 
     inv_strength_k = max(1.0, min(15.0, st0["inv_jump_k"] + (3.2 if is_coastal else 1.2)))
     cape_eff = max(
@@ -368,14 +430,40 @@ def _build_fluid_params_from_sounding(
         else ((120.0 if is_coastal else 210.0) + max(0.0, st0["temp_2m_c"] - 12.0) * 28.0),
     )
 
+    lapse_k_km = float(rs.get("lapse_rate_k_km", 6.2))
+    n_bv = math.sqrt(max(4e-5, (9.81 / 285.0) * max(0.0015, (9.8 - lapse_k_km) / 1000.0)))
+    barrier_h_m = max(350.0, min(2200.0, elev_m if elev_m > 320.0 else 550.0))
+    froude_num = round(max(0.15, min(3.5, max(2.0, spd_700) / max(1.5, n_bv * barrier_h_m))), 2)
+    wave_gain = round(
+        min(
+            1.85,
+            0.72
+            + max(spd_850, spd_700) * 0.052
+            + (0.28 if 0.55 <= froude_num <= 1.65 and spd_700 >= 7.5 else 0.0),
+        ),
+        2,
+    )
+
     return {
         "surfaceTempC": round(st0["temp_2m_c"], 2),
         "surfaceRhPct": round(st0["rh_2m_pct"], 1),
+        "fogCloudPct": fog_pct,
+        "fogBaseAslM": fog_base_m,
+        "fogTopAslM": fog_top_m,
+        "cumulusCloudPct": cu_pct,
         "lowCloudPct": float(st0["cloud_low_pct"]),
-        "midCloudPct": float(st0["cloud_mid_pct"]),
-        "highCloudPct": float(st0["cloud_high_pct"]),
-        "inversionBaseM": round(max(110.0, st0["inv_base_asl_m"]), 1),
-        "inversionThicknessM": 220.0 if is_coastal else 320.0,
+        "lowBaseAslM": low_base_m,
+        "lowTopAslM": low_top_m,
+        "midCloudPct": mid_pct,
+        "midBaseAslM": mid_base_m,
+        "midTopAslM": mid_top_m,
+        "midIceFrac": mid_ice_frac,
+        "highCloudPct": high_pct,
+        "highBaseAslM": high_base_m,
+        "highTopAslM": high_top_m,
+        "highOpticalDepth": high_tau,
+        "inversionBaseM": round(max(90.0, fog_base_m if fog_band else st0["inv_base_asl_m"]), 1),
+        "inversionThicknessM": round(max(120.0, fog_top_m - fog_base_m), 1) if fog_band else (220.0 if is_coastal else 320.0),
         "inversionStrengthK": round(inv_strength_k, 2),
         "windSfcU": u_sfc,
         "windSfcV": v_sfc,
@@ -386,12 +474,351 @@ def _build_fluid_params_from_sounding(
         "wind250U": u_250,
         "wind250V": v_250,
         "convectiveCape": round(cape_eff, 1),
-        "orographicWaveGain": round(min(1.65, 0.85 + spd_850 * 0.055), 2),
+        "orographicWaveGain": wave_gain,
+        "froudeNumber": froude_num,
         "vorticityConfinement": 1.18,
-        "cirrusIceBoost": round(0.82 + 0.58 * (st0["cloud_high_pct"] / 100.0), 2),
+        "cirrusIceBoost": round(0.75 + 0.52 * min(1.35, high_tau / max(0.25, (high_pct / 100.0) + 0.15)), 2),
         "jet250Mph": int(round(st0["wind_250_kmh"] * 0.621371)),
         "jet300Mph": int(round(st0["wind_300_kmh"] * 0.621371)),
         "seed": int(seed & 0xFFFF),
+    }
+
+
+def _build_atmospheric_layers_provenance(
+    st0: dict[str, Any],
+    fluid_params: dict[str, Any],
+    *,
+    is_coastal: bool,
+    is_historical: bool,
+    lead_hours: float,
+    w_nowcast: float,
+    has_live_nowcast: bool,
+    goes_data: dict[str, Any] | None,
+    station_obs: dict[str, Any] | None,
+    has_hrrr: bool,
+    hrrr_lmh: tuple[int, int, int],
+    ecmwf_lmh: tuple[int, int, int],
+    aifs_lmh: tuple[int, int, int],
+    gfs_lmh: tuple[int, int, int],
+    nowcast_lmh: tuple[int, int, int],
+) -> dict[str, Any]:
+    """Builds per-layer altitude, data provenance, and calibrated confidence metadata for 3D UI & cloud hover."""
+    rs = st0["rust_station"]
+    bands = rs.get("cloud_bands") or []
+    band_map = {str(b.get("label")): b for b in bands}
+
+    h_lo, h_mi, h_hi = hrrr_lmh
+    e_lo, e_mi, e_hi = ecmwf_lmh
+    a_lo, a_mi, a_hi = aifs_lmh
+    g_lo, g_mi, g_hi = gfs_lmh
+    n_lo, n_mi, n_hi = nowcast_lmh
+
+    sat_name = str(goes_data.get("satellite", "GOES-18")) if goes_data else "GOES-18"
+    is_cal_l2 = bool(goes_data and goes_data.get("is_calibrated_l2"))
+    sat_age_min = float(goes_data.get("scan_age_minutes", 8.0)) if goes_data else 0.0
+    motion_conf = float(goes_data.get("motion_confidence", 0.72)) if goes_data else 0.0
+
+    has_close_metar = bool(station_obs and float(station_obs.get("distance_km", 999.0)) <= 45.0)
+    metar_id = str(station_obs["station_id"]) if station_obs else None
+    metar_dist_km = round(float(station_obs["distance_km"]), 1) if station_obs else None
+    has_metar_ceil = bool(has_close_metar and station_obs and station_obs.get("lowest_ceiling_asl_m"))
+
+    if has_live_nowcast and w_nowcast >= 0.12:
+        temporal_regime = "live_nowcast"
+    elif is_historical:
+        temporal_regime = "historical_archive"
+    else:
+        temporal_regime = "nwp_forecast"
+
+    # Base NWP skill decays smoothly with forecast lead time; archived reanalysis has ~82% baseline skill
+    if is_historical:
+        base_nwp_skill = 82.0
+    else:
+        pos_lead = max(0.0, lead_hours)
+        base_nwp_skill = 85.0 * math.exp(-pos_lead / 135.0)
+
+    # Base observational skill when GOES L2 is active (decays gently over the 0-4h advection horizon)
+    obs_base_skill = (
+        (91.0 if is_cal_l2 else 82.0) * (0.86 + 0.14 * motion_conf) * math.exp(-max(0.0, lead_hours) / 14.0)
+        if (has_live_nowcast and goes_data is not None)
+        else base_nwp_skill
+    )
+
+    high_cf_total = float(fluid_params.get("highCloudPct", st0["cloud_high_pct"])) / 100.0
+    mid_cf_total = float(fluid_params.get("midCloudPct", st0["cloud_mid_pct"])) / 100.0
+
+    def _tier(c: int) -> str:
+        if c >= 74:
+            return "high"
+        if c >= 50:
+            return "moderate"
+        return "low"
+
+    def _layer_conf_and_sources(
+        layer_id: str,
+        cov_pct: float,
+        m_vals: tuple[int, int, int, int],
+        now_val: int,
+    ) -> tuple[int, list[str], dict[str, int], str]:
+        mh, me, ma, mg = m_vals
+        spread = max(mh, me, ma, mg) - min(mh, me, ma, mg)
+        mean_m = 0.25 * (mh + me + ma + mg)
+        std_m = math.sqrt(
+            0.25 * ((mh - mean_m) ** 2 + (me - mean_m) ** 2 + (ma - mean_m) ** 2 + (mg - mean_m) ** 2)
+        )
+        # Coastal marine-layer timing/inversion thickness carries extra sub-grid NWP uncertainty
+        regime_pen = 5.0 if (layer_id == "fog" and is_coastal and w_nowcast < 0.35) else 0.0
+        spread_pen = min(24.0, 0.50 * std_m) if is_historical else min(28.0, 0.62 * std_m)
+        nwp_conf = base_nwp_skill - spread_pen - regime_pen
+
+        w_obs = 0.0
+        if has_live_nowcast and w_nowcast > 0.04:
+            if layer_id in ("fog", "low"):
+                w_obs = min(0.95, w_nowcast * 1.06)
+            elif layer_id == "mid":
+                w_obs = min(0.93, w_nowcast * 0.96)
+            else:
+                w_obs = min(0.91, w_nowcast * 0.88)
+
+        obs_conf = obs_base_skill
+        obscured_from_space = False
+        if w_obs > 0.05:
+            # Satellite IR/vis sees highest cloud top first; dense cirrus obscures boundary layer unless METAR confirms!
+            if layer_id in ("fog", "low") and high_cf_total >= 0.62:
+                if has_close_metar:
+                    obs_conf -= 3.5
+                else:
+                    obs_conf -= 15.0
+                    obscured_from_space = True
+            elif layer_id == "mid" and high_cf_total >= 0.72:
+                obs_conf -= 9.0
+                obscured_from_space = True
+            if layer_id in ("fog", "low") and has_close_metar:
+                obs_conf += 5.5 if has_metar_ceil else 3.5
+
+        raw_conf = w_obs * obs_conf + (1.0 - w_obs) * nwp_conf
+        conf_pct = int(round(max(20.0, min(94.0, raw_conf))))
+
+        sources: list[str] = []
+        if w_obs >= 0.12 and goes_data is not None:
+            l2_tag = "ABI L2 ACTP/ACHA/COD" if is_cal_l2 else "ABI IR/Vis"
+            sources.append(f"{sat_name} {l2_tag} ({int(round(w_obs * 100))}%)")
+        if layer_id in ("fog", "low") and has_close_metar and metar_id:
+            ceil_str = "ceilometer" if has_metar_ceil else "ASOS"
+            sources.append(f"METAR {metar_id} {ceil_str} ({metar_dist_km:.0f} km)")
+        nwp_w_pct = int(round((1.0 - w_obs) * 100))
+        if is_historical:
+            sources.append("Archived HRRR 3km + ERA5/IFS Sounding")
+        elif nwp_w_pct >= 8:
+            hrrr_lbl = "NOAA HRRR 3km" if has_hrrr else "NOAA GFS"
+            sources.append(f"{hrrr_lbl} + ECMWF IFS/AIFS ({nwp_w_pct}%)")
+
+        breakdown = {
+            "hrrr": int(mh),
+            "ecmwf_ifs": int(me),
+            "ecmwf_aifs": int(ma),
+            "gfs": int(mg),
+        }
+        if has_live_nowcast:
+            breakdown["goes_l2"] = int(now_val)
+
+        # Build concise, transparent 1-line explanation for hover card
+        if w_obs >= 0.45 and goes_data is not None:
+            if obscured_from_space:
+                reason = (
+                    f"{sat_name} view partly masked by upper cirrus ({int(round(high_cf_total * 100))}%); "
+                    f"blended with NWP sounding. 3D 1m eddies simulated."
+                )
+            elif layer_id in ("fog", "low") and has_metar_ceil and metar_id:
+                reason = (
+                    f"{sat_name} L2 cloud-top + {metar_id} ceilometer base measured ({sat_age_min:.0f}m old); "
+                    f"3D 1m billows simulated."
+                )
+            elif layer_id == "high" and is_cal_l2:
+                reason = (
+                    f"{sat_name} ACHAC ice top & COD optical depth retrieved ({sat_age_min:.0f}m old); "
+                    f"3D ice fallstreaks simulated."
+                )
+            else:
+                reason = (
+                    f"{sat_name} L2 macro deck & parallax drift measured ({sat_age_min:.0f}m old); "
+                    f"3D 1m structure simulated."
+                )
+        elif is_historical:
+            if std_m >= 18.0:
+                reason = (
+                    f"Archived sounding (3km HRRR {mh}% vs 28km IFS {me}% resolution spread); "
+                    f"3D 1m cloud field simulated."
+                )
+            else:
+                reason = (
+                    f"Archived pressure-level reanalysis sounding (±{int(round(std_m))}% model σ); "
+                    f"3D 1m cloud field simulated."
+                )
+        else:
+            lead_tag = f"+{max(0.0, lead_hours):.0f}h forecast"
+            if spread >= 34:
+                reason = (
+                    f"{lead_tag} • Models split (HRRR {mh}% vs IFS {me}% vs AIFS {ma}%); "
+                    f"3D cloud structure simulated."
+                )
+            elif spread >= 16:
+                reason = (
+                    f"{lead_tag} • Moderate model spread (±{int(round(std_m))}% σ); "
+                    f"macro sounding from NWP, 3D wisps simulated."
+                )
+            else:
+                reason = (
+                    f"{lead_tag} • Strong 4-model consensus (HRRR {mh}% / IFS {me}%); "
+                    f"macro sounding from NWP, 3D wisps simulated."
+                )
+
+        return conf_pct, sources, breakdown, reason
+
+    fog_cov = float(fluid_params["fogCloudPct"])
+    cu_cov = float(fluid_params["cumulusCloudPct"])
+    mid_cov = float(fluid_params["midCloudPct"])
+    hi_cov = float(fluid_params["highCloudPct"])
+
+    fog_conf, fog_src, fog_brk, fog_note = _layer_conf_and_sources(
+        "fog", fog_cov, (h_lo, e_lo, a_lo, g_lo), n_lo
+    )
+    low_conf, low_src, low_brk, low_note = _layer_conf_and_sources(
+        "low", cu_cov, (h_lo, e_lo, a_lo, g_lo), n_lo
+    )
+    mid_conf, mid_src, mid_brk, mid_note = _layer_conf_and_sources(
+        "mid", mid_cov, (h_mi, e_mi, a_mi, g_mi), n_mi
+    )
+    hi_conf, hi_src, hi_brk, hi_note = _layer_conf_and_sources(
+        "high", hi_cov, (h_hi, e_hi, a_hi, g_hi), n_hi
+    )
+
+    def _tau_of(lbl: str, fallback_cov: float, scale: float) -> float:
+        if lbl in band_map:
+            return round(float(band_map[lbl].get("optical_depth_vertical", 0.0)), 2)
+        return round((fallback_cov / 100.0) * scale, 2)
+
+    froude = float(fluid_params.get("froudeNumber", 1.0))
+    mid_name = (
+        "Mid Altocumulus & Standing Wave"
+        if (0.55 <= froude <= 1.65 and float(st0.get("wind_700_kmh", 0.0)) >= 25.0)
+        else "Mid-Tropospheric Altocumulus"
+    )
+
+    layers = [
+        {
+            "id": "high",
+            "name": "Upper-Tropospheric Ice Cirrus",
+            "short_name": "High Ice Cirrus",
+            "phase": "ice",
+            "coverage_pct": int(round(hi_cov)),
+            "base_asl_m": round(float(fluid_params["highBaseAslM"]), 0),
+            "top_asl_m": round(float(fluid_params["highTopAslM"]), 0),
+            "base_ft": int(round(float(fluid_params["highBaseAslM"]) * 3.28084)),
+            "top_ft": int(round(float(fluid_params["highTopAslM"]) * 3.28084)),
+            "optical_depth": _tau_of("high", hi_cov, 1.25),
+            "wind_mph": int(round(float(st0.get("wind_250_kmh", 40.0)) * 0.621371)),
+            "confidence_pct": hi_conf,
+            "confidence_tier": _tier(hi_conf),
+            "sources": hi_src,
+            "model_breakdown_pct": hi_brk,
+            "hover_disclosure": hi_note,
+        },
+        {
+            "id": "mid",
+            "name": mid_name,
+            "short_name": "Mid Altocumulus / Wave",
+            "phase": "mixed" if float(fluid_params.get("midIceFrac", 0.3)) >= 0.2 else "liquid",
+            "coverage_pct": int(round(mid_cov)),
+            "base_asl_m": round(float(fluid_params["midBaseAslM"]), 0),
+            "top_asl_m": round(float(fluid_params["midTopAslM"]), 0),
+            "base_ft": int(round(float(fluid_params["midBaseAslM"]) * 3.28084)),
+            "top_ft": int(round(float(fluid_params["midTopAslM"]) * 3.28084)),
+            "optical_depth": _tau_of("mid", mid_cov, 5.5),
+            "wind_mph": int(round(math.hypot(*st0.get("wind_500_uv_ms", (8.0, 0.0))) * 2.23694)),
+            "confidence_pct": mid_conf,
+            "confidence_tier": _tier(mid_conf),
+            "sources": mid_src,
+            "model_breakdown_pct": mid_brk,
+            "hover_disclosure": mid_note,
+        },
+        {
+            "id": "low",
+            "name": "Boundary-Layer Cumulus / Sc",
+            "short_name": "Low Cumulus / Sc",
+            "phase": "liquid",
+            "coverage_pct": int(round(cu_cov)),
+            "base_asl_m": round(float(fluid_params["lowBaseAslM"]), 0),
+            "top_asl_m": round(float(fluid_params["lowTopAslM"]), 0),
+            "base_ft": int(round(float(fluid_params["lowBaseAslM"]) * 3.28084)),
+            "top_ft": int(round(float(fluid_params["lowTopAslM"]) * 3.28084)),
+            "optical_depth": _tau_of("low", cu_cov, 8.5),
+            "wind_mph": int(round(math.hypot(*st0.get("wind_850_uv_ms", (5.0, 0.0))) * 2.23694)),
+            "confidence_pct": low_conf,
+            "confidence_tier": _tier(low_conf),
+            "sources": low_src,
+            "model_breakdown_pct": low_brk,
+            "hover_disclosure": low_note,
+        },
+        {
+            "id": "fog",
+            "name": "Sub-Inversion Marine Stratus / Fog",
+            "short_name": "Marine Stratus / Fog",
+            "phase": "liquid",
+            "coverage_pct": int(round(fog_cov)),
+            "base_asl_m": round(float(fluid_params["fogBaseAslM"]), 0),
+            "top_asl_m": round(float(fluid_params["fogTopAslM"]), 0),
+            "base_ft": int(round(float(fluid_params["fogBaseAslM"]) * 3.28084)),
+            "top_ft": int(round(float(fluid_params["fogTopAslM"]) * 3.28084)),
+            "optical_depth": _tau_of("fog", fog_cov, 10.5),
+            "wind_mph": int(round(float(st0.get("wind_10m_kmh", 12.0)) * 0.621371)),
+            "confidence_pct": fog_conf,
+            "confidence_tier": _tier(fog_conf),
+            "sources": fog_src,
+            "model_breakdown_pct": fog_brk,
+            "hover_disclosure": fog_note,
+        },
+    ]
+
+    # Weight overall confidence by active cloud layers (or mean across column when clear)
+    w_tot = (fog_cov + 5.0) + (cu_cov + 5.0) + (mid_cov + 4.0) + (hi_cov + 5.0)
+    overall_conf = int(
+        round(
+            (
+                fog_conf * (fog_cov + 5.0)
+                + low_conf * (cu_cov + 5.0)
+                + mid_conf * (mid_cov + 4.0)
+                + hi_conf * (hi_cov + 5.0)
+            )
+            / max(1.0, w_tot)
+        )
+    )
+
+    if temporal_regime == "live_nowcast":
+        metar_part = f" + METAR {metar_id}" if (has_close_metar and metar_id) else ""
+        pipeline_label = f"Live {sat_name} ABI L2{metar_part} + 4-Model NWP"
+    elif temporal_regime == "historical_archive":
+        pipeline_label = "ERA5 / Open-Meteo Pressure-Level Reanalysis"
+    else:
+        hrrr_part = "HRRR 3km + " if has_hrrr else ""
+        pipeline_label = f"{hrrr_part}ECMWF IFS/AIFS + GFS Ensemble (+{max(0.0, lead_hours):.0f}h)"
+
+    return {
+        "overall_confidence_pct": overall_conf,
+        "overall_confidence_tier": _tier(overall_conf),
+        "temporal_regime": temporal_regime,
+        "lead_hours": round(lead_hours, 2),
+        "nowcast_weight_pct": int(round(w_nowcast * 100.0)),
+        "primary_pipeline_label": pipeline_label,
+        "metar_station_id": metar_id if has_close_metar else None,
+        "metar_distance_km": metar_dist_km if has_close_metar else None,
+        "satellite_name": sat_name if (has_live_nowcast and goes_data) else None,
+        "satellite_scan_age_min": round(sat_age_min, 1) if (has_live_nowcast and goes_data) else None,
+        "simulation_note": (
+            "Layer heights, macro coverage & wind shear come from satellite/METAR/NWP soundings; "
+            "fine 1m billows, wave lenses & cirrus fallstreaks are physically simulated on GPU."
+        ),
+        "layers": layers,
     }
 
 
@@ -1542,6 +1969,23 @@ def solve_weather_and_corridor(
 
     seed_int = int(hashlib.sha256(f"{lat:.3f}:{lon:.3f}:{req_date.isoformat()}".encode()).hexdigest()[:8], 16)
     fluid_atmosphere_params = _build_fluid_params_from_sounding(st0, is_coastal, seed_int)
+    atmospheric_layers = _build_atmospheric_layers_provenance(
+        st0,
+        fluid_atmosphere_params,
+        is_coastal=is_coastal,
+        is_historical=is_historical,
+        lead_hours=lead_hours,
+        w_nowcast=w_nowcast_primary,
+        has_live_nowcast=has_live_nowcast,
+        goes_data=goes_data,
+        station_obs=station_obs,
+        has_hrrr=has_hrrr,
+        hrrr_lmh=(hrrr_low, hrrr_mid, hrrr_high),
+        ecmwf_lmh=(ecmwf_low, ecmwf_mid, ecmwf_high),
+        aifs_lmh=(aifs_low, aifs_mid, aifs_high),
+        gfs_lmh=(gfs_low, gfs_mid, gfs_high),
+        nowcast_lmh=(nowcast_low, nowcast_mid, nowcast_high),
+    )
 
     hourly_timeline: list[dict[str, Any]] = []
     for hr in range(24):
@@ -1557,6 +2001,49 @@ def solve_weather_and_corridor(
         h_exp_pct, h_prob_pct, h_p10, h_p50, h_p90 = _normalize_corridor_ray_pct(h_ray, hr_col_aod)
         h_kelvin = int(round(float(h_ray.get("beam_color_kelvin") or 5400.0)))
         h_glow = int(round(float(h_canv.get("composite_canvas_score") or 40.0)))
+
+        hr_dt_loc = dt.datetime(req_date.year, req_date.month, req_date.day, hr, 30, tzinfo=tz_obj)
+        hr_lead = (hr_dt_loc.astimezone(dt.timezone.utc) - now_utc).total_seconds() / 3600.0
+        if has_live_nowcast and -0.8 <= hr_lead <= 4.5:
+            w_hr = (
+                0.94
+                if model_engine == "nowcast"
+                else (
+                    max_ens_w / (1.0 + (max(0.0, hr_lead) / decay_tau_hr) ** 1.8)
+                    if model_engine == "ensemble"
+                    else 0.0
+                )
+            )
+        else:
+            w_hr = 0.0
+
+        fb_lo, fb_mi, fb_hi = snd_h["cloud_low_pct"], snd_h["cloud_mid_pct"], snd_h["cloud_high_pct"]
+        mh_lo, mh_mi, mh_hi, ok_mh = _model_lmh_at_hr("ncep_hrrr_conus", hr, fb_lo, fb_mi, fb_hi)
+        me_lo, me_mi, me_hi, _ = _model_lmh_at_hr("ecmwf_ifs025", hr, fb_lo, fb_mi, fb_hi)
+        ma_lo, ma_mi, ma_hi, _ = _model_lmh_at_hr("ecmwf_aifs025_single", hr, me_lo, me_mi, me_hi)
+        mg_lo, mg_mi, mg_hi, ok_mg = _model_lmh_at_hr("gfs_seamless", hr, fb_lo, fb_mi, fb_hi)
+        if not ok_mh and ok_mg:
+            mh_lo, mh_mi, mh_hi = mg_lo, mg_mi, mg_hi
+
+        hr_fluid_params = _build_fluid_params_from_sounding(snd_h, is_coastal, seed_int + hr)
+        hr_layers = _build_atmospheric_layers_provenance(
+            snd_h,
+            hr_fluid_params,
+            is_coastal=is_coastal,
+            is_historical=is_historical,
+            lead_hours=hr_lead,
+            w_nowcast=w_hr,
+            has_live_nowcast=bool(has_live_nowcast and w_hr > 0.04),
+            goes_data=goes_data if w_hr > 0.04 else None,
+            station_obs=station_obs if w_hr > 0.04 else None,
+            has_hrrr=ok_mh,
+            hrrr_lmh=(mh_lo, mh_mi, mh_hi),
+            ecmwf_lmh=(me_lo, me_mi, me_hi),
+            aifs_lmh=(ma_lo, ma_mi, ma_hi),
+            gfs_lmh=(mg_lo, mg_mi, mg_hi),
+            nowcast_lmh=(nowcast_low, nowcast_mid, nowcast_high),
+        )
+
         hourly_timeline.append(
             {
                 "hour": hr,
@@ -1580,7 +2067,8 @@ def solve_weather_and_corridor(
                 "canvas_glow_score": h_glow,
                 "blocker_label": h_blk.get("blocker_type") or "clear",
                 "blocker_distance_km": round(float(h_blk.get("distance_km") or 0.0), 1),
-                "fluid_atmosphere_params": _build_fluid_params_from_sounding(snd_h, is_coastal, seed_int + hr),
+                "fluid_atmosphere_params": hr_fluid_params,
+                "atmospheric_layers": hr_layers,
             }
         )
 
@@ -1709,6 +2197,7 @@ def solve_weather_and_corridor(
         "spatial_cloud_field": spatial_cloud_field,
         "mesoscale_cloud_grid": mesoscale_cloud_grid,
         "fluid_atmosphere_params": fluid_atmosphere_params,
+        "atmospheric_layers": atmospheric_layers,
         "ray_path_stations": ray_path_stations,
         "corridor_stations_6": corridor_stations_6,
         "corridor_raycast": corridor_raycast_summary,

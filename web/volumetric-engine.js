@@ -9,140 +9,46 @@ import * as THREE from 'three';
 
 export const WEATHER_REGIME_PRESETS = {
   live: {
-    label: 'Live Forecast Imputation (HRRR / Sounding)',
-    description: 'Couples Open-Meteo / HRRR pressure-level sounding directly into the GPU 128×128×48 Navier-Stokes & 3D ice solver.',
+    label: 'Unified Multi-Layer Physical Atmosphere',
+    description:
+      'Simultaneously resolves sub-inversion marine stratus/fog, boundary-layer cumulus, mid-tropospheric altocumulus/lenticular waves, and sheared 3D ice cirrus from live GOES-18 L2, METAR, and 4-model NWP soundings.',
     overrides: null,
   },
-  coastal_fog_sea: {
-    label: 'Pacific Marine Fog Sea & Inversion',
-    description: 'Strong 8.5 K marine inversion at 310m traps dense stratus against coastal ridges while 300hPa sheared cirrus glows overhead.',
-    overrides: {
-      surfaceTempC: 12.8,
-      surfaceRhPct: 95,
-      lowCloudPct: 84,
-      midCloudPct: 12,
-      highCloudPct: 48,
-      inversionBaseM: 310,
-      inversionThicknessM: 170,
-      inversionStrengthK: 8.5,
-      windSfcU: 6.4,
-      windSfcV: -4.2,
-      wind850U: 9.0,
-      wind850V: -2.5,
-      wind500U: 19.0,
-      wind500V: 5.0,
-      wind250U: 41.0,
-      wind250V: 16.0,
-      convectiveCape: 90,
-      orographicWaveGain: 1.25,
-      vorticityConfinement: 1.2,
-      cirrusIceBoost: 1.15,
-    },
-  },
-  crepuscular_godrays: {
-    label: 'Broken Stratocumulus & God-Rays',
-    description: 'Fenestrated coastal/valley stratocumulus cells with humid sub-cloud haze producing dramatic 3D crepuscular sunbeams.',
-    overrides: {
-      surfaceTempC: 14.5,
-      surfaceRhPct: 89,
-      lowCloudPct: 68,
-      midCloudPct: 28,
-      highCloudPct: 36,
-      inversionBaseM: 540,
-      inversionThicknessM: 240,
-      inversionStrengthK: 5.4,
-      windSfcU: 7.2,
-      windSfcV: -2.8,
-      wind850U: 11.5,
-      wind850V: -1.5,
-      wind500U: 22.0,
-      wind500V: 6.0,
-      wind250U: 35.0,
-      wind250V: 12.0,
-      convectiveCape: 380,
-      orographicWaveGain: 1.15,
-      vorticityConfinement: 1.45,
-      cirrusIceBoost: 0.95,
-    },
-  },
-  sierra_cumulus_cirrus: {
-    label: 'Orographic Cumulus & High 3D Cirrus',
-    description: 'Anabatic slope thermals build 1m-detailed cumulus turrets over summits beneath sweeping 10.5 km cirrus uncinus mares\' tails.',
-    overrides: {
-      surfaceTempC: 18.5,
-      surfaceRhPct: 64,
-      lowCloudPct: 44,
-      midCloudPct: 38,
-      highCloudPct: 76,
-      inversionBaseM: 1950,
-      inversionThicknessM: 380,
-      inversionStrengthK: 2.2,
-      windSfcU: 4.5,
-      windSfcV: 2.1,
-      wind850U: 8.8,
-      wind850V: 3.4,
-      wind500U: 21.0,
-      wind500V: 8.5,
-      wind250U: 48.0,
-      wind250V: 21.0,
-      convectiveCape: 1050,
-      orographicWaveGain: 1.1,
-      vorticityConfinement: 1.6,
-      cirrusIceBoost: 1.45,
-    },
-  },
-  lenticular_wave: {
-    label: 'Sierra Lee-Wave Lenticular & Jet Cirrus',
-    description: 'High-stability stratified cross-ridge flow excites standing 3D mountain gravity waves (altocumulus lenticularis) and jet-stream cirrus.',
-    overrides: {
-      surfaceTempC: 11.0,
-      surfaceRhPct: 68,
-      lowCloudPct: 26,
-      midCloudPct: 66,
-      highCloudPct: 68,
-      inversionBaseM: 1450,
-      inversionThicknessM: 280,
-      inversionStrengthK: 6.8,
-      windSfcU: 9.5,
-      windSfcV: 1.8,
-      wind850U: 16.5,
-      wind850V: 3.0,
-      wind500U: 29.0,
-      wind500V: 7.0,
-      wind250U: 54.0,
-      wind250V: 15.0,
-      convectiveCape: 140,
-      orographicWaveGain: 2.15,
-      vorticityConfinement: 0.95,
-      cirrusIceBoost: 1.35,
-    },
-  },
-  clear_crisp_cirrus: {
-    label: 'Crystal Alpine Visibility & Wispy Cirrus',
-    description: 'Clean dry boundary layer for razor-sharp mountain views with delicate high-tropospheric 3D cirrus filaments catching late alpenglow.',
-    overrides: {
-      surfaceTempC: 15.5,
-      surfaceRhPct: 46,
-      lowCloudPct: 8,
-      midCloudPct: 10,
-      highCloudPct: 62,
-      inversionBaseM: 900,
-      inversionThicknessM: 260,
-      inversionStrengthK: 3.0,
-      windSfcU: 3.2,
-      windSfcV: -1.4,
-      wind850U: 6.5,
-      wind850V: 1.0,
-      wind500U: 17.0,
-      wind500V: 6.0,
-      wind250U: 44.0,
-      wind250V: 19.0,
-      convectiveCape: 80,
-      orographicWaveGain: 0.85,
-      vorticityConfinement: 1.0,
-      cirrusIceBoost: 1.35,
-    },
-  },
+};
+
+const DEFAULT_ATMOSPHERE_PARAMS = {
+  surfaceTempC: 14.0,
+  surfaceRhPct: 82.0,
+  fogCloudPct: 26.0,
+  fogBaseAslM: 120.0,
+  fogTopAslM: 420.0,
+  cumulusCloudPct: 22.0,
+  lowCloudPct: 44.0,
+  lowBaseAslM: 940.0,
+  lowTopAslM: 1850.0,
+  midCloudPct: 18.0,
+  midBaseAslM: 3200.0,
+  midTopAslM: 4600.0,
+  highCloudPct: 46.0,
+  highBaseAslM: 7800.0,
+  highTopAslM: 10400.0,
+  inversionBaseM: 380.0,
+  inversionThicknessM: 210.0,
+  inversionStrengthK: 6.0,
+  windSfcU: 5.2,
+  windSfcV: -3.4,
+  wind850U: 8.0,
+  wind850V: -2.0,
+  wind500U: 18.0,
+  wind500V: 4.5,
+  wind250U: 36.0,
+  wind250V: 14.0,
+  convectiveCape: 260.0,
+  orographicWaveGain: 1.18,
+  vorticityConfinement: 1.18,
+  cirrusIceBoost: 1.05,
+  froudeNumber: 0.68,
+  seed: 1337,
 };
 
 // GPU 3D Fluid Grid Dimensions: 128 x 128 x 48 (786,432 voxels — 4x WASM horizontal resolution!)
@@ -343,9 +249,18 @@ const FLUID_COMMON_HEADER_GLSL3 = /* glsl */ `
   uniform float uZTopM;
   uniform float uSurfaceTempC;
   uniform float uSurfaceRhPct;
+  uniform float uFogCloudPct;
+  uniform float uFogBaseAslM;
+  uniform float uFogTopAslM;
   uniform float uLowCloudPct;
+  uniform float uLowBaseAslM;
+  uniform float uLowTopAslM;
   uniform float uMidCloudPct;
+  uniform float uMidBaseAslM;
+  uniform float uMidTopAslM;
   uniform float uHighCloudPct;
+  uniform float uHighBaseAslM;
+  uniform float uHighTopAslM;
   uniform float uInversionBaseM;
   uniform float uInversionThicknessM;
   uniform float uInversionStrengthK;
@@ -397,11 +312,12 @@ const FLUID_COMMON_HEADER_GLSL3 = /* glsl */ `
   void ambientSounding(float zAsl, out float tempK, out float pressPa, out float thetaAmb, out float qsatLiq, out float qsatIce) {
     float zRel = max(0.0, zAsl - uZBaseM);
     float tSfc = 273.15 + uSurfaceTempC;
+    float invBaseAsl = max(uZBaseM + 40.0, uInversionBaseM);
     float invJump = uInversionStrengthK * smoothstep(
-      uInversionBaseM,
-      uInversionBaseM + max(80.0, uInversionThicknessM),
-      zRel
-    ) * exp(-max(0.0, zRel - uInversionBaseM - uInversionThicknessM) / 2200.0);
+      invBaseAsl,
+      invBaseAsl + max(80.0, uInversionThicknessM),
+      zAsl
+    ) * exp(-max(0.0, zAsl - invBaseAsl - uInversionThicknessM) / 2200.0);
     tempK = max(214.0, tSfc - 0.0063 * zRel + invJump);
     pressPa = 101325.0 * pow(max(0.16, 1.0 - 0.0065 * max(0.0, zAsl) / 288.15), 5.25588);
     thetaAmb = tempK * pow(100000.0 / max(5000.0, pressPa), 0.2854);
@@ -524,7 +440,7 @@ const FLUID_COMMON_HEADER_GLSL3 = /* glsl */ `
   }
 `;
 
-// GPU Fluid Init / Weather Regime Seeding Pass (writes Velocity or Thermo depending on uInitMode)
+// GPU Fluid Init / Unified Multi-Layer Seeding Pass (writes Velocity or Thermo depending on uInitMode)
 const FLUID_INIT_FRAGMENT_GLSL3 = /* glsl */ `
   ${FLUID_COMMON_HEADER_GLSL3}
   uniform sampler2D uTerrainGridTex;
@@ -557,54 +473,53 @@ const FLUID_INIT_FRAGMENT_GLSL3 = /* glsl */ `
 
     vec2 uv = (vec2(vox.xy) + 0.5) / 128.0;
     float cellMacro = sculptedCloudMacro2D(uv);
+    float fogMacro = sculptedCloudMacro2D(uv * 0.75 + vec2(0.19, 0.41));
     float midWave = 0.65 * valueNoisePeriodic2D(uv + vec2(0.31, 0.67), 4.0)
                   + 0.35 * valueNoisePeriodic2D(uv + vec2(0.12, 0.83), 8.0);
+    float turretVar = valueNoisePeriodic2D(uv + vec2(0.47, 0.23), 8.0);
 
-    // Physical Lifting Condensation Level (LCL) + sub-inversion marine stratus profile
-    float lowCov = clamp(uLowCloudPct / 100.0, 0.0, 1.0);
-    float lclRelM = max(130.0, (100.0 - clamp(uSurfaceRhPct, 15.0, 100.0)) * 25.0);
-    float invTop = uInversionBaseM + max(90.0, uInversionThicknessM * 0.85);
-    float stratusRegime = smoothstep(4.2, 7.2, uInversionStrengthK) * (1.0 - clamp(uConvectiveCape / 520.0, 0.0, 0.85));
+    // Layer 1: Sub-Inversion Marine Stratus / Valley Fog ([uFogBaseAslM, uFogTopAslM])
+    float fogCov = clamp(uFogCloudPct / 100.0, 0.0, 1.0);
+    float fogBase = max(elevM + 12.0, uFogBaseAslM);
+    float fogTop = max(fogBase + 75.0, uFogTopAslM);
+    float fogBand = smoothstep(fogBase - 45.0, fogBase + 35.0, zAsl)
+                  * (1.0 - smoothstep(fogTop - 25.0, fogTop + 85.0, zAsl));
+    float fogThresh = 1.0 - fogCov * 0.82 - 0.05;
+    float fogCellMask = smoothstep(fogThresh, fogThresh + 0.20 + fogCov * 0.30, fogMacro);
+    float qcFog = fogCov * fogCellMask * fogBand * 0.00175;
 
-    float stratusBand = smoothstep(max(20.0, uInversionBaseM - 220.0), uInversionBaseM - 15.0, zRel)
-                      * (1.0 - smoothstep(invTop - 25.0, invTop + 115.0, zRel));
-
-    // Summit prominence anchor: peaks/ridges seed persistent 3D orographic cumulus & banner clouds
+    // Layer 2: Boundary-Layer Cumulus / Stratocumulus ([uLowBaseAslM, uLowTopAslM]) — coexists above fog!
+    float cuCov = clamp(uLowCloudPct / 100.0, 0.0, 1.0);
     float summitRoot = clamp(promM / 280.0, 0.0, 1.0)
                      * smoothstep(40.0, 260.0, zAsl - elevM)
                      * exp(-max(0.0, zAsl - elevM - 240.0) / 1150.0);
+    float cuField = clamp(cellMacro + summitRoot * 0.24, 0.0, 1.0);
+    float cuThresh = 1.0 - cuCov * 0.78 - 0.05;
+    float cellStrength = smoothstep(cuThresh, 0.98, cuField);
+    float cuBase = max(elevM + 55.0, uLowBaseAslM);
+    float cuSpan = max(320.0, uLowTopAslM - cuBase);
+    float localCuTop = cuBase + 140.0 + cuSpan * pow(cellStrength, 1.28) * (0.58 + 0.56 * turretVar);
+    float cumulusDome = smoothstep(cuBase - 45.0, cuBase + 75.0, zAsl)
+                      * smoothstep(localCuTop + 120.0, localCuTop - 280.0, zAsl);
+    float qcCumulus = cuCov * cellStrength * cumulusDome * 0.00195;
 
-    float lowField = clamp(cellMacro + summitRoot * 0.24, 0.0, 1.0);
-    float lowThresh = 1.0 - lowCov * 0.78 - 0.05;
-    float cellStrength = smoothstep(lowThresh, 0.98, lowField);
-    float turretVar = valueNoisePeriodic2D(uv + vec2(0.47, 0.23), 8.0);
+    float qcLow = max(qcFog, qcCumulus);
 
-    // Tapered 3D pyramidal/cauliflower dome envelope: wide flat base at LCL, tapering inward with altitude
-    // so only thermal plume centers reach high altitude (zero flat-topped cylinders!)
-    float maxTowerSpan = 520.0 + clamp(uConvectiveCape, 0.0, 1400.0) * 1.15;
-    float localCuTopRel = lclRelM + 160.0 + maxTowerSpan * pow(cellStrength, 1.35) * (0.58 + 0.60 * turretVar);
-    float cumulusDome = smoothstep(lclRelM - 40.0, lclRelM + 75.0, zRel)
-                      * smoothstep(localCuTopRel + 120.0, localCuTopRel - 320.0, zRel);
-
-    float lowCellMask = smoothstep(lowThresh, lowThresh + 0.22 + lowCov * 0.28, lowField);
-    float qcCumulus = lowCov * cellStrength * cumulusDome * 0.00195;
-    float qcStratus = lowCov * lowCellMask * stratusBand * 0.00165;
-    float qcLow = mix(qcCumulus, qcStratus, stratusRegime);
-
-    // Mid-level altocumulus / standing lenticular wave lenses (tapered 3D lens thickness)
+    // Layer 3: Mid-Tropospheric Altocumulus & Standing Mountain Wave ([uMidBaseAslM, uMidTopAslM])
     float midCov = clamp(uMidCloudPct / 100.0, 0.0, 1.0);
     float leeCrest = clamp(promM / 320.0, 0.0, 1.0) * clamp((uOrographicWaveGain - 0.85) * 0.55, 0.0, 0.55);
     float midField = clamp(midWave + leeCrest * 0.30, 0.0, 1.0);
     float midStrength = smoothstep(1.0 - midCov * 0.76 - 0.05, 0.96, midField);
-    float midCenterZ = 3350.0 + (turretVar - 0.5) * 650.0;
-    float midHalfThick = 180.0 + 1150.0 * pow(midStrength, 1.15);
-    float midLens = smoothstep(midCenterZ - midHalfThick - 220.0, midCenterZ - midHalfThick + 120.0, zRel)
-                  * smoothstep(midCenterZ + midHalfThick + 220.0, midCenterZ + midHalfThick - 120.0, zRel);
-    float qcMid = midCov * midStrength * midLens * 0.00135;
+    float midSpan = max(480.0, uMidTopAslM - uMidBaseAslM);
+    float midCenterAsl = 0.5 * (uMidBaseAslM + uMidTopAslM) + (turretVar - 0.5) * 0.28 * midSpan;
+    float midHalfThick = 140.0 + 0.48 * midSpan * pow(midStrength, 1.10);
+    float midLens = smoothstep(midCenterAsl - midHalfThick - 200.0, midCenterAsl - midHalfThick + 110.0, zAsl)
+                  * smoothstep(midCenterAsl + midHalfThick + 200.0, midCenterAsl + midHalfThick - 110.0, zAsl);
+    float qcMid = midCov * midStrength * midLens * 0.00138;
 
     float qc = (zAsl > elevM + 10.0) ? (qcLow + qcMid) : 0.0;
 
-    // High 3D Cirrus Uncinus & Vertebratus ice crystal layer (6.7 - 11.8 km ASL) with clear sky channels
+    // Layer 4: Upper-Tropospheric Ice Cirrus ([uHighBaseAslM, uHighTopAslM])
     float highCov = clamp(uHighCloudPct / 100.0, 0.0, 1.0);
     vec2 jetDir = normalize(uWind250 + vec2(1e-3));
     vec2 crossDir = vec2(-jetDir.y, jetDir.x);
@@ -613,7 +528,10 @@ const FLUID_INIT_FRAGMENT_GLSL3 = /* glsl */ `
                    + 0.38 * valueNoisePeriodic2D(vec2(jetProj.x * 1.0, jetProj.y * 3.0) + vec2(0.37, 0.19), 8.0);
     float ciRibs = 0.5 + 0.5 * sin(jetProj.x * 6.2831853 * 5.0 + ciStreak * 2.6);
     float cirrusPatch = clamp(ciStreak * (0.80 + 0.28 * ciRibs), 0.0, 1.0);
-    float cirrusAlt = smoothstep(6700.0, 8500.0, zAsl) * (1.0 - smoothstep(10850.0, 11950.0, zAsl));
+    float hiBase = max(4800.0, uHighBaseAslM);
+    float hiTop = max(hiBase + 950.0, uHighTopAslM);
+    float cirrusAlt = smoothstep(hiBase - 450.0, hiBase + 650.0, zAsl)
+                    * (1.0 - smoothstep(hiTop - 250.0, hiTop + 750.0, zAsl));
     float cirrusMask = smoothstep(1.0 - highCov * 0.72 - 0.04, 1.0 - highCov * 0.28 + 0.16, cirrusPatch);
     float qi = highCov * cirrusMask * cirrusAlt * 0.00048 * uCirrusIceBoost;
 
@@ -927,13 +845,16 @@ const FLUID_ADVECT_MICROPHYSICS_FRAGMENT_GLSL3 = /* glsl */ `
     float qc = max(0.0, advParcel.z);
     float qi = max(0.0, qiAdv);
 
-    // 3. 1:1 Lagrangian synoptic boundary-layer moisture & summit-anchored cloud root maintenance
+    // 3. 1:1 Lagrangian synoptic 4-layer moisture & summit-anchored cloud root maintenance
     vec2 uv = (vec2(vox.xy) + 0.5) / 128.0;
     float invDomain = 1.0 / max(1000.0, uDomainXyM);
-    vec2 driftLowUv = fract(uv - uWindSfc * (uSimTime * invDomain));
-    float cellWave = sculptedCloudMacro2D(driftLowUv);
+    vec2 driftSfcUv = fract(uv - uWindSfc * (uSimTime * invDomain));
+    vec2 drift850Uv = fract(uv - uWind850 * (uSimTime * invDomain));
+    float fogMacro = sculptedCloudMacro2D(driftSfcUv * 0.75 + vec2(0.19, 0.41));
+    float cellWave = sculptedCloudMacro2D(drift850Uv);
 
-    float lowCov = clamp(uLowCloudPct / 100.0, 0.0, 1.0);
+    float fogCov = clamp(uFogCloudPct / 100.0, 0.0, 1.0);
+    float cuCov = clamp(uLowCloudPct / 100.0, 0.0, 1.0);
     float midCov = clamp(uMidCloudPct / 100.0, 0.0, 1.0);
     float highCov = clamp(uHighCloudPct / 100.0, 0.0, 1.0);
 
@@ -943,50 +864,60 @@ const FLUID_ADVECT_MICROPHYSICS_FRAGMENT_GLSL3 = /* glsl */ `
       vec2 mesoUv = clamp(enLocal / max(20000.0, uMesoscaleSpanM) + 0.5, 0.03, 0.97);
       vec4 mesoCov = texture(uMesoscaleCloudTex, mesoUv);
       float edgeBlend = smoothstep(0.30, 0.49, max(abs(uv.x - 0.5), abs(uv.y - 0.5)));
-      lowCov = mix(lowCov, max(mesoCov.r, mesoCov.a * 0.85), edgeBlend * 0.72);
+      if (uFogCloudPct > 1.5 || mesoCov.a > 0.20) {
+        fogCov = mix(fogCov, mesoCov.a, edgeBlend * 0.72);
+      }
+      cuCov = mix(cuCov, max(0.0, mesoCov.r - fogCov * 0.55), edgeBlend * 0.72);
       midCov = mix(midCov, mesoCov.g, edgeBlend * 0.72);
       highCov = mix(highCov, mesoCov.b, edgeBlend * 0.72);
     }
 
-    float lclRelM = max(130.0, (100.0 - clamp(uSurfaceRhPct, 15.0, 100.0)) * 25.0);
-    float invTop = uInversionBaseM + max(90.0, uInversionThicknessM * 0.85);
-    float stratusRegime = smoothstep(4.2, 7.2, uInversionStrengthK) * (1.0 - clamp(uConvectiveCape / 520.0, 0.0, 0.85));
+    // Layer 1: Sub-inversion marine stratus / valley fog ([uFogBaseAslM, uFogTopAslM])
+    float fogBase = max(elevM + 12.0, uFogBaseAslM);
+    float fogTop = max(fogBase + 75.0, uFogTopAslM);
+    float fogBand = smoothstep(fogBase - 45.0, fogBase + 35.0, zAsl)
+                  * (1.0 - smoothstep(fogTop - 25.0, fogTop + 85.0, zAsl));
+    float fogThresh = 1.0 - fogCov * 0.82 - 0.05;
+    float fogSupport = (fogCov > 0.02)
+      ? smoothstep(fogThresh, fogThresh + 0.20 + fogCov * 0.30, fogMacro) * fogBand
+      : 0.0;
 
-    float stratusBand = smoothstep(max(20.0, uInversionBaseM - 220.0), uInversionBaseM - 15.0, zRel)
-                      * (1.0 - smoothstep(invTop - 25.0, invTop + 115.0, zRel));
-
+    // Layer 2: Boundary-layer cumulus / stratocumulus ([uLowBaseAslM, uLowTopAslM])
     float summitRoot = clamp(promM / 280.0, 0.0, 1.0)
                      * smoothstep(40.0, 260.0, zAsl - elevM)
                      * exp(-max(0.0, zAsl - elevM - 240.0) / 1150.0);
-
-    float lowField = clamp(cellWave + summitRoot * 0.24, 0.0, 1.0);
-    float lowThresh = 1.0 - lowCov * 0.78 - 0.05;
-    float cellStrength = smoothstep(lowThresh, 0.98, lowField);
-    float turretVar = valueNoisePeriodic2D(driftLowUv + vec2(0.47, 0.23), 8.0);
-    float maxTowerSpan = 520.0 + clamp(uConvectiveCape, 0.0, 1400.0) * 1.15;
-    float localCuTopRel = lclRelM + 160.0 + maxTowerSpan * pow(cellStrength, 1.35) * (0.58 + 0.60 * turretVar);
-    float cumulusDome = smoothstep(lclRelM - 40.0, lclRelM + 75.0, zRel)
-                      * smoothstep(localCuTopRel + 120.0, localCuTopRel - 320.0, zRel);
-    float lowCellMask = smoothstep(lowThresh, lowThresh + 0.22 + lowCov * 0.28, lowField);
-    float lowSupport = mix(cellStrength * cumulusDome, lowCellMask * stratusBand, stratusRegime);
+    float cuField = clamp(cellWave + summitRoot * 0.24, 0.0, 1.0);
+    float cuThresh = 1.0 - cuCov * 0.78 - 0.05;
+    float cellStrength = smoothstep(cuThresh, 0.98, cuField);
+    float turretVar = valueNoisePeriodic2D(drift850Uv + vec2(0.47, 0.23), 8.0);
+    float cuBase = max(elevM + 55.0, uLowBaseAslM);
+    float cuSpan = max(320.0, uLowTopAslM - cuBase);
+    float localCuTop = cuBase + 140.0 + cuSpan * pow(cellStrength, 1.28) * (0.58 + 0.56 * turretVar);
+    float cumulusDome = smoothstep(cuBase - 45.0, cuBase + 75.0, zAsl)
+                      * smoothstep(localCuTop + 120.0, localCuTop - 280.0, zAsl);
+    float cuSupport = (cuCov > 0.02) ? (cellStrength * cumulusDome) : 0.0;
 
     // Updraft adiabatic cooling drives genuine orographic & convective condensation!
     thetaPrime += (-0.0028 * vel.z) * dt - thetaPrime * 0.012 * dt;
     float targetRh = mix(uSurfaceRhPct / 100.0, 0.34 + 0.44 * midCov, smoothstep(0.0, 4200.0, zRel));
-    if (lowCov > 0.05 && zRel < lclRelM + maxTowerSpan + 350.0) {
-      targetRh = max(targetRh, mix(0.72, 1.085, lowSupport));
+    if (fogCov > 0.03 && zAsl <= fogTop + 160.0) {
+      targetRh = max(targetRh, mix(0.74, 1.088, fogSupport));
     }
-    if (midCov > 0.05 && zRel > 1800.0 && zRel < 5800.0) {
+    if (cuCov > 0.03 && zAsl >= cuBase - 120.0 && zAsl <= uLowTopAslM + 350.0) {
+      targetRh = max(targetRh, mix(0.70, 1.085, cuSupport));
+    }
+    if (midCov > 0.03 && zAsl >= uMidBaseAslM - 450.0 && zAsl <= uMidTopAslM + 550.0) {
       vec2 driftMidUv = fract(uv - uWind500 * (uSimTime * invDomain));
       float midCell = 0.65 * valueNoisePeriodic2D(driftMidUv + vec2(0.31, 0.67), 4.0)
                     + 0.35 * valueNoisePeriodic2D(driftMidUv + vec2(0.12, 0.83), 8.0);
       float leeCrest = clamp(promM / 320.0, 0.0, 1.0) * clamp((uOrographicWaveGain - 0.85) * 0.55, 0.0, 0.55);
       float midStrength = smoothstep(1.0 - midCov * 0.76 - 0.05, 0.96, clamp(midCell + leeCrest * 0.30, 0.0, 1.0));
-      float midCenterZ = 3350.0 + (turretVar - 0.5) * 650.0;
-      float midHalfThick = 180.0 + 1150.0 * pow(midStrength, 1.15);
-      float midLens = smoothstep(midCenterZ - midHalfThick - 220.0, midCenterZ - midHalfThick + 120.0, zRel)
-                    * smoothstep(midCenterZ + midHalfThick + 220.0, midCenterZ + midHalfThick - 120.0, zRel);
-      targetRh = max(targetRh, mix(0.68, 1.070, midStrength * midLens));
+      float midSpan = max(480.0, uMidTopAslM - uMidBaseAslM);
+      float midCenterAsl = 0.5 * (uMidBaseAslM + uMidTopAslM) + (turretVar - 0.5) * 0.28 * midSpan;
+      float midHalfThick = 140.0 + 0.48 * midSpan * pow(midStrength, 1.10);
+      float midLens = smoothstep(midCenterAsl - midHalfThick - 200.0, midCenterAsl - midHalfThick + 110.0, zAsl)
+                    * smoothstep(midCenterAsl + midHalfThick + 200.0, midCenterAsl + midHalfThick - 110.0, zAsl);
+      targetRh = max(targetRh, mix(0.68, 1.072, midStrength * midLens));
     }
     // Orographic wave crest saturation boost + lee-trough drying for crisp lenticular lenses!
     if (zRel > 180.0 && zRel < 6500.0) {
@@ -1011,7 +942,7 @@ const FLUID_ADVECT_MICROPHYSICS_FRAGMENT_GLSL3 = /* glsl */ `
     }
     qc = clamp(qc * (1.0 - 0.004 * dt), 0.0, 0.0034);
 
-    // 5. Koop Upper-Tropospheric Cirrus Ice Nucleation & Wind-Sheared Fallstreak Sublimation
+    // 5. Koop Upper-Tropospheric Cirrus Ice Nucleation & Wind-Sheared Fallstreak Sublimation ([uHighBaseAslM, uHighTopAslM])
     vec2 jetDir = normalize(uWind250 + vec2(1e-3));
     vec2 crossDir = vec2(-jetDir.y, jetDir.x);
     vec2 jetUv = fract(uv - uWind250 * (uSimTime * invDomain));
@@ -1020,12 +951,15 @@ const FLUID_ADVECT_MICROPHYSICS_FRAGMENT_GLSL3 = /* glsl */ `
                    + 0.38 * valueNoisePeriodic2D(vec2(jetProj.x * 1.0, jetProj.y * 3.0) + vec2(0.37, 0.19), 8.0);
     float ciRibs = 0.5 + 0.5 * sin(jetProj.x * 6.2831853 * 5.0 + ciStreak * 2.6);
     float ciWave = clamp(ciStreak * (0.80 + 0.28 * ciRibs), 0.0, 1.0);
-    float ciGenBand = smoothstep(6700.0, 8600.0, zAsl) * (1.0 - smoothstep(10850.0, 11950.0, zAsl));
+    float hiBase = max(4800.0, uHighBaseAslM);
+    float hiTop = max(hiBase + 950.0, uHighTopAslM);
+    float ciGenBand = smoothstep(hiBase - 450.0, hiBase + 650.0, zAsl)
+                    * (1.0 - smoothstep(hiTop - 250.0, hiTop + 750.0, zAsl));
     float ciMask = smoothstep(1.0 - highCov * 0.72 - 0.04, 1.0 - highCov * 0.28 + 0.16, ciWave);
     float qiTarget = highCov * ciMask * ciGenBand * 0.00048 * uCirrusIceBoost
                    * (1.0 + 0.28 * clamp(vel.z, -0.8, 1.6));
 
-    if (zAsl >= 6400.0) {
+    if (zAsl >= hiBase - 750.0) {
       qi = mix(qi, qiTarget, clamp(0.052 * dt, 0.0, 0.28));
       // Bergeron glaciation from supercooled mid/high liquid
       if (tempK < 253.0 && qc > 1e-5) {
@@ -1034,7 +968,7 @@ const FLUID_ADVECT_MICROPHYSICS_FRAGMENT_GLSL3 = /* glsl */ `
         qi += freeze * 0.65;
       }
     } else {
-      // Ice crystals falling below 6.4 km sublimate smoothly into dry mid-tropospheric air (mares' tail tips!)
+      // Ice crystals falling below cirrus base sublimate smoothly into drier mid-tropospheric air (mares' tail tips!)
       qi *= exp(-0.20 * dt);
     }
     qi = clamp(qi, 0.0, 0.00090);
@@ -1398,6 +1332,28 @@ const SAMPLE_FLUID_VOLUME_HELPER_GLSL3 = /* glsl */ `
   uniform sampler2D uMesoscaleCloudTex;
   uniform float uMesoscaleSpanM;
   uniform float uHasMesoscaleGrid;
+  uniform float uZBaseM;
+  uniform float uZTopM;
+  uniform float uFogCloudPct;
+  uniform float uFogBaseAslM;
+  uniform float uFogTopAslM;
+  uniform float uLowBaseAslM;
+  uniform float uLowTopAslM;
+  uniform float uMidBaseAslM;
+  uniform float uMidTopAslM;
+  uniform float uHighBaseAslM;
+  uniform float uHighTopAslM;
+
+  float sToAltitudeM(float s) {
+    float span = max(1000.0, uZTopM - uZBaseM);
+    return uZBaseM + span * (0.26 * s + 0.74 * s * s);
+  }
+
+  float altitudeToS(float zAsl) {
+    float span = max(1000.0, uZTopM - uZBaseM);
+    float zeta = clamp((zAsl - uZBaseM) / span, 0.0, 1.0);
+    return clamp((-0.26 + sqrt(0.0676 + 2.96 * zeta)) / 1.48, 0.0, 1.0);
+  }
 
   vec4 sampleFluidMacro(vec2 uvWorld, float s) {
     if (uUseGpuAtlas > 0.5) {
@@ -1455,14 +1411,29 @@ const SAMPLE_FLUID_VOLUME_HELPER_GLSL3 = /* glsl */ `
     if (uHasMesoscaleGrid > 0.5) {
       float mesoBlend = smoothstep(domainXyM * 0.48, domainXyM * 1.45, radialDist);
       if (mesoBlend > 0.005) {
+        float zAsl = sToAltitudeM(s);
         vec2 mesoUv = clamp(en / max(20000.0, uMesoscaleSpanM) + 0.5, 0.02, 0.98);
         vec4 meso = texture(uMesoscaleCloudTex, mesoUv); // R=low, G=mid, B=high, A=fog/inv
-        float lowVert = (1.0 - smoothstep(0.32, 0.52, s)) * smoothstep(0.01, 0.08, s);
-        float midVert = smoothstep(0.28, 0.44, s) * (1.0 - smoothstep(0.62, 0.78, s));
-        float highVert = smoothstep(0.60, 0.76, s) * (1.0 - smoothstep(0.93, 1.0, s));
+
+        float fogTop = max(uFogBaseAslM + 80.0, uFogTopAslM);
+        float fogVert = smoothstep(uFogBaseAslM - 55.0, uFogBaseAslM + 35.0, zAsl)
+                      * (1.0 - smoothstep(fogTop - 30.0, fogTop + 95.0, zAsl));
+        float cuTop = max(uLowBaseAslM + 320.0, uLowTopAslM);
+        float lowVert = smoothstep(uLowBaseAslM - 75.0, uLowBaseAslM + 95.0, zAsl)
+                      * (1.0 - smoothstep(cuTop - 160.0, cuTop + 260.0, zAsl));
+        float midTop = max(uMidBaseAslM + 480.0, uMidTopAslM);
+        float midVert = smoothstep(uMidBaseAslM - 220.0, uMidBaseAslM + 180.0, zAsl)
+                      * (1.0 - smoothstep(midTop - 220.0, midTop + 280.0, zAsl));
+        float hiBase = max(4800.0, uHighBaseAslM);
+        float hiTop = max(hiBase + 950.0, uHighTopAslM);
+        float highVert = smoothstep(hiBase - 450.0, hiBase + 650.0, zAsl)
+                       * (1.0 - smoothstep(hiTop - 250.0, hiTop + 750.0, zAsl));
+
         float cellMod = clamp(0.45 + 0.95 * max(farFl.r, nearFl.r * 0.75), 0.35, 1.30);
         float iceMod  = clamp(0.45 + 0.95 * max(farFl.g, nearFl.g * 0.75), 0.35, 1.30);
-        float mesoLiq = sqrt(clamp((max(meso.r, meso.a * 0.9) * lowVert + meso.g * midVert) * cellMod, 0.0, 1.0));
+        float fogActive = (uFogCloudPct > 1.5 || meso.a > 0.18) ? (meso.a * fogVert) : 0.0;
+        float cuActive = max(0.0, meso.r - fogActive * 0.55) * lowVert;
+        float mesoLiq = sqrt(clamp((max(fogActive, cuActive) + meso.g * midVert) * cellMod, 0.0, 1.0));
         float mesoIce = sqrt(clamp(meso.b * highVert * iceMod, 0.0, 1.0));
         combinedCloud.x = mix(combinedCloud.x, mesoLiq, mesoBlend * 0.85);
         combinedCloud.y = mix(combinedCloud.y, mesoIce, mesoBlend * 0.85);
@@ -1490,8 +1461,6 @@ const CLOUD_SHADOW_MAP_FRAGMENT_GLSL3 = /* glsl */ `
   uniform sampler3D uDetailNoise3D;
   uniform vec3 uSunDirWorld;
   uniform float uDomainXyM;
-  uniform float uZBaseM;
-  uniform float uZTopM;
   uniform float uMinElevM;
   uniform float uLclAltM;
   uniform float uInversionBaseM;
@@ -1502,12 +1471,6 @@ const CLOUD_SHADOW_MAP_FRAGMENT_GLSL3 = /* glsl */ `
   uniform vec2 uWind500;
   uniform vec2 uWindAdvectSfc;
   uniform vec2 uWindAdvectJet;
-
-  float altitudeToS(float zAsl) {
-    float span = max(1000.0, uZTopM - uZBaseM);
-    float zeta = clamp((zAsl - uZBaseM) / span, 0.0, 1.0);
-    return clamp((-0.26 + sqrt(0.0676 + 2.96 * zeta)) / 1.48, 0.0, 1.0);
-  }
 
   float sampleShadowTerrainLocalY(vec2 worldXZ) {
     if (uHasHeightTex < 0.5) return 0.0;
@@ -1532,8 +1495,6 @@ const CLOUD_SHADOW_MAP_FRAGMENT_GLSL3 = /* glsl */ `
     float stepM = mix(440.0, 820.0, smoothstep(0.24, 0.02, lightDir.y));
     float dsKm = stepM * 0.001;
 
-    bool convectiveBase = (uLclAltM > uZBaseM + 260.0) && (uInversionBaseM > 680.0);
-
     float tau = 0.0;
     const int STEPS = 20;
     for (int i = 0; i < STEPS; i++) {
@@ -1543,7 +1504,8 @@ const CLOUD_SHADOW_MAP_FRAGMENT_GLSL3 = /* glsl */ `
       if (zAsl > uZTopM) break;
       float s = altitudeToS(zAsl);
       vec4 fl = sampleFluidFieldNonRepeating(p.xz, uDomainXyM, s);
-      float baseGate = convectiveBase ? smoothstep(uLclAltM - 95.0, uLclAltM + 45.0, zAsl) : 1.0;
+      bool aboveFogZone = (uFogCloudPct <= 1.5) || (zAsl > uFogTopAslM + 90.0);
+      float baseGate = aboveFogZone ? smoothstep(uLowBaseAslM - 95.0, uLowBaseAslM + 45.0, zAsl) : 1.0;
       float qc = fl.r * fl.r * uCloudDensityGain * baseGate;
       float qi = fl.g * fl.g * uCirrusDensityGain;
       if (qc + qi > 0.002) {
@@ -1560,44 +1522,21 @@ const CLOUD_SHADOW_MAP_FRAGMENT_GLSL3 = /* glsl */ `
   }
 `;
 
-// Pass B: Full-Atmosphere (0 m .. 12,200 m ASL) Sculptural 3D Volumetric Cloud, Ethereal Gossamer Veil,
-// 1m Kolmogorov Micro-Turbulence, Sheared 3D Cirrus Uncinus & Crepuscular God-Ray Raymarcher!
-const VOLUMETRIC_RAYMARCH_FRAGMENT_GLSL3 = /* glsl */ `
-  precision highp float;
-  precision highp sampler3D;
-
-  in vec2 vUv;
-  out vec4 fragColor;
-
-  uniform sampler2D uSceneDepthTex;
+// Shared 4-Layer Volumetric Extinction Core (used identically by Fullscreen Raymarcher AND 2x1 Async Cloud Hover Probe!)
+const VOLUMETRIC_EXTINCTION_CORE_GLSL3 = /* glsl */ `
   uniform sampler2D uHeightTex;
   uniform float uHasHeightTex;
   ${SAMPLE_FLUID_VOLUME_HELPER_GLSL3}
-  ${CORRIDOR_LUT_HELPER_GLSL3}
   uniform sampler3D uDetailNoise3D;
-
-  uniform mat4 uInvViewProj;
-  uniform mat4 uViewProj;
-  uniform vec3 uCameraPos;
-  uniform vec2 uResolution;
-  uniform float uFrameIndex;
   uniform float uSimTime;
 
   uniform float uSpanM;
   uniform float uMinElevM;
   uniform float uMaxLocalTerrainY;
   uniform float uDomainXyM;
-  uniform float uZBaseM;
-  uniform float uZTopM;
   uniform float uLclAltM;
   uniform float uInversionBaseM;
   uniform float uWaveRegime;
-
-  uniform vec3 uSunDirWorld;
-  uniform float uSunElDeg;
-  uniform vec3 uMoonDirWorld;
-  uniform float uMoonElDeg;
-  uniform float uMoonIllum;
 
   uniform vec2 uWindSfc;
   uniform vec2 uWind500;
@@ -1607,49 +1546,8 @@ const VOLUMETRIC_RAYMARCH_FRAGMENT_GLSL3 = /* glsl */ `
   uniform float uCirrusDensityGain;
   uniform float uMicroDetailGain;
   uniform float uGodRayGain;
-  uniform float uQualitySteps;
 
-  const float PI = 3.14159265359;
   const float EARTH_R_EFF = 7350000.0;
-
-  float isotropicPixelHash(vec2 pix) {
-    vec3 p3 = fract(vec3(pix.xyx) * vec3(0.1031, 0.1030, 0.0973));
-    p3 += dot(p3, p3.yzx + 33.33);
-    return fract((p3.x + p3.y) * p3.z);
-  }
-
-  float hgPhase(float cosTheta, float g) {
-    float g2 = g * g;
-    float denom = max(1e-3, pow(1.0 + g2 - 2.0 * g * cosTheta, 1.5));
-    return (1.0 - g2) / (4.0 * PI * denom);
-  }
-
-  // 3-lobe Mie droplet phase: intense silver-lining diffraction peak + broad forward corona
-  // + opposition glory backscatter + subtle 39-deg primary fogbow!
-  float liquidCloudPhase(float cosTheta) {
-    float silverPeak = hgPhase(cosTheta, 0.86);
-    float coronaGlow = hgPhase(cosTheta, 0.46);
-    float gloryBack  = hgPhase(cosTheta, -0.36);
-    float angleDeg   = degrees(acos(clamp(cosTheta, -1.0, 1.0)));
-    float fogbow     = 0.036 * exp(-pow((angleDeg - 141.0) / 5.5, 2.0));
-    return 0.42 * silverPeak + 0.38 * coronaGlow + 0.20 * gloryBack + fogbow;
-  }
-
-  // Hexagonal ice-crystal phase with crisp forward scattering + 22-deg halo + sundog glint
-  float cirrusIcePhase(float cosTheta) {
-    float forwardPeak = hgPhase(cosTheta, 0.88);
-    float broadIce    = hgPhase(cosTheta, 0.42);
-    float backGlint   = hgPhase(cosTheta, -0.40);
-    float angleDeg    = degrees(acos(clamp(cosTheta, -1.0, 1.0)));
-    float halo22      = 0.115 * exp(-pow((angleDeg - 22.0) / 2.8, 2.0));
-    return 0.48 * forwardPeak + 0.34 * broadIce + 0.18 * backGlint + halo22;
-  }
-
-  float altitudeToS(float zAsl) {
-    float span = max(1000.0, uZTopM - uZBaseM);
-    float zeta = clamp((zAsl - uZBaseM) / span, 0.0, 1.0);
-    return clamp((-0.26 + sqrt(0.0676 + 2.96 * zeta)) / 1.48, 0.0, 1.0);
-  }
 
   float sampleTerrainLocalY(vec2 worldXZ, out float insidePatch) {
     float halfSpan = uSpanM * 0.5;
@@ -1698,13 +1596,13 @@ const VOLUMETRIC_RAYMARCH_FRAGMENT_GLSL3 = /* glsl */ `
     float nyquistM = max(stepFootprintM * 0.52, distToCam * 0.0015);
 
     if (qcMacro > 0.0006) {
-      // Architectural flat condensation floor at LCL for convective cumulus regimes,
-      // while preserving valley-hugging coastal marine stratus decks when inversion is low!
-      bool convectiveBase = (uLclAltM > uZBaseM + 260.0) && (uInversionBaseM > 680.0);
-      float flatBaseGate = convectiveBase
-        ? smoothstep(uLclAltM - 75.0, uLclAltM + 42.0, zAsl)
-        : 1.0;
-      float heightAboveBase = max(0.0, zAsl - (convectiveBase ? uLclAltM : (uZBaseM + 120.0)));
+      // Preserve sub-inversion marine stratus/fog below uFogTopAslM while keeping crisp cumulus condensation floor at uLowBaseAslM!
+      bool inFogDeck = (uFogCloudPct > 1.5) && (zAsl <= uFogTopAslM + 95.0);
+      float flatBaseGate = inFogDeck
+        ? smoothstep(uFogBaseAslM - 55.0, uFogBaseAslM + 20.0, zAsl)
+        : smoothstep(uLowBaseAslM - 85.0, uLowBaseAslM + 40.0, zAsl);
+      float activeBase = inFogDeck ? uFogBaseAslM : uLowBaseAslM;
+      float heightAboveBase = max(0.0, zAsl - activeBase);
       float hTower = clamp(heightAboveBase / 1650.0, 0.0, 1.0);
 
       if (detailLevel == 0) {
@@ -1725,11 +1623,11 @@ const VOLUMETRIC_RAYMARCH_FRAGMENT_GLSL3 = /* glsl */ `
         vec2 windLocal = mix(uWindSfc, uWind500, midBlend);
         vec3 pAdv = posWorld - vec3(windLocal.x, 0.16 * wTurb, -windLocal.y) * uSimTime;
 
-        // Regime morphing: sleek laminar airfoil lenses in high-wave regimes vs billowing cauliflower cumulus
-        float waveLaminar = smoothstep(1.42, 2.05, uWaveRegime) * smoothstep(1400.0, 2600.0, zAsl);
+        // Smooth laminar airfoil lenses within the mid-tropospheric standing-wave band vs billowing cauliflower cumulus below
+        float inMidBand = smoothstep(uMidBaseAslM - 350.0, uMidBaseAslM + 250.0, zAsl)
+                        * (1.0 - smoothstep(uMidTopAslM - 150.0, uMidTopAslM + 450.0, zAsl));
+        float waveLaminar = smoothstep(1.22, 1.85, uWaveRegime) * inMidBand;
 
-        // True meteorological cumulus dome wavelengths (3400m -> 850m/425m/212m lobes; 1020m -> 255m/127m florets)
-        // Band-limited with hardware trilinear 3D mipmaps (textureLod) to eliminate ray-step stippling!
         float mesoLambda = mix(3400.0, 4200.0, waveLaminar);
         vec3 mesoScale = mix(vec3(1.0 / 3400.0), vec3(1.0 / 4400.0, 1.0 / 950.0, 1.0 / 3600.0), waveLaminar);
         float mipMeso = clamp(log2(max(1.0, nyquistM / (mesoLambda / 64.0))), 0.0, 3.5);
@@ -1738,8 +1636,8 @@ const VOLUMETRIC_RAYMARCH_FRAGMENT_GLSL3 = /* glsl */ `
         float mipTurret = clamp(log2(max(1.0, nyquistM / (1020.0 / 64.0))), 0.0, 3.8);
         vec4 dTurret = textureLod(uDetailNoise3D, pAdv * (1.0 / 1020.0) + vec3(dMeso.b * 0.10, 0.23, dMeso.r * 0.08), mipTurret);
 
-        // Smooth 3D Cauliflower Dome Displacement using ONLY broad macro lobes (zero high-freq stipple!)
-        float lobeAmp = (1.0 - waveLaminar * 0.88) * smoothstep(0.0, 0.26, hTower);
+        float fogFlatten = inFogDeck ? 0.35 : 1.0;
+        float lobeAmp = (1.0 - waveLaminar * 0.88) * smoothstep(0.0, 0.26, hTower) * fogFlatten;
         vec2 dispXZ = (vec2(dMeso.r, dMeso.g) - 0.5) * 420.0 * (0.40 + 0.60 * lobeAmp);
         float dispZ = (dMeso.r - 0.48) * 320.0 * lobeAmp;
         float sWarped = altitudeToS(zAsl - dispZ);
@@ -1749,14 +1647,13 @@ const VOLUMETRIC_RAYMARCH_FRAGMENT_GLSL3 = /* glsl */ `
         float updraftInflate = clamp(0.5 + 0.5 * wTurb, 0.0, 1.0);
         float domeShape = mix(0.64 * dMeso.r + 0.36 * dTurret.r, 0.74 * dMeso.r + 0.26 * dMeso.b, waveLaminar);
 
-        // Creamy voluptuous 3D cauliflower billows & clefts vs sleek stacked lenticular airfoil laminae
         float billowWeight = clamp(95.0 / max(nyquistM, 18.0), 0.30, 1.0);
         float cauliflowerClefts = mix(1.0 - dMeso.g, (1.0 - dTurret.g) * 0.62 + (1.0 - dMeso.g) * 0.38, billowWeight);
         float airfoilStrata = 0.5 + 0.5 * sin(zAsl * 0.020 + dMeso.b * 2.0);
         float lenticularTrim = (1.0 - airfoilStrata) * 0.46 + (1.0 - dMeso.r) * 0.14;
         float erode = mix(cauliflowerClefts, lenticularTrim, waveLaminar);
 
-        // 1. Voluptuous sculptural 3D cumulus core
+        // 1. Voluptuous sculptural 3D cloud core
         float rawCore = qcWarped * (0.58 + 0.98 * domeShape)
                       - (0.28 - 0.09 * updraftInflate) * erode * (1.0 - clamp(qcWarped * 0.68, 0.0, 0.82));
         float coreSculpt = max(0.0, rawCore);
@@ -1770,7 +1667,6 @@ const VOLUMETRIC_RAYMARCH_FRAGMENT_GLSL3 = /* glsl */ `
         float gossamer = qcHalo * (0.42 * rimZone * filamentWisp + 0.18 * virgaZone * dMeso.b);
 
         if ((coreSculpt + gossamer) > 0.0004 && distToCam < 4500.0) {
-          // Near-field 15m -> 1m Kelvin-Helmholtz curls & Kolmogorov gossamer wisps (strictly Nyquist-gated!)
           float lodNear = exp(-distToCam / 1800.0) * clamp(28.0 / max(nyquistM, 4.0), 0.0, 1.0) * uMicroDetailGain * (1.0 - waveLaminar * 0.6);
           if (lodNear > 0.02) {
             float mipFine = clamp(log2(max(1.0, nyquistM / (192.0 / 64.0))), 0.0, 3.5);
@@ -1787,13 +1683,15 @@ const VOLUMETRIC_RAYMARCH_FRAGMENT_GLSL3 = /* glsl */ `
       }
     }
 
-    // Upper-Tropospheric 3D Cirrus Uncinus, Floccus Generating Heads & Vertebratus Wave Ribs (6.35 - 12.1 km)
+    // Upper-Tropospheric 3D Cirrus Uncinus, Floccus Generating Heads & Vertebratus Wave Ribs ([uHighBaseAslM, uHighTopAslM])
     float sigmaIce = 0.0;
-    if (qiMacro > 0.016 && zAsl >= 6300.0) {
+    float hiFloor = max(4600.0, uHighBaseAslM - 900.0);
+    if (qiMacro > 0.016 && zAsl >= hiFloor) {
       if (detailLevel < 2) {
         sigmaIce = qiMacro * smoothstep(0.06, 0.48, qiMacro) * 0.0038;
       } else {
-        float fallDepthKm = clamp((10850.0 - zAsl) * 0.001, -1.1, 4.3);
+        float hiTopRef = max(uHighBaseAslM + 950.0, uHighTopAslM);
+        float fallDepthKm = clamp((hiTopRef - zAsl) * 0.001, -1.1, 4.5);
         vec2 shearVec = (uWind250 - uWind500) * 52.0;
         vec2 hookOffset = shearVec * (fallDepthKm * 0.52 + 0.28 * fallDepthKm * fallDepthKm);
 
@@ -1811,7 +1709,7 @@ const VOLUMETRIC_RAYMARCH_FRAGMENT_GLSL3 = /* glsl */ `
         vec4 ciTex = textureLod(uDetailNoise3D, ciCoord, mipCi);
         vec4 ciFine = textureLod(uDetailNoise3D, ciCoord * 3.2 + vec3(ciTex.b * 0.16, ciTex.r * 0.12, 0.0), min(3.5, mipCi + 1.0));
 
-        float headWeight = smoothstep(9500.0, 10950.0, zAsl);
+        float headWeight = smoothstep(hiTopRef - 1150.0, hiTopRef + 100.0, zAsl);
         float vertRib = 0.72 + 0.28 * sin(alongJet * (1.0 / 390.0) + ciTex.r * 3.2);
         float silkStrands = ciTex.b * (0.42 + 0.78 * ciFine.b) * vertRib;
         float tuftHeads = ciTex.g * (0.55 + 0.55 * ciFine.r);
@@ -1830,6 +1728,174 @@ const VOLUMETRIC_RAYMARCH_FRAGMENT_GLSL3 = /* glsl */ `
     float sigmaHaze = (0.0000042 + 0.000074 * rhHaze * lowAirWeight) * uGodRayGain * farHorizonFade;
 
     return vec4(sigmaLiq, sigmaIce, sigmaHaze, gossamerFrac);
+  }
+`;
+
+// Zero-Stall 2x1 GPU Cloud-Ray Picker (`cloudProbeRT`, 32 bytes async PBO readback):
+// Marches cursor ray through the exact 3D sculpted extinction field to identify the hovered cloud layer,
+// physical ASL altitude, slant distance, and per-layer optical depth!
+const CLOUD_PROBE_FRAGMENT_GLSL3 = /* glsl */ `
+  precision highp float;
+  precision highp sampler3D;
+
+  out vec4 fragColor;
+
+  ${VOLUMETRIC_EXTINCTION_CORE_GLSL3}
+  uniform vec3 uProbeOrigin;
+  uniform vec3 uProbeDir;
+  uniform float uProbeMaxDist;
+
+  void main() {
+    int px = int(gl_FragCoord.x);
+    vec3 rayDir = normalize(uProbeDir);
+    float maxDist = clamp(uProbeMaxDist, 10.0, 118000.0);
+    float gamma = maxDist > 16000.0 ? 2.28 : 1.35;
+
+    float transmittance = 1.0;
+    float visWeightSum = 0.0;
+    float weightedDistM = 0.0;
+    float weightedAltM = 0.0;
+    float firstHitDistM = -1.0;
+
+    float tauFog = 0.0;
+    float tauLow = 0.0;
+    float tauMid = 0.0;
+    float tauHigh = 0.0;
+
+    float fogSplitZ = (uFogCloudPct > 1.5)
+      ? (uFogTopAslM + max(75.0, 0.35 * max(0.0, uLowBaseAslM - uFogTopAslM)))
+      : -9999.0;
+    float midSplitZ = 0.5 * (uLowTopAslM + uMidBaseAslM);
+    float highSplitZ = 0.5 * (uMidTopAslM + max(4800.0, uHighBaseAslM));
+
+    const int PROBE_STEPS = 60;
+    float prevT = 0.0;
+
+    for (int i = 0; i < PROBE_STEPS; i++) {
+      float u1 = float(i + 1) / float(PROBE_STEPS);
+      float tStart = prevT;
+      float tEnd = maxDist * pow(u1, gamma);
+      prevT = tEnd;
+
+      float dt = max(0.5, tEnd - tStart);
+      float tMid = 0.5 * (tStart + tEnd);
+      vec3 pos = uProbeOrigin + rayDir * tMid;
+      float horizDist2 = dot(pos.xz - uProbeOrigin.xz, pos.xz - uProbeOrigin.xz);
+      float zAsl = pos.y + uMinElevM - horizDist2 / (2.0 * EARTH_R_EFF);
+
+      if (zAsl > uZTopM + 160.0) {
+        if (rayDir.y > 0.05) break;
+        continue;
+      }
+      if (zAsl < uZBaseM - 60.0) {
+        continue;
+      }
+
+      vec4 sigmas = sampleAtmosphereExtinction(pos, zAsl, tMid, dt, 2);
+      float sigmaLiq = sigmas.x;
+      float sigmaIce = sigmas.y;
+      float sigmaCloud = sigmaLiq + sigmaIce;
+      if (sigmaCloud <= 2.0e-6) {
+        continue;
+      }
+
+      float dTau = sigmaCloud * dt;
+      float stepAbsorb = 1.0 - exp(-dTau);
+      float visW = transmittance * stepAbsorb;
+
+      visWeightSum += visW;
+      weightedDistM += visW * tMid;
+      weightedAltM += visW * zAsl;
+
+      if (sigmaIce > sigmaLiq * 0.65 || zAsl >= highSplitZ) {
+        tauHigh += visW;
+      } else if (zAsl <= fogSplitZ) {
+        tauFog += visW;
+      } else if (zAsl >= midSplitZ) {
+        tauMid += visW;
+      } else {
+        tauLow += visW;
+      }
+
+      transmittance *= (1.0 - stepAbsorb);
+      if (firstHitDistM < 0.0 && (1.0 - transmittance) >= 0.032) {
+        firstHitDistM = tMid;
+      }
+      if (transmittance < 0.015) {
+        break;
+      }
+    }
+
+    float cloudAlpha = clamp(1.0 - transmittance, 0.0, 1.0);
+    if (px == 0) {
+      float meanDist = visWeightSum > 1.0e-5 ? (weightedDistM / visWeightSum) : 0.0;
+      float meanAlt = visWeightSum > 1.0e-5 ? (weightedAltM / visWeightSum) : 0.0;
+      fragColor = vec4(cloudAlpha, meanDist, meanAlt, firstHitDistM > 0.0 ? firstHitDistM : meanDist);
+    } else {
+      fragColor = vec4(tauFog, tauLow, tauMid, tauHigh);
+    }
+  }
+`;
+
+// Pass B: Full-Atmosphere (0 m .. 12,200 m ASL) Sculptural 3D Volumetric Cloud, Ethereal Gossamer Veil,
+// 1m Kolmogorov Micro-Turbulence, Sheared 3D Cirrus Uncinus & Crepuscular God-Ray Raymarcher!
+const VOLUMETRIC_RAYMARCH_FRAGMENT_GLSL3 = /* glsl */ `
+  precision highp float;
+  precision highp sampler3D;
+
+  in vec2 vUv;
+  out vec4 fragColor;
+
+  uniform sampler2D uSceneDepthTex;
+  ${VOLUMETRIC_EXTINCTION_CORE_GLSL3}
+  ${CORRIDOR_LUT_HELPER_GLSL3}
+
+  uniform mat4 uInvViewProj;
+  uniform mat4 uViewProj;
+  uniform vec3 uCameraPos;
+  uniform vec2 uResolution;
+  uniform float uFrameIndex;
+
+  uniform vec3 uSunDirWorld;
+  uniform float uSunElDeg;
+  uniform vec3 uMoonDirWorld;
+  uniform float uMoonElDeg;
+  uniform float uMoonIllum;
+  uniform float uQualitySteps;
+
+  const float PI = 3.14159265359;
+
+  float isotropicPixelHash(vec2 pix) {
+    vec3 p3 = fract(vec3(pix.xyx) * vec3(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+  }
+
+  float hgPhase(float cosTheta, float g) {
+    float g2 = g * g;
+    float denom = max(1e-3, pow(1.0 + g2 - 2.0 * g * cosTheta, 1.5));
+    return (1.0 - g2) / (4.0 * PI * denom);
+  }
+
+  // 3-lobe Mie droplet phase: intense silver-lining diffraction peak + broad forward corona
+  // + opposition glory backscatter + subtle 39-deg primary fogbow!
+  float liquidCloudPhase(float cosTheta) {
+    float silverPeak = hgPhase(cosTheta, 0.86);
+    float coronaGlow = hgPhase(cosTheta, 0.46);
+    float gloryBack  = hgPhase(cosTheta, -0.36);
+    float angleDeg   = degrees(acos(clamp(cosTheta, -1.0, 1.0)));
+    float fogbow     = 0.036 * exp(-pow((angleDeg - 141.0) / 5.5, 2.0));
+    return 0.42 * silverPeak + 0.38 * coronaGlow + 0.20 * gloryBack + fogbow;
+  }
+
+  // Hexagonal ice-crystal phase with crisp forward scattering + 22-deg halo + sundog glint
+  float cirrusIcePhase(float cosTheta) {
+    float forwardPeak = hgPhase(cosTheta, 0.88);
+    float broadIce    = hgPhase(cosTheta, 0.42);
+    float backGlint   = hgPhase(cosTheta, -0.40);
+    float angleDeg    = degrees(acos(clamp(cosTheta, -1.0, 1.0)));
+    float halo22      = 0.115 * exp(-pow((angleDeg - 22.0) / 2.8, 2.0));
+    return 0.48 * forwardPeak + 0.34 * broadIce + 0.18 * backGlint + halo22;
   }
 
   float sampleTerrainSunVisibility(vec3 posWorld, vec3 lightDir) {
@@ -2385,6 +2451,7 @@ export class VolumetricAtmosphereEngine {
     };
 
     this.onTelemetryCallback = null;
+    this.onCloudProbeCallback = null;
     this.pendingRaycastCallbacks = new Map();
     this.nextRaycastReqId = 1;
 
@@ -2403,6 +2470,14 @@ export class VolumetricAtmosphereEngine {
     this._historyValid = false;
     this._telemetryPbo = null;
     this._telemetryFence = null;
+    this.cloudProbeRT = null;
+    this.cloudProbePass = null;
+    this._probeBuf = null;
+    this._probePbo = null;
+    this._probeFence = null;
+    this._pendingProbeReq = null;
+    this._inflightProbeMeta = null;
+    this._probeCancelled = false;
 
     this._init3DTextures();
     this._initRenderTargetsAndPasses();
@@ -2500,6 +2575,19 @@ export class VolumetricAtmosphereEngine {
       uMesoscaleCloudTex: { value: this.mesoscaleCloudTex },
       uMesoscaleSpanM: { value: 160000.0 },
       uHasMesoscaleGrid: { value: 0.0 },
+    };
+
+    // Shared 4-layer physical altitude envelope uniforms across Fluid Solver, Shadow Map, Raymarcher & Hover Probe
+    this.layerEnvelopeUniforms = {
+      uFogCloudPct: { value: DEFAULT_ATMOSPHERE_PARAMS.fogCloudPct },
+      uFogBaseAslM: { value: DEFAULT_ATMOSPHERE_PARAMS.fogBaseAslM },
+      uFogTopAslM: { value: DEFAULT_ATMOSPHERE_PARAMS.fogTopAslM },
+      uLowBaseAslM: { value: DEFAULT_ATMOSPHERE_PARAMS.lowBaseAslM },
+      uLowTopAslM: { value: DEFAULT_ATMOSPHERE_PARAMS.lowTopAslM },
+      uMidBaseAslM: { value: DEFAULT_ATMOSPHERE_PARAMS.midBaseAslM },
+      uMidTopAslM: { value: DEFAULT_ATMOSPHERE_PARAMS.midTopAslM },
+      uHighBaseAslM: { value: DEFAULT_ATMOSPHERE_PARAMS.highBaseAslM },
+      uHighTopAslM: { value: DEFAULT_ATMOSPHERE_PARAMS.highTopAslM },
     };
   }
 
@@ -2636,7 +2724,8 @@ export class VolumetricAtmosphereEngine {
       uZTopM: { value: 12200.0 },
       uSurfaceTempC: { value: 14.0 },
       uSurfaceRhPct: { value: 84.0 },
-      uLowCloudPct: { value: 52.0 },
+      ...this.layerEnvelopeUniforms,
+      uLowCloudPct: { value: 24.0 },
       uMidCloudPct: { value: 20.0 },
       uHighCloudPct: { value: 48.0 },
       uInversionBaseM: { value: 380.0 },
@@ -2901,12 +2990,16 @@ export class VolumetricAtmosphereEngine {
     const rh = Math.max(15, Math.min(100, p.surfaceRhPct ?? 80));
     const dewSpreadC = ((100 - rh) / 5.0);
     const zBase = this.telemetry.zBaseM;
-    const lclM = zBase + Math.max(80, dewSpreadC * 125.0);
+    const computedLclM = zBase + Math.max(80, dewSpreadC * 125.0);
+    const lclM = (p.fogCloudPct ?? 0) > 5.0
+      ? (p.fogBaseAslM ?? computedLclM)
+      : (p.lowBaseAslM ?? computedLclM);
     const freezeM = Math.max(zBase + 300, zBase + (tC / 6.3) * 1000.0 + (p.inversionStrengthK ?? 4) * 55.0);
     const wind850 = Math.hypot(p.wind850U ?? 8, p.wind850V ?? -2);
     const reliefM = Math.max(250, (this.terrainMeta.maxElevM || 1200) - zBase);
     const bvN = 0.011 + 0.0008 * (p.inversionStrengthK ?? 4);
-    const froude = Math.min(2.8, Math.max(0.18, wind850 / Math.max(1.5, bvN * reliefM)));
+    const computedFroude = Math.min(2.8, Math.max(0.18, wind850 / Math.max(1.5, bvN * reliefM)));
+    const froude = p.froudeNumber ?? computedFroude;
     const shear250_500 = Math.hypot(
       (p.wind250U ?? 36) - (p.wind500U ?? 18),
       (p.wind250V ?? 14) - (p.wind500V ?? 5)
@@ -2914,7 +3007,7 @@ export class VolumetricAtmosphereEngine {
 
     this.telemetry.lclAltitudeM = lclM;
     this.telemetry.freezingLevelM = freezeM;
-    this.telemetry.glaciationCirrusBaseM = Math.max(6800, freezeM + 4100);
+    this.telemetry.glaciationCirrusBaseM = p.highBaseAslM ?? Math.max(6800, freezeM + 4100);
     this.telemetry.maxUpdraftMs = maxW;
     this.telemetry.maxLiquidGKg = maxQc;
     this.telemetry.maxIceGKg = maxQi;
@@ -3043,6 +3136,7 @@ export class VolumetricAtmosphereEngine {
         uCloudVolume3D: { value: this.cloudVolumeTex },
         uUseGpuAtlas: { value: 0.0 },
         ...this.mesoscaleUniforms,
+        ...this.layerEnvelopeUniforms,
         uDetailNoise3D: { value: this.detailNoiseTex },
         uSunDirWorld: { value: new THREE.Vector3(-0.85, 0.15, 0.2).normalize() },
         uDomainXyM: { value: 18000.0 },
@@ -3078,6 +3172,7 @@ export class VolumetricAtmosphereEngine {
         uUseGpuAtlas: { value: 0.0 },
         ...this.mesoscaleUniforms,
         ...this.corridorUniforms,
+        ...this.layerEnvelopeUniforms,
         uDetailNoise3D: { value: this.detailNoiseTex },
         uInvViewProj: { value: new THREE.Matrix4() },
         uViewProj: { value: new THREE.Matrix4() },
@@ -3113,6 +3208,31 @@ export class VolumetricAtmosphereEngine {
     });
     this.volumetricScene = new THREE.Scene();
     this.volumetricScene.add(new THREE.Mesh(fsGeo, this.volumetricMat));
+
+    // 6. 2x1 Float Async GPU Cloud-Hover Picker (`cloudProbeRT`, 32-byte zero-stall PBO readback)
+    if (this.supportsFloatFBO) {
+      this.cloudProbeRT = new THREE.WebGLRenderTarget(2, 1, {
+        minFilter: THREE.NearestFilter,
+        magFilter: THREE.NearestFilter,
+        format: THREE.RGBAFormat,
+        type: THREE.FloatType,
+        depthBuffer: false,
+      });
+      this._probeBuf = new Float32Array(8);
+      if (this._supportsAsyncFloatPbo) {
+        const gl = this.renderer.getContext();
+        this._probePbo = gl.createBuffer();
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this._probePbo);
+        gl.bufferData(gl.PIXEL_PACK_BUFFER, this._probeBuf.byteLength, gl.STREAM_READ);
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+      }
+      this.cloudProbePass = this._createComputeScene(CLOUD_PROBE_FRAGMENT_GLSL3, {
+        ...this.volumetricMat.uniforms,
+        uProbeOrigin: { value: new THREE.Vector3() },
+        uProbeDir: { value: new THREE.Vector3(0, 0.1, -1) },
+        uProbeMaxDist: { value: 116000.0 },
+      });
+    }
 
     this.temporalResolveMat = new THREE.ShaderMaterial({
       glslVersion: THREE.GLSL3,
@@ -3314,8 +3434,7 @@ export class VolumetricAtmosphereEngine {
     if (typeof lutPayload.sun_elevation_deg === 'number') {
       this.corridorUniforms.uCorridorLutSunElDeg.value = lutPayload.sun_elevation_deg;
     }
-    this.corridorUniforms.uUseCorridorAtmo.value =
-      this._hasCorridorAtmoData && this.activePreset === 'live' ? 1.0 : 0.0;
+    this.corridorUniforms.uUseCorridorAtmo.value = this._hasCorridorAtmoData ? 1.0 : 0.0;
     this._needsTerrainBake = true;
   }
 
@@ -3367,7 +3486,7 @@ export class VolumetricAtmosphereEngine {
     this.mesoscaleCloudTex.needsUpdate = true;
     this.mesoscaleUniforms.uMesoscaleSpanM.value = gridPayload.span_m || 160000.0;
     this._hasLoadedMesoscaleGrid = true;
-    this.mesoscaleUniforms.uHasMesoscaleGrid.value = this.activePreset === 'live' ? 1.0 : 0.0;
+    this.mesoscaleUniforms.uHasMesoscaleGrid.value = 1.0;
   }
 
   setQualityMode(mode) {
@@ -3386,8 +3505,7 @@ export class VolumetricAtmosphereEngine {
   }
 
   setPreset(presetKey) {
-    if (!WEATHER_REGIME_PRESETS[presetKey]) return;
-    this.activePreset = presetKey;
+    this.activePreset = WEATHER_REGIME_PRESETS[presetKey] ? presetKey : 'live';
     this.syncWeatherParamsToWorker(true);
   }
 
@@ -3552,15 +3670,29 @@ export class VolumetricAtmosphereEngine {
       const rad = ((weather.wind_dir_deg || 285) * Math.PI) / 180;
       const uSfc = -spdMs * Math.sin(rad);
       const vSfc = -spdMs * Math.cos(rad);
+      const fogTopM = (weather.fog_top_ft || 1200) * 0.3048;
+      const fogBaseM = Math.max(40.0, ((weather.fog_base_ft || 350) * 0.3048));
+      const lowPct = weather.cloud_low_pct ?? 45;
+      const hasMarine = Boolean(weather.fog_present) || (weather.fog_probability_pct ?? 0) >= 35;
       this.liveWeatherParams = {
         surfaceTempC: ((weather.temp_sunset_f ?? 58) - 32) * (5 / 9),
         surfaceRhPct: 82,
-        lowCloudPct: weather.cloud_low_pct ?? 45,
+        fogCloudPct: hasMarine ? lowPct * 0.75 : 0.0,
+        fogBaseAslM: fogBaseM,
+        fogTopAslM: Math.max(fogBaseM + 160.0, fogTopM),
+        cumulusCloudPct: hasMarine ? lowPct * 0.35 : lowPct,
+        lowCloudPct: lowPct,
+        lowBaseAslM: Math.max(fogTopM + 320.0, 950.0),
+        lowTopAslM: Math.max(fogTopM + 1100.0, 1900.0),
         midCloudPct: weather.cloud_mid_pct ?? 22,
+        midBaseAslM: 3200.0,
+        midTopAslM: 4600.0,
         highCloudPct: weather.cloud_high_pct ?? 42,
-        inversionBaseM: (weather.fog_top_ft || 1200) * 0.3048,
+        highBaseAslM: 7800.0,
+        highTopAslM: 10400.0,
+        inversionBaseM: fogTopM,
         inversionThicknessM: 220,
-        inversionStrengthK: 6.0,
+        inversionStrengthK: hasMarine ? 6.2 : 3.4,
         windSfcU: uSfc,
         windSfcV: vSfc,
         wind850U: uSfc * 1.4,
@@ -3569,21 +3701,19 @@ export class VolumetricAtmosphereEngine {
         wind500V: 5.0,
         wind250U: 38.0,
         wind250V: 14.0,
-        convectiveCape: 280,
+        convectiveCape: 260,
         orographicWaveGain: 1.15,
         vorticityConfinement: 1.15,
         cirrusIceBoost: 1.0,
         seed: 1337,
       };
     }
-    if (this.activePreset === 'live') {
-      this.syncWeatherParamsToWorker(true);
-    }
+    this.syncWeatherParamsToWorker(true);
   }
 
   getEffectiveParams() {
     const presetObj = WEATHER_REGIME_PRESETS[this.activePreset];
-    const base = this.liveWeatherParams || WEATHER_REGIME_PRESETS.coastal_fog_sea.overrides;
+    const base = this.liveWeatherParams || DEFAULT_ATMOSPHERE_PARAMS;
     const merged = presetObj && presetObj.overrides ? { ...base, ...presetObj.overrides } : { ...base };
     merged.solarElevationDeg = this.volumetricMat.uniforms.uSunElDeg.value;
     const sd = this.volumetricMat.uniforms.uSunDirWorld.value;
@@ -3592,33 +3722,48 @@ export class VolumetricAtmosphereEngine {
   }
 
   syncWeatherParamsToWorker(reseed = false) {
-    const isLive = this.activePreset === 'live';
     this.corridorUniforms.uUseCorridorAtmo.value =
-      isLive && this._hasLoadedCorridorLut && this._hasCorridorAtmoData ? 1.0 : 0.0;
+      this._hasLoadedCorridorLut && this._hasCorridorAtmoData ? 1.0 : 0.0;
     this.mesoscaleUniforms.uHasMesoscaleGrid.value =
-      isLive && this._hasLoadedMesoscaleGrid ? 1.0 : 0.0;
+      this._hasLoadedMesoscaleGrid ? 1.0 : 0.0;
 
     const p = this.getEffectiveParams();
+    const invBaseM = p.inversionBaseM ?? 380.0;
+    const invTopDefault = invBaseM + Math.min(220.0, (p.inversionThicknessM ?? 200.0) * 0.65);
+    const fogPct = p.fogCloudPct ?? ((p.inversionStrengthK ?? 0) >= 3.5 ? (p.lowCloudPct ?? 0) * 0.65 : 0.0);
+    const cuPct = p.cumulusCloudPct ?? Math.max(0.0, (p.lowCloudPct ?? 35.0) - fogPct * 0.65);
+
+    const le = this.layerEnvelopeUniforms;
+    le.uFogCloudPct.value = fogPct;
+    le.uFogBaseAslM.value = p.fogBaseAslM ?? Math.max(40.0, invBaseM - 220.0);
+    le.uFogTopAslM.value = p.fogTopAslM ?? invTopDefault;
+    le.uLowBaseAslM.value = p.lowBaseAslM ?? Math.max(invTopDefault + 260.0, 940.0);
+    le.uLowTopAslM.value = p.lowTopAslM ?? Math.max(le.uLowBaseAslM.value + 750.0, 1850.0);
+    le.uMidBaseAslM.value = p.midBaseAslM ?? 3200.0;
+    le.uMidTopAslM.value = p.midTopAslM ?? Math.max(le.uMidBaseAslM.value + 900.0, 4600.0);
+    le.uHighBaseAslM.value = p.highBaseAslM ?? 7800.0;
+    le.uHighTopAslM.value = p.highTopAslM ?? Math.max(le.uHighBaseAslM.value + 1600.0, 10400.0);
+
     const u = this.volumetricMat.uniforms;
     u.uWindSfc.value.set(p.windSfcU ?? 5.2, p.windSfcV ?? -3.4);
     u.uWind500.value.set(p.wind500U ?? 18.0, p.wind500V ?? 4.5);
     u.uWind250.value.set(p.wind250U ?? 36.0, p.wind250V ?? 14.0);
-    u.uInversionBaseM.value = p.inversionBaseM ?? 380.0;
+    u.uInversionBaseM.value = invBaseM;
     u.uWaveRegime.value = p.orographicWaveGain ?? 1.15;
 
     this.shadowMat.uniforms.uWindSfc.value.set(p.windSfcU ?? 5.2, p.windSfcV ?? -3.4);
     this.shadowMat.uniforms.uWind500.value.set(p.wind500U ?? 18.0, p.wind500V ?? 4.5);
-    this.shadowMat.uniforms.uInversionBaseM.value = p.inversionBaseM ?? 380.0;
+    this.shadowMat.uniforms.uInversionBaseM.value = invBaseM;
     this._needsShadowBake = true;
 
     if (this.useGpuFluidSolver) {
       const su = this.simUniforms;
       su.uSurfaceTempC.value = p.surfaceTempC ?? 14.0;
       su.uSurfaceRhPct.value = p.surfaceRhPct ?? 82.0;
-      su.uLowCloudPct.value = p.lowCloudPct ?? 48.0;
+      su.uLowCloudPct.value = cuPct;
       su.uMidCloudPct.value = p.midCloudPct ?? 20.0;
       su.uHighCloudPct.value = p.highCloudPct ?? 48.0;
-      su.uInversionBaseM.value = p.inversionBaseM ?? 380.0;
+      su.uInversionBaseM.value = invBaseM;
       su.uInversionThicknessM.value = p.inversionThicknessM ?? 210.0;
       su.uInversionStrengthK.value = p.inversionStrengthK ?? 6.0;
       su.uWindSfc.value.set(p.windSfcU ?? 5.2, p.windSfcV ?? -3.4);
@@ -3809,6 +3954,143 @@ export class VolumetricAtmosphereEngine {
     this.compositeMat.uniforms.uLowResTexel.value.set(1.0 / vw, 1.0 / vh);
   }
 
+  requestCloudProbe(rayOrigin, rayDir, maxDistM = 116000.0, meta = null) {
+    if (!this.supportsFloatFBO || !this.cloudProbePass) return false;
+    this._probeCancelled = false;
+    if (!this._pendingProbeReq) {
+      this._pendingProbeReq = {
+        origin: new THREE.Vector3(),
+        dir: new THREE.Vector3(),
+        maxDist: 116000.0,
+        meta: null,
+      };
+    }
+    this._pendingProbeReq.origin.copy(rayOrigin);
+    this._pendingProbeReq.dir.copy(rayDir).normalize();
+    this._pendingProbeReq.maxDist = Math.max(10.0, Math.min(118000.0, maxDistM));
+    this._pendingProbeReq.meta = meta;
+    return true;
+  }
+
+  cancelCloudProbe() {
+    this._pendingProbeReq = null;
+    this._inflightProbeMeta = null;
+    this._probeCancelled = true;
+  }
+
+  hasPendingCloudProbe() {
+    return Boolean(this._pendingProbeReq || this._probeFence);
+  }
+
+  _pollAsyncCloudProbe() {
+    if (!this._probeFence || !this._probePbo) return;
+    const gl = this.renderer.getContext();
+    const status = gl.clientWaitSync(this._probeFence, 0, 0);
+    if (status === gl.ALREADY_SIGNALED || status === gl.CONDITION_SATISFIED) {
+      gl.deleteSync(this._probeFence);
+      this._probeFence = null;
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this._probePbo);
+      gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, this._probeBuf);
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+      const meta = this._inflightProbeMeta;
+      this._inflightProbeMeta = null;
+      if (!this._probeCancelled) {
+        this._emitCloudProbeResult(meta);
+      }
+    } else if (status === gl.WAIT_FAILED) {
+      gl.deleteSync(this._probeFence);
+      this._probeFence = null;
+      this._inflightProbeMeta = null;
+    }
+  }
+
+  _dispatchPendingCloudProbe(showAtmosphere) {
+    if (!this._pendingProbeReq || this._probeFence || !this.cloudProbePass || !this.cloudProbeRT) {
+      return;
+    }
+    if (!showAtmosphere) {
+      this._pendingProbeReq = null;
+      return;
+    }
+    const req = this._pendingProbeReq;
+    this._pendingProbeReq = null;
+    const pu = this.cloudProbePass.mat.uniforms;
+    pu.uProbeOrigin.value.copy(req.origin);
+    pu.uProbeDir.value.copy(req.dir);
+    pu.uProbeMaxDist.value = req.maxDist;
+
+    const prevRT = this.renderer.getRenderTarget();
+    this.renderer.setRenderTarget(this.cloudProbeRT);
+    this.renderer.render(this.cloudProbePass.scene, this.orthoCam);
+
+    if (this._supportsAsyncFloatPbo && this._probePbo) {
+      const gl = this.renderer.getContext();
+      if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE) {
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this._probePbo);
+        gl.readPixels(0, 0, 2, 1, gl.RGBA, gl.FLOAT, 0);
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+        this._inflightProbeMeta = req.meta;
+        this._probeFence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+        this.renderer.setRenderTarget(prevRT);
+        return;
+      }
+    }
+
+    this.renderer.readRenderTargetPixels(this.cloudProbeRT, 0, 0, 2, 1, this._probeBuf);
+    this.renderer.setRenderTarget(prevRT);
+    if (!this._probeCancelled) {
+      this._emitCloudProbeResult(req.meta);
+    }
+  }
+
+  _emitCloudProbeResult(meta) {
+    if (!this.onCloudProbeCallback || !this._probeBuf) return;
+    const cloudAlpha = this._probeBuf[0];
+    const meanDistM = this._probeBuf[1];
+    const meanAltAslM = this._probeBuf[2];
+    const firstHitDistM = this._probeBuf[3];
+    const tauFog = Math.max(0, this._probeBuf[4]);
+    const tauLow = Math.max(0, this._probeBuf[5]);
+    const tauMid = Math.max(0, this._probeBuf[6]);
+    const tauHigh = Math.max(0, this._probeBuf[7]);
+    const tauSum = Math.max(1e-6, tauFog + tauLow + tauMid + tauHigh);
+
+    let dominantLayer = 'low';
+    let bestTau = tauLow;
+    if (tauFog > bestTau) {
+      bestTau = tauFog;
+      dominantLayer = 'fog';
+    }
+    if (tauMid > bestTau) {
+      bestTau = tauMid;
+      dominantLayer = 'mid';
+    }
+    if (tauHigh > bestTau) {
+      dominantLayer = 'high';
+    }
+
+    this.onCloudProbeCallback(
+      {
+        cloudAlpha,
+        meanDistM,
+        meanAltAslM,
+        firstHitDistM,
+        tauFog,
+        tauLow,
+        tauMid,
+        tauHigh,
+        dominantLayer,
+        layerShares: {
+          fog: tauFog / tauSum,
+          low: tauLow / tauSum,
+          mid: tauMid / tauSum,
+          high: tauHigh / tauSum,
+        },
+      },
+      meta
+    );
+  }
+
   /**
    * Executes the unified GPU Compute + Volumetric Rendering Pipeline:
    * 1. Steps native WebGL2 128x128x48 Moist Navier-Stokes + 3D Cirrus solver directly in VRAM (0 CPU-GPU copies)
@@ -3825,6 +4107,7 @@ export class VolumetricAtmosphereEngine {
     if (this.useGpuFluidSolver) {
       this._pollAsyncGpuTelemetry();
     }
+    this._pollAsyncCloudProbe();
 
     if (this.evolveFluid && showAtmosphere && !document.hidden) {
       // Majestic, physically grounded 1.6x real-time cloud evolution in 1:1 Lagrangian lockstep!
@@ -3888,6 +4171,7 @@ export class VolumetricAtmosphereEngine {
     u.uCameraPos.value.copy(this.camera.position);
     u.uFrameIndex.value = this.frameIndex;
     u.uSimTime.value = this.simClockS;
+    this._dispatchPendingCloudProbe(showAtmosphere);
 
     // 0. Dirty-gated 256x256 3D Cloud Shadow Map (re-renders ONLY when fluid steps, sun moves, or ~0.25s drift)
     const simDeltaShadow = Math.abs(this.simClockS - this._lastShadowSimClockS);

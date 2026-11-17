@@ -899,42 +899,209 @@ input:not(input[type="range"]):user-invalid {
   font-variant-numeric: tabular-nums;
 }
 
-.fluid-control-block {
-  margin-block-start: 0.52rem;
+/* Unified 4-Layer Physical Atmosphere Stack, Provenance Banner & Confidence Pills */
+.atmo-provenance-banner {
+  margin-block-start: 0.5rem;
+  padding: 0.44rem 0.54rem;
+  border-radius: 8px;
+  background: var(--surface-tile);
+  border: 1px solid var(--border-subtle);
+  display: grid;
+  gap: 0.22rem;
+}
+
+.atmo-provenance-top {
   display: flex;
-  flex-direction: column;
-  gap: 0.24rem;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.45rem;
 }
 
-.fluid-select {
-  inline-size: 100%;
-  font-size: 0.76rem;
+.atmo-pipeline-label {
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  min-inline-size: 0;
+  overflow: clip;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.fluid-preset-desc {
-  margin: 0.12rem 0 0;
-  font-size: 0.71rem;
-  line-height: 1.38;
+.atmo-sim-disclosure {
+  margin: 0;
+  font-size: 0.67rem;
+  line-height: 1.35;
+  color: var(--text-muted);
   text-wrap: pretty;
 }
 
-.fluid-quality-row {
-  margin-block-start: 0.48rem;
+.conf-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.22rem;
+  padding: 0.1rem 0.42rem;
+  border-radius: 999px;
+  font-size: 0.66rem;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  flex-shrink: 0;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-subtle);
+  color: var(--text-secondary);
+}
+
+.conf-pill.conf-high {
+  background: var(--accent-emerald-soft);
+  color: var(--accent-emerald);
+  border-color: color-mix(in oklch, var(--accent-emerald) 38%, transparent);
+}
+
+.conf-pill.conf-moderate {
+  background: var(--accent-amber-soft);
+  color: var(--accent-gold);
+  border-color: color-mix(in oklch, var(--accent-amber) 38%, transparent);
+}
+
+.conf-pill.conf-low {
+  background: var(--surface-subtle);
+  color: var(--text-secondary);
+  border-color: var(--border-strong);
+}
+
+.atmo-layer-stack {
+  margin-block-start: 0.46rem;
+  display: grid;
+  gap: 0.3rem;
+}
+
+.atmo-layer-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.36rem 0.5rem;
+  border-radius: 7px;
+  background: var(--surface-tile);
+  border: 1px solid var(--border-subtle);
+  transition: background-color 140ms ease, border-color 140ms ease, opacity 140ms ease;
+}
+
+.atmo-layer-row.is-trace {
+  opacity: 0.62;
+}
+
+.atmo-layer-row.is-hovered-layer {
+  background: color-mix(in oklch, var(--accent-cyan) 10%, var(--surface-tile));
+  border-color: var(--border-strong);
+  opacity: 1;
+}
+
+.atmo-layer-main {
+  min-inline-size: 0;
+  display: grid;
+  gap: 0.06rem;
+}
+
+.atmo-layer-name {
+  font-size: 0.73rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1.2;
+}
+
+.atmo-layer-alt {
+  font-size: 0.65rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: clip;
+  text-overflow: ellipsis;
+}
+
+.atmo-layer-src {
+  font-size: 0.62rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: clip;
+  text-overflow: ellipsis;
+}
+
+.atmo-layer-metrics {
   display: flex;
   align-items: center;
   gap: 0.38rem;
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.atmo-layer-cov {
+  font-size: 0.71rem;
+  font-weight: 700;
+  color: var(--text-secondary);
+  min-inline-size: 2.3rem;
+  text-align: end;
+}
+
+/* Collapsed Simulation Quality & Gain Fine-Tuning Drawer */
+.sim-tuning-drawer {
+  margin-block-start: 0.52rem;
+  border-radius: 8px;
+  background: var(--surface-tile);
+  border: 1px solid var(--border-subtle);
+}
+
+.sim-tuning-summary {
+  list-style: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  padding: 0.38rem 0.54rem;
+  font-size: 0.69rem;
+  font-weight: 700;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+
+.sim-tuning-summary::-webkit-details-marker {
+  display: none;
+}
+
+.sim-tuning-summary:hover {
+  color: var(--text-primary);
+}
+
+.sim-tuning-drawer[open] .sim-tuning-summary .disclosure-chevron {
+  transform: rotate(180deg);
+}
+
+.sim-tuning-body {
+  padding: 0.1rem 0.54rem 0.54rem;
+  border-block-start: 1px solid var(--border-subtle);
+}
+
+.fluid-quality-row {
+  margin-block-start: 0.42rem;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.32rem;
 }
 
 .fluid-quality-group {
-  flex: 1;
+  flex: 1 1 auto;
 }
 
-.fluid-pause-btn {
+.fluid-pause-btn,
+.fluid-reset-btn {
   flex-shrink: 0;
 }
 
 .fluid-sliders-grid {
-  margin-block-start: 0.55rem;
+  margin-block-start: 0.5rem;
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.46rem 0.62rem;
@@ -957,6 +1124,89 @@ input:not(input[type="range"]):user-invalid {
 .fluid-slider-field .slider-output {
   font-size: 0.71rem;
   color: var(--accent-cyan);
+}
+
+/* Floating 3D Cloud Hover Provenance & Confidence Card */
+.cloud-hover-tooltip {
+  position: absolute;
+  inset-inline-start: 0;
+  inset-block-start: 0;
+  inline-size: min(20.5rem, calc(100% - 1.2rem));
+  padding: 0.56rem 0.7rem;
+  border-radius: 11px;
+  background: var(--surface-glass-strong);
+  backdrop-filter: blur(16px);
+  border: 1px solid var(--border-strong);
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.38);
+  pointer-events: none;
+  z-index: 22;
+  font-variant-numeric: tabular-nums;
+  will-change: transform;
+}
+
+.cloud-hover-tooltip[hidden] {
+  display: none;
+}
+
+.cht-top-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.45rem;
+}
+
+.cht-layer-title {
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+  min-inline-size: 0;
+}
+
+.cht-meta-row {
+  margin-block-start: 0.22rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.22rem 0.5rem;
+  font-size: 0.69rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.cht-meta-sep {
+  color: var(--text-muted);
+}
+
+.cht-divider {
+  margin-block: 0.34rem;
+  border: 0;
+  border-block-start: 1px solid var(--border-subtle);
+}
+
+.cht-sources-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.24rem;
+}
+
+.cht-source-chip {
+  font-size: 0.62rem;
+  font-weight: 700;
+  padding: 0.08rem 0.36rem;
+  border-radius: 5px;
+  background: var(--surface-subtle);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.cht-disclosure {
+  margin: 0.28rem 0 0;
+  font-size: 0.66rem;
+  line-height: 1.34;
+  color: var(--text-muted);
+  text-wrap: pretty;
 }
 
 details.weather-card::details-content {

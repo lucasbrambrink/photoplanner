@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="color-scheme" content="light dark" />
   <title>PhotoPlanner 3D — GPU Volumetric Cloud, 3D Cirrus &amp; Topographic Ray Engine</title>
-  <link rel="stylesheet" href="/styles.css?v=20261114g" />
+  <link rel="stylesheet" href="/styles.css?v=20261116u" />
   <script type="importmap">
     {
       "imports": {
@@ -71,7 +71,7 @@
         <span aria-hidden="true">📅</span>
         <span class="action-btn-label">Best Dates</span>
       </button>
-      <button type="button" class="btn-ghost" popovertarget="engine-methodology-popover" title="Rust WASM + WebGL2 3D Volumetric Engine Architecture">
+      <button type="button" class="btn-ghost" popovertarget="engine-methodology-popover" title="WebGL2 4-Layer Volumetric Atmosphere &amp; Ray Engine Architecture">
         <span aria-hidden="true">ℹ️</span>
         <span class="action-btn-label">Engine</span>
       </button>
@@ -101,36 +101,36 @@
     </div>
   </div>
 
-  <!-- Native Popover for Engine Methodology & Technical Telemetry (content-first-noise-reduction) -->
+  <!-- Native Popover for Engine Methodology & Technical Telemetry -->
   <div id="engine-methodology-popover" class="methodology-popover" popover>
     <div class="popover-header">
       <div>
-        <span class="eyebrow fluid-eyebrow">SYSTEM ARCHITECTURE &amp; PHYSICS PIPELINE</span>
-        <h2>Rust WASM 3D Fluid Dynamics + WebGL2 1m Volumetric Engine</h2>
+        <span class="eyebrow fluid-eyebrow">SYSTEM ARCHITECTURE &amp; DATA PROVENANCE</span>
+        <h2>Unified 4-Layer WebGL2 Fluid Atmosphere + Provenance Engine</h2>
       </div>
       <button type="button" class="btn-ghost btn-sm" popovertarget="engine-methodology-popover" popovertargetaction="hide">
         Close
       </button>
     </div>
     <p class="popover-lead">
-      <strong>PhotoPlanner 3D</strong> couples physical solar ray-casting, 1m USGS 3DEP LiDAR, and a real-time 3D atmospheric fluid solver:
+      <strong>PhotoPlanner 3D</strong> unifies real multi-source atmospheric observations with a 4-layer GPU fluid simulation and per-parcel confidence tracking:
     </p>
     <ol class="methodology-list">
       <li>
-        <strong>Rust WASM 3D Moist Navier-Stokes &amp; Cirrus Solver:</strong> A dedicated Web Worker executes compiled Rust (<code>pp_wasm.wasm</code>) solving Boussinesq buoyancy, terrain-masked Red-Black SOR pressure projection, Scorer mountain lee waves, Clausius-Clapeyron condensation, and Koop ice sedimentation from <code>0 m</code> to the <code>12.2 km</code> tropopause.
+        <strong>Unified 4-Layer 128×128×48 GPU Moist Navier-Stokes:</strong> Simultaneously resolves sub-inversion marine stratus/fog, boundary-layer cumulus, mid-level altocumulus/lenticular waves, and upper-tropospheric 3D ice cirrus at their exact pressure-level ASL altitudes from <code>0 m</code> to <code>12.2 km</code>.
       </li>
       <li>
-        <strong>WebGL2 1-Meter Detail Cascade &amp; Upper-Air 3D Cirrus:</strong> Hardware trilinear 3D textures sculpt macro fluid water and ice down to <strong>1.0-meter Kolmogorov micro-turbulent wisps</strong>, sheared <em>cirrus uncinus</em> mares' tails (with +3.3° curved-Earth horizon dip afterglow &amp; 22° ice halo), and DEM-occluded crepuscular god-rays.
+        <strong>Transparent Data Provenance &amp; Hover Picker:</strong> Hovering any 3D cloud executes an asynchronous 2×1 GPU ray probe to report calibrated layer confidence (<code>20–94%</code>), ASL altitude, data sources (GOES-18/19 ABI L2, METAR ceilometers, HRRR 3 km, ECMWF IFS/AIFS, GFS), and what is measured vs. physically simulated.
       </li>
       <li>
-        <strong>1m USGS 3DEP Terrain + Instant WASM Ray-Caster:</strong> Click any point on the 3D terrain in <strong>Inspect</strong> mode for sub-millisecond Rust WASM 65-point sightline profiling, 360° horizon notches, and trailhead routing.
+        <strong>1m USGS 3DEP Terrain + GPU Sightline Ray-Caster:</strong> Click any point on the 3D terrain in <strong>Inspect</strong> mode for sub-millisecond curved-Earth sightline profiling, 360° horizon notches, and trailhead routing.
       </li>
     </ol>
     <div class="telemetry-grid popover-telemetry-grid" id="telemetry-details">
       <div><span>Near-Field DEM</span> <strong>USGS 3DEP 1m F32 Binary Stream</strong></div>
-      <div><span>3D Fluid Grid</span> <strong>64×64×48 (0–12.2 km) + 64³ 1m Cascade</strong></div>
-      <div><span>Cloud Lighting</span> <strong>3-Octave Nubis Multi-Scatter + 128² Shadow LUT</strong></div>
-      <div><span>Solar Ephemeris</span> <strong>NOAA / Meeus + Curved-Earth Horizon Dip</strong></div>
+      <div><span>3D Fluid Column</span> <strong>128×128×48 GPU + 160 km Mesoscale Grid</strong></div>
+      <div><span>Cloud Provenance</span> <strong>GOES-18 ABI L2 + METAR + 4-Model NWP</strong></div>
+      <div><span>Solar Ephemeris</span> <strong>380 km Curved-Earth 6-Band Radiative LUT</strong></div>
     </div>
   </div>
 
@@ -214,49 +214,49 @@
       </button>
     </div>
     <p class="popover-lead">
-      Jump directly to live forecasts or calibrated historical cloud, marine fog-sea, and Sierra alpenglow benchmarks:
+      Jump directly to live forecasts or calibrated historical multi-layer cloud, marine fog-sea, and Sierra alpenglow dates:
     </p>
     <div class="scenario-preset-list">
       <button type="button" class="scenario-preset-card" id="btn-vp-yesterday-pedro">
         <span class="scenario-preset-icon" aria-hidden="true">🌅</span>
         <span class="scenario-preset-body">
           <strong>Pedro Point Yesterday Sunset</strong>
-          <span>3 km HRRR + 380 km Offshore Pacific Corridor Backtest</span>
+          <span>Archived HRRR + 380 km Offshore Pacific Corridor Backtest</span>
         </span>
       </button>
       <button type="button" class="scenario-preset-card" id="btn-vp-today-sf">
         <span class="scenario-preset-icon" aria-hidden="true">🔥</span>
         <span class="scenario-preset-body">
           <strong>Montara Mountain Live Today</strong>
-          <span>Live GOES-18 + METAR + 3 km HRRR Coastal Corridor</span>
+          <span>Live GOES-18 ABI L2 + METAR + 4-Model Coastal Column</span>
         </span>
       </button>
       <button type="button" class="scenario-preset-card" id="btn-vp-fog-sea">
         <span class="scenario-preset-icon" aria-hidden="true">☁️</span>
         <span class="scenario-preset-body">
-          <strong>Pacific Marine Inversion Fog-Sea ('25)</strong>
-          <span>Aug 15, 2025 • +10.1°F Cap with 1,260 ft Cloud Sea Below Peak</span>
+          <strong>Montara Marine Cloud-Sea ('25)</strong>
+          <span>Jun 5, 2025 • Sub-Inversion Stratus Sea + Upper Cirrus</span>
         </span>
       </button>
       <button type="button" class="scenario-preset-card" id="btn-vp-clear-slot">
         <span class="scenario-preset-icon" aria-hidden="true">✨</span>
         <span class="scenario-preset-body">
           <strong>Pedro Point Crimson Cirrus ('25)</strong>
-          <span>Oct 22, 2025 • Broken Low Sc + High Ice Mares' Tails Afterglow</span>
+          <span>May 16, 2025 • Clear Horizon Slot + High Ice Mares' Tails</span>
         </span>
       </button>
       <button type="button" class="scenario-preset-card" id="btn-vp-halfdome-alpenglow">
         <span class="scenario-preset-icon" aria-hidden="true">🏔️</span>
         <span class="scenario-preset-body">
-          <strong>Half Dome Alpine Cumulus &amp; Cirrus</strong>
-          <span>Yosemite • 1m Anabatic Turrets + 10.5 km Jet-Sheared Cirrus</span>
+          <strong>Half Dome Cumulus &amp; Cirrus ('25)</strong>
+          <span>May 25, 2025 • Yosemite Valley Sounding + High Ice Canopy</span>
         </span>
       </button>
       <button type="button" class="scenario-preset-card" id="btn-vp-clouds-rest-wave">
-        <span class="scenario-preset-icon" aria-hidden="true">🛸</span>
+        <span class="scenario-preset-icon" aria-hidden="true">🌬️</span>
         <span class="scenario-preset-body">
-          <strong>Clouds Rest Sierra Lee-Wave Lenticular</strong>
-          <span>High Sierra • Standing Scorer Gravity Wave + Tropopause Ice</span>
+          <strong>Clouds Rest Sierra Wave ('25)</strong>
+          <span>Jun 7, 2025 • High-Elevation Westerly Flow + Multi-Layer Ice</span>
         </span>
       </button>
     </div>
@@ -279,14 +279,14 @@
         </p>
       </section>
 
-      <!-- On-Demand Disclosure: WebGL2 GPU 3D Atmospheric Fluid & 1m Cloud Physics Engine (Open by default) -->
+      <!-- Unified 4-Layer Physical Atmosphere, Data Provenance & Per-Layer Confidence (Open by default) -->
       <details class="card weather-card fluid-card" id="fluid-physics-disclosure" open>
         <summary class="weather-summary">
           <div class="weather-summary-main">
-            <span class="eyebrow fluid-eyebrow">WEBGL2 GPU NAVIER-STOKES + 1M RAYMARCH</span>
-            <span class="weather-verdict" id="fluid-regime-title">3D Moist Fluid &amp; 10.5 km Cirrus</span>
+            <span class="eyebrow fluid-eyebrow">UNIFIED 4-LAYER ATMOSPHERE • HOVER CLOUDS</span>
+            <span class="weather-verdict" id="fluid-regime-title">Multi-Layer Cloud Profile &amp; Provenance</span>
             <span class="weather-summary-sub" id="fluid-summary-sub">
-              1.0m Detail Cascade • 0–12.2 km Stretched Column
+              0–12.2 km Physical Column • Hover any 3D cloud for confidence
             </span>
           </div>
           <div class="weather-summary-right">
@@ -296,61 +296,58 @@
         </summary>
 
         <div class="weather-expanded-body">
-          <div class="fluid-control-block">
-            <label for="select-fluid-preset" class="section-caption">Atmospheric Regime &amp; Imputation</label>
-            <select id="select-fluid-preset" class="form-control fluid-select">
-              <option value="live" selected>⚡ Live Forecast Imputation (HRRR / Sounding)</option>
-              <option value="coastal_fog_sea">🌊 Pacific Marine Fog Sea &amp; Inversion</option>
-              <option value="crepuscular_godrays">☀️ Broken Stratocumulus &amp; Crepuscular God-Rays</option>
-              <option value="sierra_cumulus_cirrus">🏔️ Orographic Cumulus &amp; High 3D Cirrus</option>
-              <option value="lenticular_wave">🛸 Sierra Lee-Wave Lenticular &amp; Jet Cirrus</option>
-              <option value="clear_crisp_cirrus">✨ Crystal Alpine Visibility &amp; Wispy Cirrus</option>
-            </select>
-            <p class="weather-rec fluid-preset-desc" id="fluid-preset-desc">
-              Couples Open-Meteo / HRRR pressure-level sounding directly into the 128×128×48 WebGL2 GPU Navier-Stokes &amp; ice solver.
+          <!-- Honest Data Provenance & Overall Confidence Banner -->
+          <div class="atmo-provenance-banner" id="atmo-provenance-banner">
+            <div class="atmo-provenance-top">
+              <span class="atmo-pipeline-label" id="atmo-pipeline-label">Loading GOES-18 / METAR / 4-Model Sounding…</span>
+              <span class="conf-pill conf-moderate" id="atmo-overall-conf-pill">--% Conf</span>
+            </div>
+            <p class="atmo-sim-disclosure" id="atmo-sim-disclosure">
+              Layer altitudes, coverage &amp; wind shear come from satellite, METAR &amp; NWP soundings; fine 1m 3D billows &amp; cirrus wisps are physically simulated on GPU.
             </p>
           </div>
 
-          <div class="fluid-quality-row">
-            <div class="surface-segment-group fluid-quality-group" role="group" aria-label="GPU Raymarch Quality">
-              <button type="button" class="mode-btn is-active" data-fluid-quality="ultra">Ultra 1m</button>
-              <button type="button" class="mode-btn" data-fluid-quality="balanced">Balanced</button>
-              <button type="button" class="mode-btn" data-fluid-quality="performance">Fast</button>
-            </div>
-            <button type="button" class="btn-ghost btn-sm fluid-pause-btn" id="btn-toggle-fluid-evolve">⏸ Pause</button>
-          </div>
-
-          <div class="fluid-sliders-grid">
-            <div class="slider-field fluid-slider-field">
-              <div class="slider-header">
-                <label class="slider-label" for="slider-fluid-speed">Evolution Speed</label>
-                <output class="slider-output" id="out-fluid-speed" for="slider-fluid-speed">1.0×</output>
+          <!-- Altitude-Ordered 4-Layer Vertical Stack (High Ice -> Mid Ac/Wave -> Low Cu -> Sub-Inversion Fog) -->
+          <div class="atmo-layer-stack" id="unified-layer-stack" role="list" aria-label="Atmospheric Cloud Layers by Altitude">
+            <div class="atmo-layer-row" role="listitem">
+              <div class="atmo-layer-main">
+                <span class="atmo-layer-name">High Ice Cirrus</span>
+                <span class="atmo-layer-alt">25,600–34,100 ft ASL (7.8–10.4 km)</span>
               </div>
-              <input class="slider-input" id="slider-fluid-speed" type="range" min="0" max="4" step="0.1" value="1.0" />
-            </div>
-
-            <div class="slider-field fluid-slider-field">
-              <div class="slider-header">
-                <label class="slider-label" for="slider-micro-detail">1m Micro Detail</label>
-                <output class="slider-output" id="out-micro-detail" for="slider-micro-detail">100%</output>
+              <div class="atmo-layer-metrics">
+                <span class="atmo-layer-cov">--%</span>
+                <span class="conf-pill conf-moderate">--%</span>
               </div>
-              <input class="slider-input" id="slider-micro-detail" type="range" min="0" max="200" step="5" value="100" />
             </div>
-
-            <div class="slider-field fluid-slider-field">
-              <div class="slider-header">
-                <label class="slider-label" for="slider-cloud-density">Low / Mid Liquid</label>
-                <output class="slider-output" id="out-cloud-density" for="slider-cloud-density">100%</output>
+            <div class="atmo-layer-row" role="listitem">
+              <div class="atmo-layer-main">
+                <span class="atmo-layer-name">Mid Altocumulus / Wave</span>
+                <span class="atmo-layer-alt">10,500–15,100 ft ASL (3.2–4.6 km)</span>
               </div>
-              <input class="slider-input" id="slider-cloud-density" type="range" min="15" max="200" step="5" value="100" />
+              <div class="atmo-layer-metrics">
+                <span class="atmo-layer-cov">--%</span>
+                <span class="conf-pill conf-moderate">--%</span>
+              </div>
             </div>
-
-            <div class="slider-field fluid-slider-field">
-              <div class="slider-header">
-                <label class="slider-label" for="slider-cirrus-density">Upper 3D Cirrus</label>
-                <output class="slider-output" id="out-cirrus-density" for="slider-cirrus-density">110%</output>
+            <div class="atmo-layer-row" role="listitem">
+              <div class="atmo-layer-main">
+                <span class="atmo-layer-name">Low Cumulus / Sc</span>
+                <span class="atmo-layer-alt">3,100–6,100 ft ASL (0.9–1.9 km)</span>
               </div>
-              <input class="slider-input" id="slider-cirrus-density" type="range" min="0" max="220" step="5" value="110" />
+              <div class="atmo-layer-metrics">
+                <span class="atmo-layer-cov">--%</span>
+                <span class="conf-pill conf-moderate">--%</span>
+              </div>
+            </div>
+            <div class="atmo-layer-row" role="listitem">
+              <div class="atmo-layer-main">
+                <span class="atmo-layer-name">Marine Stratus / Fog</span>
+                <span class="atmo-layer-alt">400–1,400 ft ASL (0.1–0.4 km)</span>
+              </div>
+              <div class="atmo-layer-metrics">
+                <span class="atmo-layer-cov">--%</span>
+                <span class="conf-pill conf-moderate">--%</span>
+              </div>
             </div>
           </div>
 
@@ -380,6 +377,59 @@
               <strong class="metric-tile-val" id="val-fluid-cirrus-cov">62% · 0.42 g/kg</strong>
             </div>
           </div>
+
+          <!-- Collapsed Simulation Quality & Gain Fine-Tuning Drawer -->
+          <details class="sim-tuning-drawer" id="sim-tuning-drawer">
+            <summary class="sim-tuning-summary">
+              <span>Simulation Quality &amp; Gain Fine-Tuning</span>
+              <span class="disclosure-chevron" aria-hidden="true">▾</span>
+            </summary>
+            <div class="sim-tuning-body">
+              <div class="fluid-quality-row">
+                <div class="surface-segment-group fluid-quality-group" role="group" aria-label="GPU Raymarch Quality">
+                  <button type="button" class="mode-btn is-active" data-fluid-quality="ultra">Ultra 1m</button>
+                  <button type="button" class="mode-btn" data-fluid-quality="balanced">Balanced</button>
+                  <button type="button" class="mode-btn" data-fluid-quality="performance">Fast</button>
+                </div>
+                <button type="button" class="btn-ghost btn-sm fluid-pause-btn" id="btn-toggle-fluid-evolve">⏸ Pause</button>
+                <button type="button" class="btn-ghost btn-sm fluid-reset-btn" id="btn-reset-fluid-tuning" title="Reset manual cloud gain multipliers to physical 1:1">↺ Reset</button>
+              </div>
+
+              <div class="fluid-sliders-grid">
+                <div class="slider-field fluid-slider-field">
+                  <div class="slider-header">
+                    <label class="slider-label" for="slider-fluid-speed">Evolution Speed</label>
+                    <output class="slider-output" id="out-fluid-speed" for="slider-fluid-speed">1.0×</output>
+                  </div>
+                  <input class="slider-input" id="slider-fluid-speed" type="range" min="0" max="4" step="0.1" value="1.0" />
+                </div>
+
+                <div class="slider-field fluid-slider-field">
+                  <div class="slider-header">
+                    <label class="slider-label" for="slider-micro-detail">1m Micro Detail</label>
+                    <output class="slider-output" id="out-micro-detail" for="slider-micro-detail">100%</output>
+                  </div>
+                  <input class="slider-input" id="slider-micro-detail" type="range" min="0" max="200" step="5" value="100" />
+                </div>
+
+                <div class="slider-field fluid-slider-field">
+                  <div class="slider-header">
+                    <label class="slider-label" for="slider-cloud-density">Liquid Cloud Gain</label>
+                    <output class="slider-output" id="out-cloud-density" for="slider-cloud-density">100%</output>
+                  </div>
+                  <input class="slider-input" id="slider-cloud-density" type="range" min="15" max="200" step="5" value="100" />
+                </div>
+
+                <div class="slider-field fluid-slider-field">
+                  <div class="slider-header">
+                    <label class="slider-label" for="slider-cirrus-density">Upper Cirrus Gain</label>
+                    <output class="slider-output" id="out-cirrus-density" for="slider-cirrus-density">105%</output>
+                  </div>
+                  <input class="slider-input" id="slider-cirrus-density" type="range" min="0" max="220" step="5" value="105" />
+                </div>
+              </div>
+            </div>
+          </details>
         </div>
       </details>
 
@@ -522,14 +572,14 @@
             <button type="button" class="corridor-tab" id="btn-yesterday-pedro" title="Yesterday's Pedro Point Sunset Backtest (Archived HRRR + 380 km Pacific Corridor)">
               🌅 Yesterday Pedro
             </button>
-            <button type="button" class="corridor-tab" id="btn-live-today-sf" title="Today's Live GOES-18 + METAR + 3km HRRR Sunset Forecast for SF Coast / Montara">
+            <button type="button" class="corridor-tab" id="btn-live-today-sf" title="Today's Live GOES-18 + METAR + 4-Model Sunset Forecast for SF Coast / Montara">
               🔥 Today SF Live
             </button>
-            <button type="button" class="corridor-tab" id="btn-hist-fog-sea" title="Aug 15, 2025: Marine Inversion Cap with Fog Sea below Montara Peak">
-              ☁️ Fog-Sea '25
+            <button type="button" class="corridor-tab" id="btn-hist-fog-sea" title="Jun 5, 2025: Marine Inversion Stratus Sea below Montara Peak + Upper Cirrus">
+              ☁️ Cloud-Sea '25
             </button>
-            <button type="button" class="corridor-tab" id="btn-hist-clear-slot" title="Oct 22, 2025: Coastal Pacific Sunset Benchmark">
-              ✨ Coastal '25
+            <button type="button" class="corridor-tab" id="btn-hist-clear-slot" title="May 16, 2025: Pedro Point Clear Horizon Slot + High Cirrus">
+              ✨ Cirrus '25
             </button>
           </div>
 
@@ -622,6 +672,9 @@
     <section class="viewport-stage" id="viewport-stage" aria-label="Interactive 3D Topographic Sun-Ray Map">
       <div id="canvas-container" class="canvas-container"></div>
 
+      <!-- Floating 3D Cloud Hover Provenance & Confidence Tooltip (pointer-events: none) -->
+      <div id="cloud-hover-tooltip" class="cloud-hover-tooltip" role="status" aria-live="polite" hidden></div>
+
       <div class="viewport-hud-shell">
         <!-- Row 1: Single Consolidated Floating Top HUD Row -->
         <div class="viewport-toolbar" role="toolbar" aria-label="3D Viewport Controls and Telemetry">
@@ -690,9 +743,9 @@
               type="button"
               class="toolbar-pill-btn gpu-telemetry-pill"
               id="viewport-gpu-pill"
-              title="Inspect Rust WASM 3D Fluid Solver &amp; WebGL2 Volumetric Controls"
+              title="Inspect Unified 4-Layer Atmospheric Stack &amp; Confidence"
             >
-              ⚡ 60 FPS • WASM
+              ⚡ 60 FPS • GPU
             </button>
           </div>
         </div>
@@ -821,6 +874,6 @@
     </section>
   </main>
 
-  <script type="module" src="/app.js?v=20261115h"></script>
+  <script type="module" src="/app.js?v=20261116u"></script>
 </body>
 </html>

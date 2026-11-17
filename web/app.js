@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { VolumetricAtmosphereEngine, WEATHER_REGIME_PRESETS } from "./volumetric-engine.js?v=20261115h";
+import { VolumetricAtmosphereEngine } from "./volumetric-engine.js?v=20261116u";
 
 // Conditional Popover API polyfill loader (content-first-noise-reduction)
 if (!Object.hasOwn(HTMLElement.prototype, "popover")) {
@@ -33,6 +33,8 @@ const state = {
   shootReport: null,
   terrainPatch: null,
   weatherReport: null,
+  activeAtmosphericLayers: null,
+  hoveredCloudLayerId: null,
   customTripodReport: null,
   currentMinutes: 17 * 60 + 18,
   selectedVpIndex: 0, // 0..2 when a VP is expanded, -1 when collapsed or inspecting custom pin
@@ -2469,7 +2471,6 @@ function applyHourlyWeatherAtMinutes(minutes) {
   if (
     row0?.fluid_atmosphere_params &&
     row1?.fluid_atmosphere_params &&
-    volumetricEngine.activePreset === "live" &&
     Math.abs(clampedMin - _lastSyncedFluidMinutes) >= 3
   ) {
     _lastSyncedFluidMinutes = clampedMin;
@@ -2479,9 +2480,21 @@ function applyHourlyWeatherAtMinutes(minutes) {
     const numericKeys = [
       "surfaceTempC",
       "surfaceRhPct",
+      "fogCloudPct",
+      "fogBaseAslM",
+      "fogTopAslM",
+      "cumulusCloudPct",
       "lowCloudPct",
+      "lowBaseAslM",
+      "lowTopAslM",
       "midCloudPct",
+      "midBaseAslM",
+      "midTopAslM",
+      "midIceFrac",
       "highCloudPct",
+      "highBaseAslM",
+      "highTopAslM",
+      "highOpticalDepth",
       "inversionBaseM",
       "inversionThicknessM",
       "inversionStrengthK",
@@ -2495,6 +2508,7 @@ function applyHourlyWeatherAtMinutes(minutes) {
       "wind250V",
       "convectiveCape",
       "orographicWaveGain",
+      "froudeNumber",
       "vorticityConfinement",
       "cirrusIceBoost",
       "jet250Mph",
@@ -2510,6 +2524,11 @@ function applyHourlyWeatherAtMinutes(minutes) {
   }
 
   const pickRow = alpha < 0.5 ? row0 : row1;
+  const nextAtmoLayers = pickRow?.atmospheric_layers || wr.atmospheric_layers || null;
+  if (nextAtmoLayers && nextAtmoLayers !== state.activeAtmosphericLayers) {
+    state.activeAtmosphericLayers = nextAtmoLayers;
+    renderUnifiedAtmosphereStack(nextAtmoLayers);
+  }
   return {
     expBeamPct: Math.round(lerpNum(row0.expected_transmittance_pct, row1.expected_transmittance_pct, wr.ray_transmittance_pct ?? 50)),
     directBeamPct: Math.round(lerpNum(row0.direct_beam_pct, row1.direct_beam_pct, wr.direct_beam_probability_pct ?? 50)),
@@ -3441,7 +3460,100 @@ function renderWeatherCard(w) {
       .join("");
   }
 
+  state.activeAtmosphericLayers = w.atmospheric_layers || null;
+  renderUnifiedAtmosphereStack(state.activeAtmosphericLayers);
   renderAstroCard(w, state.shootReport);
+}
+
+function escapeHtmlText(str) {
+  return String(str ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function setHoveredCloudLayerHighlight(layerId) {
+  if (state.hoveredCloudLayerId === layerId) return;
+  state.hoveredCloudLayerId = layerId || null;
+  const stackEl = document.getElementById("unified-layer-stack");
+  if (!stackEl) return;
+  stackEl.querySelectorAll(".atmo-layer-row[data-layer-id]").forEach((row) => {
+    row.classList.toggle("is-hovered-layer", row.dataset.layerId === state.hoveredCloudLayerId);
+  });
+}
+
+function renderUnifiedAtmosphereStack(atmoLayers) {
+  if (!atmoLayers || !Array.isArray(atmoLayers.layers)) return;
+
+  const pipelineEl = document.getElementById("atmo-pipeline-label");
+  const overallPillEl = document.getElementById("atmo-overall-conf-pill");
+  const simDiscEl = document.getElementById("atmo-sim-disclosure");
+  const regimeTitleEl = document.getElementById("fluid-regime-title");
+  const stackEl = document.getElementById("unified-layer-stack");
+
+  if (pipelineEl && atmoLayers.primary_pipeline_label) {
+    pipelineEl.textContent = atmoLayers.primary_pipeline_label;
+  }
+  if (overallPillEl && typeof atmoLayers.overall_confidence_pct === "number") {
+    const tier = atmoLayers.overall_confidence_tier || "moderate";
+    overallPillEl.textContent = `${Math.round(atmoLayers.overall_confidence_pct)}% Conf`;
+    overallPillEl.className = `conf-pill conf-${tier}`;
+  }
+  if (simDiscEl && atmoLayers.simulation_note) {
+    simDiscEl.textContent = atmoLayers.simulation_note;
+  }
+
+  if (regimeTitleEl) {
+    const activeDecks = atmoLayers.layers.filter((l) => (l.coverage_pct ?? 0) >= 8);
+    if (activeDecks.length === 0) {
+      regimeTitleEl.textContent = `Clear Column (${Math.round(atmoLayers.overall_confidence_pct ?? 80)}% Conf)`;
+    } else if (activeDecks.length === 1) {
+      regimeTitleEl.textContent = `${activeDecks[0].short_name} (${Math.round(activeDecks[0].coverage_pct)}%)`;
+    } else if (activeDecks.length === 2) {
+      regimeTitleEl.textContent = `${activeDecks[0].short_name} + ${activeDecks[1].short_name}`;
+    } else {
+      regimeTitleEl.textContent = `${activeDecks.length}-Layer Cloud Column (${activeDecks[0].short_name} + ${activeDecks[activeDecks.length - 1].short_name})`;
+    }
+  }
+
+  if (stackEl) {
+    stackEl.innerHTML = atmoLayers.layers
+      .map((layer) => {
+        const cov = Math.round(layer.coverage_pct ?? 0);
+        const conf = Math.round(layer.confidence_pct ?? 60);
+        const tier = layer.confidence_tier || (conf >= 75 ? "high" : conf >= 52 ? "moderate" : "low");
+        const baseFt = Math.round(layer.base_ft ?? (layer.base_asl_m || 0) * 3.28084).toLocaleString();
+        const topFt = Math.round(layer.top_ft ?? (layer.top_asl_m || 0) * 3.28084).toLocaleString();
+        const baseKm = ((layer.base_asl_m || 0) / 1000).toFixed(1);
+        const topKm = ((layer.top_asl_m || 0) / 1000).toFixed(1);
+        const primarySrc = layer.sources?.[0] || "";
+        const isTrace = cov <= 3;
+        const isHovered = state.hoveredCloudLayerId === layer.id;
+        const rowClasses = [
+          "atmo-layer-row",
+          isTrace ? "is-trace" : "",
+          isHovered ? "is-hovered-layer" : "",
+        ]
+          .filter(Boolean)
+          .join(" ");
+
+        return `
+          <div class="${rowClasses}" role="listitem" data-layer-id="${escapeHtmlText(layer.id)}" title="${escapeHtmlText(layer.hover_disclosure || "")}">
+            <div class="atmo-layer-main">
+              <span class="atmo-layer-name">${escapeHtmlText(layer.short_name || layer.name)}</span>
+              <span class="atmo-layer-alt">${baseFt}–${topFt} ft ASL (${baseKm}–${topKm} km)</span>
+              ${primarySrc ? `<span class="atmo-layer-source">${escapeHtmlText(primarySrc)}</span>` : ""}
+            </div>
+            <div class="atmo-layer-metrics">
+              <span class="atmo-layer-cov">${cov}%</span>
+              <span class="conf-pill conf-${escapeHtmlText(tier)}" title="Layer data confidence: ${conf}%">${conf}%</span>
+            </div>
+          </div>
+        `;
+      })
+      .join("");
+  }
 }
 
 function renderAstroCard(w, shootReport) {
@@ -3875,7 +3987,7 @@ async function loadLandmarkScenario(customCoord = null) {
 }
 
 // ============================================================================
-// Interactive 3D Terrain Raycaster (Hover Readout + Click-to-Highlight)
+// Interactive 3D Terrain & Volumetric Cloud Raycaster (Hover Provenance + Click)
 // ============================================================================
 const raycaster = new THREE.Raycaster();
 const pointerNDC = new THREE.Vector2();
@@ -3883,6 +3995,167 @@ let pointerDownPos = { x: 0, y: 0 };
 let pointerHoverRafPending = false;
 let latestPointerClientX = 0;
 let latestPointerClientY = 0;
+let latestPointerButtons = 0;
+let lastCloudProbeReqMs = 0;
+let _lastTooltipHtmlKey = "";
+
+const cloudHoverTooltipEl = document.getElementById("cloud-hover-tooltip");
+
+const FALLBACK_LAYER_META = {
+  high: {
+    id: "high",
+    short_name: "High Ice Cirrus",
+    confidence_pct: 74,
+    sources: ["Upper-Troposphere Sounding (300–200 hPa)", "GOES-18 ABI L2 Cirrus"],
+    hover_disclosure: "Upper-tropospheric ice band altitude & wind shear from NWP/satellite; 3D mares' tails simulated.",
+  },
+  mid: {
+    id: "mid",
+    short_name: "Mid Altocumulus / Wave",
+    confidence_pct: 68,
+    sources: ["Mid-Level Sounding (700–500 hPa)", "16×16 Mesoscale Grid"],
+    hover_disclosure: "700–500 hPa moisture & Froude wave envelope from NWP sounding; 3D wave structure simulated.",
+  },
+  low: {
+    id: "low",
+    short_name: "Low Cumulus / Sc",
+    confidence_pct: 66,
+    sources: ["Boundary-Layer LCL Sounding", "METAR Ceilometer"],
+    hover_disclosure: "LCL condensation base & convective depth from NWP/METAR; individual 1m cumulus billows simulated.",
+  },
+  fog: {
+    id: "fog",
+    short_name: "Marine Stratus / Fog",
+    confidence_pct: 76,
+    sources: ["GOES-18 Marine Stratus L2", "METAR Ceilometer + 925 hPa Inversion"],
+    hover_disclosure: "Sub-inversion marine stratus top & inland penetration from GOES/METAR/HRRR; 1m cloud-top eddies simulated.",
+  },
+};
+
+function hideCloudHoverTooltip(cancelPending = true) {
+  if (cloudHoverTooltipEl && !cloudHoverTooltipEl.hidden) {
+    cloudHoverTooltipEl.hidden = true;
+  }
+  _lastTooltipHtmlKey = "";
+  setHoveredCloudLayerHighlight(null);
+  if (cancelPending) {
+    volumetricEngine.cancelCloudProbe();
+  }
+}
+
+function positionCloudHoverTooltip(clientX, clientY) {
+  if (!cloudHoverTooltipEl || !viewportStageEl) return;
+  const stageRect = viewportStageEl.getBoundingClientRect();
+  const cardW = cloudHoverTooltipEl.offsetWidth || 292;
+  const cardH = cloudHoverTooltipEl.offsetHeight || 128;
+  const pad = 12;
+  let x = clientX - stageRect.left + 16;
+  let y = clientY - stageRect.top + 16;
+  if (x + cardW + pad > stageRect.width) {
+    x = Math.max(pad, clientX - stageRect.left - cardW - 14);
+  }
+  if (y + cardH + pad > stageRect.height) {
+    y = Math.max(pad, clientY - stageRect.top - cardH - 14);
+  }
+  x = Math.max(pad, x);
+  y = Math.max(pad, y);
+  cloudHoverTooltipEl.style.transform = `translate3d(${Math.round(x)}px, ${Math.round(y)}px, 0)`;
+}
+
+volumetricEngine.onCloudProbeCallback = (probe, meta) => {
+  if (
+    !cloudHoverTooltipEl ||
+    !state.showAtmosphere ||
+    !meta ||
+    latestPointerButtons !== 0 ||
+    !probe ||
+    probe.cloudAlpha < 0.038
+  ) {
+    hideCloudHoverTooltip(false);
+    return;
+  }
+
+  const domId = probe.dominantLayer || "low";
+  const layersArr = state.activeAtmosphericLayers?.layers;
+  const layerMeta =
+    (Array.isArray(layersArr) && layersArr.find((l) => l.id === domId)) ||
+    FALLBACK_LAYER_META[domId] ||
+    FALLBACK_LAYER_META.low;
+
+  const baseConf = typeof layerMeta.confidence_pct === "number" ? layerMeta.confidence_pct : 68;
+  const distM = Math.max(0, probe.meanDistM || 0);
+  // Far-corridor clouds (>25 km away) rely more heavily on coarser NWP spatial interpolation
+  const distPenalty = distM > 25000 ? Math.min(9, Math.round((distM - 25000) / 11000)) : 0;
+  // Thin parcel wisps are governed more by simulated sub-grid turbulence than dense cloud cores
+  const densityAdj = probe.cloudAlpha < 0.14 ? -4 : probe.cloudAlpha > 0.55 ? 2 : 0;
+  const confPct = Math.max(18, Math.min(95, Math.round(baseConf - distPenalty + densityAdj)));
+  const confTier = confPct >= 74 ? "high" : confPct >= 52 ? "moderate" : "low";
+
+  const altM = Math.max(0, probe.meanAltAslM || 0);
+  const altFtRounded = Math.round((altM * 3.28084) / 50) * 50;
+  const altKmStr = (altM / 1000).toFixed(1);
+  const distKm = distM / 1000;
+  const distMi = distKm * 0.621371;
+  const distStr = distMi < 10 ? `${distMi.toFixed(1)} mi` : `${Math.round(distMi)} mi`;
+  const opacityPct = Math.max(4, Math.min(100, Math.round(probe.cloudAlpha * 100)));
+
+  // Check if ray intersects a secondary overlapping cloud deck (>=22% optical depth share)
+  let secondaryOverlapLabel = "";
+  if (probe.layerShares) {
+    let bestSecId = null;
+    let bestSecShare = 0.22;
+    for (const [lid, share] of Object.entries(probe.layerShares)) {
+      if (lid !== domId && share >= bestSecShare) {
+        bestSecShare = share;
+        bestSecId = lid;
+      }
+    }
+    if (bestSecId) {
+      const secMeta =
+        (Array.isArray(layersArr) && layersArr.find((l) => l.id === bestSecId)) ||
+        FALLBACK_LAYER_META[bestSecId];
+      if (secMeta) {
+        secondaryOverlapLabel = `+ ${secMeta.short_name}`;
+      }
+    }
+  }
+
+  const sources = Array.isArray(layerMeta.sources) ? layerMeta.sources.slice(0, 3) : [];
+  const disclosure = layerMeta.hover_disclosure || "";
+  const htmlKey = `${domId}|${confPct}|${altFtRounded}|${distStr}|${opacityPct}|${secondaryOverlapLabel}|${sources.join(";")}|${disclosure}`;
+
+  if (htmlKey !== _lastTooltipHtmlKey) {
+    _lastTooltipHtmlKey = htmlKey;
+    const chipsHtml = sources
+      .map((s) => `<span class="cht-source-chip">${escapeHtmlText(s)}</span>`)
+      .join("");
+
+    cloudHoverTooltipEl.innerHTML = `
+      <div class="cht-top-row">
+        <span class="cht-layer-title">${escapeHtmlText(layerMeta.short_name || layerMeta.name)}</span>
+        <span class="conf-pill conf-${confTier}">${confPct}% Confidence</span>
+      </div>
+      <div class="cht-meta-row">
+        <span>${altFtRounded.toLocaleString()} ft ASL (${altKmStr} km)</span>
+        <span>•</span>
+        <span>${distStr} away</span>
+        <span>•</span>
+        <span>${opacityPct}% opacity</span>
+        ${secondaryOverlapLabel ? `<span>• ${escapeHtmlText(secondaryOverlapLabel)}</span>` : ""}
+      </div>
+      ${
+        chipsHtml
+          ? `<div class="cht-divider"></div><div class="cht-sources-row">${chipsHtml}</div>`
+          : ""
+      }
+      ${disclosure ? `<p class="cht-disclosure">${escapeHtmlText(disclosure)}</p>` : ""}
+    `;
+  }
+
+  cloudHoverTooltipEl.hidden = false;
+  positionCloudHoverTooltip(meta.clientX, meta.clientY);
+  setHoveredCloudLayerHighlight(domId);
+};
 
 function updatePointerNDCFromCoords(clientX, clientY) {
   const rect = renderer.domElement.getBoundingClientRect();
@@ -3895,11 +4168,25 @@ function updatePointerNDC(event) {
 }
 
 renderer.domElement.addEventListener(
+  "pointerleave",
+  () => {
+    hideCloudHoverTooltip(true);
+  },
+  { passive: true }
+);
+
+renderer.domElement.addEventListener(
   "pointermove",
   (e) => {
     if (!terrainMeshRef || !state.terrainPatch) return;
     latestPointerClientX = e.clientX;
     latestPointerClientY = e.clientY;
+    latestPointerButtons = e.buttons;
+    if (e.buttons !== 0) {
+      hideCloudHoverTooltip(true);
+    } else if (cloudHoverTooltipEl && !cloudHoverTooltipEl.hidden) {
+      positionCloudHoverTooltip(e.clientX, e.clientY);
+    }
     if (pointerHoverRafPending) return;
     pointerHoverRafPending = true;
     requestAnimationFrame(() => {
@@ -3914,6 +4201,7 @@ renderer.domElement.addEventListener(
         const vpIdx = vpHits[0].object.userData.vpIndex;
         const vp = state.shootReport?.top_viewpoints?.[vpIdx];
         if (vp) {
+          hideCloudHoverTooltip(true);
           cursorCoordsBar.textContent = `VP${vp.viewpoint_rank}: ${vp.viewpoint_label} (${vp.hike_distance_to_vp_miles} mi) • Click to highlight`;
           return;
         }
@@ -3926,6 +4214,29 @@ renderer.domElement.addEventListener(
         const actionLabel =
           state.clickMode === "tripod" ? "Click to inspect sightline" : "Click to set Target";
         cursorCoordsBar.textContent = `${lat.toFixed(4)}, ${lon.toFixed(4)} • ${elevFt.toLocaleString()} ft • ${actionLabel}`;
+      } else {
+        const d = raycaster.ray.direction;
+        // Local scene coordinates: +X = East, -Z = North, +Y = Up
+        const azDeg = ((Math.atan2(d.x, -d.z) * 180) / Math.PI + 360) % 360;
+        const elDeg = (Math.asin(Math.max(-1, Math.min(1, d.y))) * 180) / Math.PI;
+        cursorCoordsBar.textContent = `Sky Azimuth ${azDeg.toFixed(1)}° (${compassLabel(azDeg)}) • Elev ${elDeg >= 0 ? "+" : ""}${elDeg.toFixed(1)}° • Hover cloud for confidence`;
+      }
+
+      if (state.showAtmosphere && latestPointerButtons === 0) {
+        const nowPerf = performance.now();
+        if (nowPerf - lastCloudProbeReqMs >= 38) {
+          lastCloudProbeReqMs = nowPerf;
+          const maxProbeDist = terrHit ? Math.max(15.0, terrHit.distance) : 116000.0;
+          volumetricEngine.requestCloudProbe(
+            raycaster.ray.origin,
+            raycaster.ray.direction,
+            maxProbeDist,
+            { clientX: latestPointerClientX, clientY: latestPointerClientY }
+          );
+          wakeRenderLoop(false);
+        }
+      } else {
+        hideCloudHoverTooltip(true);
       }
     });
   },
@@ -3939,6 +4250,8 @@ renderer.domElement.addEventListener("selectstart", (e) => e.preventDefault());
 renderer.domElement.addEventListener("pointerdown", (e) => {
   window.getSelection?.()?.removeAllRanges?.();
   pointerDownPos = { x: e.clientX, y: e.clientY };
+  latestPointerButtons = e.buttons;
+  hideCloudHoverTooltip(true);
 });
 
 renderer.domElement.addEventListener("pointerup", async (e) => {
@@ -4179,6 +4492,9 @@ document.getElementById("toggle-light-field")?.addEventListener("change", (e) =>
 
 document.getElementById("toggle-atmosphere")?.addEventListener("change", (e) => {
   state.showAtmosphere = e.target.checked;
+  if (!state.showAtmosphere) {
+    hideCloudHoverTooltip(true);
+  }
   updateSunRaysAndShader();
 });
 
@@ -4294,63 +4610,57 @@ document.getElementById("ai-models-comparison-grid")?.addEventListener("click", 
   }
 });
 
-function applyQuickScenario(landmark, date, fluidPreset = null) {
+function applyQuickScenario(landmark, date) {
   document.getElementById("scenarios-popover")?.hidePopover?.();
+  hideCloudHoverTooltip(true);
   state.landmark = landmark;
   state.date = date;
   const lmSel = document.getElementById("landmark-select");
   const dtInp = document.getElementById("shoot-date");
   if (lmSel) lmSel.value = landmark;
   if (dtInp) dtInp.value = date;
-  if (fluidPreset) {
-    const fSel = document.getElementById("select-fluid-preset");
-    if (fSel) fSel.value = fluidPreset;
-    volumetricEngine.setPreset(fluidPreset);
-    const info = WEATHER_REGIME_PRESETS[fluidPreset];
-    const descEl = document.getElementById("fluid-preset-desc");
-    if (descEl && info) descEl.textContent = info.description;
-  }
+  volumetricEngine.setPreset("live");
   loadLandmarkScenario();
 }
 
 document.getElementById("btn-yesterday-pedro")?.addEventListener("click", () => {
-  applyQuickScenario("Pedro Point Headlands", yesterdayIso, "live");
+  applyQuickScenario("Pedro Point Headlands", yesterdayIso);
 });
 
 document.getElementById("btn-vp-yesterday-pedro")?.addEventListener("click", () => {
-  applyQuickScenario("Pedro Point Headlands", yesterdayIso, "live");
+  applyQuickScenario("Pedro Point Headlands", yesterdayIso);
 });
 
 document.getElementById("btn-live-today-sf")?.addEventListener("click", () => {
-  applyQuickScenario("Montara Mountain", todayIso, "live");
+  applyQuickScenario("Montara Mountain", todayIso);
 });
 
 document.getElementById("btn-vp-today-sf")?.addEventListener("click", () => {
-  applyQuickScenario("Montara Mountain", todayIso, "live");
+  applyQuickScenario("Montara Mountain", todayIso);
 });
 
 document.getElementById("btn-hist-fog-sea")?.addEventListener("click", () => {
-  applyQuickScenario("Montara Mountain", "2025-08-15", "coastal_fog_sea");
+  applyQuickScenario("Montara Mountain", "2025-06-05");
 });
 
 document.getElementById("btn-vp-fog-sea")?.addEventListener("click", () => {
-  applyQuickScenario("Montara Mountain", "2025-08-15", "coastal_fog_sea");
+  applyQuickScenario("Montara Mountain", "2025-06-05");
 });
 
 document.getElementById("btn-hist-clear-slot")?.addEventListener("click", () => {
-  applyQuickScenario("Pedro Point Headlands", "2025-10-22", "crepuscular_godrays");
+  applyQuickScenario("Pedro Point Headlands", "2025-05-16");
 });
 
 document.getElementById("btn-vp-clear-slot")?.addEventListener("click", () => {
-  applyQuickScenario("Pedro Point Headlands", "2025-10-22", "crepuscular_godrays");
+  applyQuickScenario("Pedro Point Headlands", "2025-05-16");
 });
 
 document.getElementById("btn-vp-halfdome-alpenglow")?.addEventListener("click", () => {
-  applyQuickScenario("Half Dome", todayIso, "sierra_cumulus_cirrus");
+  applyQuickScenario("Half Dome", "2025-05-25");
 });
 
 document.getElementById("btn-vp-clouds-rest-wave")?.addEventListener("click", () => {
-  applyQuickScenario("Clouds Rest", todayIso, "lenticular_wave");
+  applyQuickScenario("Clouds Rest", "2025-06-07");
 });
 
 const playBtn = document.getElementById("btn-play-sun");
@@ -4454,12 +4764,11 @@ document.getElementById("btn-open-calendar").addEventListener("click", async () 
 });
 
 // ============================================================================
-// 3D Fluid Dynamics & Upper-Atmosphere Cirrus Controls (Rust WASM + WebGL2)
+// Unified 4-Layer Physical Atmosphere Controls & Fine-Tuning Drawer (WebGL2)
 // ============================================================================
 const fluidDisclosure = document.getElementById("fluid-physics-disclosure");
-const selectFluidPreset = document.getElementById("select-fluid-preset");
-const fluidPresetDesc = document.getElementById("fluid-preset-desc");
 const btnToggleFluidEvolve = document.getElementById("btn-toggle-fluid-evolve");
+const btnResetFluidTuning = document.getElementById("btn-reset-fluid-tuning");
 const sliderFluidSpeed = document.getElementById("slider-fluid-speed");
 const sliderMicroDetail = document.getElementById("slider-micro-detail");
 const sliderCloudDensity = document.getElementById("slider-cloud-density");
@@ -4479,16 +4788,6 @@ viewportGpuPill?.addEventListener("click", () => {
   }
 });
 
-selectFluidPreset?.addEventListener("change", (e) => {
-  const key = e.target.value;
-  volumetricEngine.setPreset(key);
-  const info = WEATHER_REGIME_PRESETS[key];
-  if (fluidPresetDesc && info) {
-    fluidPresetDesc.textContent = info.description;
-  }
-  updateSunRaysAndShader();
-});
-
 document.querySelectorAll("[data-fluid-quality]").forEach((btn) => {
   btn.addEventListener("click", () => {
     const q = btn.dataset.fluidQuality;
@@ -4505,6 +4804,41 @@ btnToggleFluidEvolve?.addEventListener("click", () => {
   btnToggleFluidEvolve.textContent = volumetricEngine.evolveFluid
     ? "⏸ Pause"
     : "▶ Resume";
+});
+
+btnResetFluidTuning?.addEventListener("click", () => {
+  if (sliderFluidSpeed) {
+    sliderFluidSpeed.value = "1.0";
+    syncSliderValue(sliderFluidSpeed);
+    const out = document.getElementById("out-fluid-speed");
+    if (out) out.textContent = "1.0×";
+  }
+  if (sliderMicroDetail) {
+    sliderMicroDetail.value = "100";
+    syncSliderValue(sliderMicroDetail);
+    const out = document.getElementById("out-micro-detail");
+    if (out) out.textContent = "100%";
+  }
+  if (sliderCloudDensity) {
+    sliderCloudDensity.value = "100";
+    syncSliderValue(sliderCloudDensity);
+    const out = document.getElementById("out-cloud-density");
+    if (out) out.textContent = "100%";
+  }
+  if (sliderCirrusDensity) {
+    sliderCirrusDensity.value = "105";
+    syncSliderValue(sliderCirrusDensity);
+    const out = document.getElementById("out-cirrus-density");
+    if (out) out.textContent = "105%";
+  }
+  volumetricEngine.evolutionSpeed = 1.0;
+  volumetricEngine.setUserTuning({
+    cloudDensityGain: 1.0,
+    cirrusDensityGain: 1.05,
+    microDetailGain: 1.0,
+    godRayGain: 1.0,
+  });
+  wakeRenderLoop(true);
 });
 
 sliderFluidSpeed?.addEventListener("input", () => {
@@ -4584,7 +4918,9 @@ volumetricEngine.onTelemetryCallback = (tel) => {
     }
   }
   if (fluidSummarySub) {
-    fluidSummarySub.textContent = `1.0m Detail • 0–${topKm} km 3D Cirrus • Low ${lowPct}% / High ${highPct}%`;
+    const overallConf = state.activeAtmosphericLayers?.overall_confidence_pct;
+    const confTag = typeof overallConf === "number" ? `${Math.round(overallConf)}% Conf` : "Hover clouds";
+    fluidSummarySub.textContent = `0–${topKm} km Column • Low ${lowPct}% / High ${highPct}% • ${confTag}`;
   }
 };
 
@@ -4710,6 +5046,7 @@ function animate(nowMs = performance.now()) {
   const isHighRateActive =
     state.isPlayingSun ||
     isScrubbingTime ||
+    volumetricEngine.hasPendingCloudProbe() ||
     idleElapsedMs < ACTIVE_BOOST_WINDOW_MS ||
     camSettleElapsedMs < CAM_SETTLE_TAIL_MS;
 

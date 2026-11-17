@@ -14,6 +14,8 @@ from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
 import json
 import math
+import random
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -25,7 +27,9 @@ NWP_CACHE_DIR = ROOT_DIR / "data" / "weather_cache" / "nwp"
 USER_AGENT = "PhotoPlanner/2.0 (landscape-optics-corridor; github.com/lucasbrambrink/photoplanner)"
 
 _MEM_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
-_MEM_TTL_SECONDS = 900.0  # 15 minutes
+_MEM_TTL_SECONDS = 1800.0  # 30 minutes (matches HRRR/IFS hourly update cadence)
+_PACING_LOCK = threading.Lock()
+_LAST_REQ_TS = 0.0
 
 # 6 log-spaced distances (km) along the primary 0-380 km solar corridor
 CORRIDOR_DISTANCES_KM: list[float] = [0.0, 15.0, 45.0, 100.0, 190.0, 320.0]
@@ -85,18 +89,32 @@ def bearing_offset_lat_lon_km(
 
 
 def _get_json(url: str, timeout: float = 10.0) -> Any:
+    global _LAST_REQ_TS
     import urllib.error
 
     last_exc: Exception | None = None
-    for attempt in range(4):
+    for attempt in range(5):
+        with _PACING_LOCK:
+            now_m = time.monotonic()
+            gap = 0.42 - (now_m - _LAST_REQ_TS)
+            if gap > 0:
+                time.sleep(gap)
+            _LAST_REQ_TS = time.monotonic()
         try:
             req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             last_exc = exc
-            if exc.code in (429, 502, 503, 504) and attempt < 3:
-                time.sleep(1.8 * (2**attempt))
+            if exc.code in (429, 502, 503, 504) and attempt < 4:
+                retry_hdr = exc.headers.get("Retry-After") if exc.headers else None
+                wait_s = 2.4 * (2**attempt) + random.uniform(0.15, 0.75)
+                if retry_hdr:
+                    try:
+                        wait_s = max(wait_s, min(20.0, float(retry_hdr)))
+                    except ValueError:
+                        pass
+                time.sleep(min(22.0, wait_s))
                 continue
             raise
         except Exception as exc:
@@ -617,6 +635,15 @@ def fetch_24h_corridor_and_models(
             aq_docs = f_aq.result()
         except Exception as exc:
             errors.append(f"CAMS AQ fetch warning: {exc}")
+
+    if len(point_docs) != len(coords) and disk_path.exists():
+        try:
+            stale_cached = json.loads(disk_path.read_text(encoding="utf-8"))
+            if stale_cached.get("ok"):
+                _MEM_CACHE[cache_key] = (now_mono, stale_cached)
+                return stale_cached
+        except Exception:
+            pass
 
     # Parse 24-hour CAMS aerosol & ozone time series
     aod_0km_24h = [0.065] * 24
