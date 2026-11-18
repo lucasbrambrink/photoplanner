@@ -1,5 +1,5 @@
 """
-Historical Ground-Truth Backtesting & Multi-Sensor Calibration Harness (`planner/weather/backtest.py`, v4.0).
+Historical Ground-Truth Backtesting & Multi-Sensor Calibration Harness (`planner/weather/backtest.py`, v4.2).
 
 Evaluates PhotoPlanner's unified multi-layer atmospheric nowcasting & forecasting engine across
 **24 real 2025 California golden-hour shoots** spanning **all 4 seasons** (Winter, Spring, Summer,
@@ -9,7 +9,7 @@ Autumn) and **4 distinct geographic/elevation regimes**:
   3. Central Coast / Monterey Bay (`Garrapata / Big Sur`, `180 m` / `591 ft` ASL)
   4. High Sierra Alpine (`Half Dome` `2,693 m` / `8,835 ft` & `Clouds Rest` `3,026 m` / `9,928 ft`)
 
-Four Empirical Verification Tracks (strictly causal `scan_end_utc <= t_issue` at forecast time):
+Five Empirical Verification Tracks (strictly causal `scan_end_utc <= t_issue` at forecast time):
 - **Track 1 (Vertical Altitude & Inversion Accuracy)**: Evaluates boundary-layer fog lid altitude,
   inversion strength (`°F`), ASOS ceilometer cloud-base alignment, and summit-above-fog vs
   immersed-in-fog classification against independent `00Z` NWS radiosonde balloons (`KOAK`, `KVBG`,
@@ -19,13 +19,18 @@ Four Empirical Verification Tracks (strictly causal `scan_end_utc <= t_issue` at
   `ABI-L2-ACTPC`, 3D cloud-top parallax displacement (`GOES-18` `-137.0° W`), coastal leeward
   orographic stratus pinning, and 6-station `0–320 km` corridor cloud skill (`+0.5h..+3.0h`).
 - **Track 3 (True Lead-Time Forecast Skill Curve: `+1h`, `+3h`, `+24h`, `+72h` Hindcasts)**:
-  Evaluates causal nowcasts (`+1h`, `+3h`) and archived Open-Meteo `previous-runs-api` historical
-  forecast runs (`+24h` Day-1, `+72h` Day-3) against both Multi-Sensor Observed Truth and
-  independent pre-sunset pyranometer/irradiance transmittance (`DNI / DNI_clear`).
+  Evaluates causal nowcasts (`+1h`, `+3h`), native `3 km` NOAA HRRR S3 soundings, and archived
+  Open-Meteo `previous-runs-api` historical forecast runs (`+24h` Day-1, `+72h` Day-3) against
+  Multi-Sensor Observed Truth and `2 km`, `5-minute` `NREL NSRDB GOES-18 CONUS v4.0.0` golden-hour
+  Direct Normal Irradiance (`dni / clearsky_dni`), audited side-by-side against `31 km` `ERA5`.
 - **Track 4 (3D Cloud Hover-Card Confidence Calibration — `ECE` & Reliability Curve)**:
   Scores predicted per-layer hover-card `confidence_pct` (`fog`, `low`, `mid`, `high`) across
   all events and lead times against realized empirical layer accuracy, computing Expected
   Calibration Error (`ECE`) across confidence bins.
+- **Track 5 (Mountain & Coastal Webcam Sky Chromaticity & `2 km` NSRDB Irradiance Verification)**:
+  Extracts `R/B` warmth (`P90`), `R/G` crimson index, warm saturation (`P85`), correlated color
+  temperature (`K`), and `empirical_alpenglow_score` from archived `PhenoCam` / `NEON` golden-hour
+  imagery across all 24 events and compares against `alpenglow_score` and `2 km` `NSRDB` vs `ERA5`.
 """
 
 from __future__ import annotations
@@ -62,12 +67,16 @@ from .nwp_corridor import (
 )
 from .raob_sounding import fetch_raob_sounding
 from .station_obs import fetch_nearest_station_observation
+from .webcam_truth import (
+    fetch_nsrdb_2km_golden_hour_dni,
+    fetch_webcam_ground_truth,
+)
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 BACKTEST_CACHE_DIR = ROOT_DIR / "data" / "weather_cache" / "backtest_archive"
 SUMMARY_JSON_PATH = ROOT_DIR / "data" / "weather_cache" / "backtest_summary_v3.json"
 BENCHMARK_REPORT_JSON_PATH = ROOT_DIR / "data" / "weather_benchmarks" / "backtest_summary.json"
-USER_AGENT = "PhotoPlanner/4.0 (Multi-Sensor Historical Atmospheric Benchmark)"
+USER_AGENT = "PhotoPlanner/4.2 (Multi-Sensor Historical Atmospheric Benchmark)"
 
 # 24 real 2025 California golden-hour benchmark shoots spanning all 4 seasons & 4 geographic regimes
 BENCHMARK_EVENTS: list[dict[str, Any]] = [
@@ -925,6 +934,68 @@ def _evaluate_corridor_nowcast_event(
     return out_nc
 
 
+def _attach_v42_nsrdb_and_webcam_truth(ev: dict[str, Any], out_rc: dict[str, Any]) -> dict[str, Any]:
+    lat = float(ev["lat"])
+    lon = float(ev["lon"])
+    elev_m = float(ev["elev_m"])
+    d_str = str(ev["date"])
+
+    era5_dni = fetch_archived_golden_hour_dni(lat, lon, elev_m, d_str)
+    era5_pct = float(era5_dni["golden_hour_rel_transmittance_pct"])
+    nsrdb_doc = fetch_nsrdb_2km_golden_hour_dni(lat, lon, elev_m, d_str)
+    if nsrdb_doc is not None and nsrdb_doc.get("available"):
+        primary_dni_pct = float(nsrdb_doc["golden_hour_rel_transmittance_pct"])
+        dni_src = "nsrdb_2km_goes18_v4"
+    else:
+        primary_dni_pct = era5_pct
+        dni_src = "era5_31km_archive"
+
+    wb_doc = fetch_webcam_ground_truth(lat, lon, d_str, phase="sunset", elev_m=elev_m, analyze_pixels=True)
+    pc = wb_doc.get("primary_camera")
+    webcam_ref: dict[str, Any] | None = None
+    if pc is not None:
+        ch = pc.get("sky_chromaticity") or {}
+        pf = pc.get("primary_frame") or {}
+        truth_low = int(out_rc["modes"]["truth"]["cloud_low_pct"])
+        cross_ridge_fog = bool(
+            ev["region"] == "coastal"
+            and float(pc["lon"]) > lon + 0.20
+            and truth_low >= 55
+        )
+        webcam_ref = {
+            "camera_id": pc["camera_id"],
+            "provider_label": pc["provider_label"],
+            "distance_km": pc["distance_km"],
+            "camera_lat": pc["lat"],
+            "camera_lon": pc["lon"],
+            "camera_elev_m": pc["elev_m"],
+            "azimuth_deg": pc["azimuth_deg"],
+            "timestamp_local": pf.get("timestamp_local"),
+            "offset_vs_sunset_min": pf.get("offset_vs_sunset_min"),
+            "is_airmass_matched": not cross_ridge_fog,
+            "sky_chromaticity": {
+                "available": bool(ch.get("available")),
+                "is_ir_night_mode": bool(ch.get("is_ir_night_mode")),
+                "rb_warmth_p90": ch.get("rb_warmth_p90"),
+                "rg_ratio_p90": ch.get("rg_ratio_p90"),
+                "saturation_p85": ch.get("saturation_p85"),
+                "estimated_color_temp_kelvin": ch.get("estimated_color_temp_kelvin"),
+                "empirical_alpenglow_score": ch.get("empirical_alpenglow_score"),
+                "sky_grade": ch.get("sky_grade"),
+            },
+        }
+
+    out_rc["dni_truth_source"] = dni_src
+    out_rc["era5_31km_golden_truth_pct"] = era5_pct
+    out_rc["nsrdb_2km_golden_truth_pct"] = (
+        float(nsrdb_doc["golden_hour_rel_transmittance_pct"]) if nsrdb_doc else None
+    )
+    out_rc["nsrdb_2km_ref"] = nsrdb_doc
+    out_rc["dni_golden_truth_pct"] = primary_dni_pct
+    out_rc["webcam_ref"] = webcam_ref
+    return out_rc
+
+
 def _evaluate_multisensor_solver_event(ev: dict[str, Any], refresh: bool = False) -> dict[str, Any]:
     """
     Evaluates end-to-end `solve_weather_and_corridor` across:
@@ -935,15 +1006,27 @@ def _evaluate_multisensor_solver_event(ev: dict[str, Any], refresh: bool = False
       - `hindcast_24h` (Archived Open-Meteo `previous-runs-api` Day-1 forecast)
       - `hindcast_72h` (Archived Open-Meteo `previous-runs-api` Day-3 forecast)
       - `nwp_only` (Raw pressure-level NWP reanalysis without satellite/ASOS/RAOB)
-    Plus backward-compatible `1.0h, 3.0h, 24.0h` calibrated vs uncalibrated DNI/Raycast metrics.
+    Enriched in `v4.2` with `2 km` `NREL NSRDB v4.0.0` golden-hour irradiance and archived
+    `PhenoCam` / `NEON` golden-hour sky chromaticity ground truth.
     """
     BACKTEST_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    ev_cache = BACKTEST_CACHE_DIR / f"rc_ev_v41_{ev['id']}.json"
+    ev_cache = BACKTEST_CACHE_DIR / f"rc_ev_v42_{ev['id']}.json"
     if (not refresh) and ev_cache.exists():
         try:
             cached = json.loads(ev_cache.read_text(encoding="utf-8"))
-            print(f"  [Track 1/3/4 Solver] {ev['id']} ({ev['date']}) cached", flush=True)
+            print(f"  [Track 1/3/4/5 Solver] {ev['id']} ({ev['date']}) cached", flush=True)
             return cached
+        except Exception:
+            pass
+
+    ev_cache_v41 = BACKTEST_CACHE_DIR / f"rc_ev_v41_{ev['id']}.json"
+    if (not refresh) and ev_cache_v41.exists():
+        try:
+            base_rc = json.loads(ev_cache_v41.read_text(encoding="utf-8"))
+            out_rc = _attach_v42_nsrdb_and_webcam_truth(ev, base_rc)
+            ev_cache.write_text(json.dumps(out_rc), encoding="utf-8")
+            print(f"  [Track 1/3/4/5 Solver] {ev['id']} ({ev['date']}) upgraded v4.1->v4.2", flush=True)
+            return out_rc
         except Exception:
             pass
 
@@ -1129,11 +1212,12 @@ def _evaluate_multisensor_solver_event(ev: dict[str, Any], refresh: bool = False
         "modes": modes_summary,
         "leads": lead_evals,
     }
+    out_rc = _attach_v42_nsrdb_and_webcam_truth(ev, out_rc)
     try:
         ev_cache.write_text(json.dumps(out_rc), encoding="utf-8")
     except Exception:
         pass
-    print(f"  [Track 1/3/4 Solver] {ev['id']} ({ev['date']}) done", flush=True)
+    print(f"  [Track 1/3/4/5 Solver] {ev['id']} ({ev['date']}) done", flush=True)
     return out_rc
 
 
@@ -1405,6 +1489,8 @@ def run_full_backtest_suite(
         dni_errs = [abs(r["modes"][m_key]["golden_exp_pct"] - r["dni_golden_truth_pct"]) for r in rc_results]
         dni_preds = [r["modes"][m_key]["golden_exp_pct"] for r in rc_results]
         dni_truths = [r["dni_golden_truth_pct"] for r in rc_results]
+        era5_truths = [float(r.get("era5_31km_golden_truth_pct", r["dni_golden_truth_pct"])) for r in rc_results]
+        era5_errs = [abs(p - e) for p, e in zip(dni_preds, era5_truths)]
         dni_cov = [
             1.0 if (r["modes"][m_key]["golden_p10_pct"] - 1.5 <= r["dni_golden_truth_pct"] <= r["modes"][m_key]["golden_p90_pct"] + 1.5) else 0.0
             for r in rc_results
@@ -1414,6 +1500,7 @@ def run_full_backtest_suite(
             for r in rc_results
         ]
         r_dni = float(np.corrcoef(dni_preds, dni_truths)[0, 1]) if len(dni_preds) > 2 else 0.0
+        r_era5 = float(np.corrcoef(dni_preds, era5_truths)[0, 1]) if len(dni_preds) > 2 else 0.0
         lead_time_hindcast_skill[m_key] = {
             "cloud_low_mae_pp": round(float(np.mean(low_errs)), 2),
             "cloud_mid_mae_pp": round(float(np.mean(mid_errs)), 2),
@@ -1423,6 +1510,8 @@ def run_full_backtest_suite(
             "alpenglow_score_mae_pts": round(float(np.mean(alp_errs)), 2),
             "golden_hour_dni_mae_pp": round(float(np.mean(dni_errs)), 2),
             "golden_hour_dni_pearson_r": round(r_dni, 3),
+            "era5_31km_dni_mae_pp": round(float(np.mean(era5_errs)), 2),
+            "era5_31km_dni_pearson_r": round(r_era5, 3),
             "golden_hour_p10_p90_coverage_pct": round(float(np.mean(dni_cov)) * 100.0, 1),
             "sunset_p10_p90_coverage_pct": round(float(np.mean(ss_cov)) * 100.0, 1),
         }
@@ -1460,7 +1549,7 @@ def run_full_backtest_suite(
                 ss_cov_l.append(
                     1.0 if (m_rec["sunset_p10_pct"] - 1.5 <= t_ss <= m_rec["sunset_p90_pct"] + 1.5) else 0.0
                 )
-                ss_widths.append(m_rec["sunset_p90_pct"] - m_rec["sunset_p90_pct"])
+                ss_widths.append(m_rec["sunset_p90_pct"] - m_rec["sunset_p10_pct"])
 
             corr_gh = float(np.corrcoef(gh_preds, gh_truths)[0, 1]) if len(gh_preds) > 2 else 0.0
             raycast_skill_by_lead.setdefault(lkey, {})[mode] = {
@@ -1507,9 +1596,90 @@ def run_full_backtest_suite(
     # --- Track 4: 3D Cloud Hover-Card Confidence Calibration ---
     confidence_calibration = _compute_confidence_calibration(rc_results)
 
+    # --- Track 5: Mountain & Coastal Webcam Sky Chromaticity + 2 km NSRDB Irradiance Verification ---
+    wb_valid_events = [
+        r for r in rc_results
+        if r.get("webcam_ref") is not None
+        and r["webcam_ref"]["sky_chromaticity"].get("available")
+        and not r["webcam_ref"]["sky_chromaticity"].get("is_ir_night_mode")
+    ]
+    wb_matched_events = [r for r in wb_valid_events if r["webcam_ref"].get("is_airmass_matched", True)]
+
+    burner_regimes = {
+        "clear_corridor", "clear_alpine", "marine_cloud_sea",
+        "coastal_cirrus_burner", "sierra_cirrus_burner",
+    }
+    overcast_regimes = {
+        "frontal_overcast", "storm_overcast", "crest_attenuation",
+        "sierra_cirrus_wave", "marine_stratus",
+    }
+    burner_wb = [r for r in wb_matched_events if r["regime"] in burner_regimes]
+    overcast_wb = [r for r in wb_matched_events if r["regime"] in overcast_regimes]
+
+    emp_all = [float(r["webcam_ref"]["sky_chromaticity"]["empirical_alpenglow_score"]) for r in wb_valid_events]
+    sol_all = [float(r["modes"]["truth"]["alpenglow_score"]) for r in wb_valid_events]
+    emp_mat = [float(r["webcam_ref"]["sky_chromaticity"]["empirical_alpenglow_score"]) for r in wb_matched_events]
+    sol_mat = [float(r["modes"]["truth"]["alpenglow_score"]) for r in wb_matched_events]
+
+    nsrdb_audit_by_mode: dict[str, Any] = {}
+    for m_key in ("truth", "nowcast_1h", "nowcast_3h", "hindcast_24h"):
+        preds_m = [float(r["modes"][m_key]["golden_exp_pct"]) for r in rc_results]
+        t_ns = [float(r["dni_golden_truth_pct"]) for r in rc_results]
+        t_er = [float(r.get("era5_31km_golden_truth_pct", r["dni_golden_truth_pct"])) for r in rc_results]
+        nsrdb_audit_by_mode[m_key] = {
+            "era5_31km_mae_pp": round(float(np.mean([abs(p - e) for p, e in zip(preds_m, t_er)])), 2),
+            "nsrdb_2km_mae_pp": round(float(np.mean([abs(p - n) for p, n in zip(preds_m, t_ns)])), 2),
+            "era5_31km_pearson_r": round(float(np.corrcoef(preds_m, t_er)[0, 1]), 3) if len(preds_m) > 2 else 0.0,
+            "nsrdb_2km_pearson_r": round(float(np.corrcoef(preds_m, t_ns)[0, 1]), 3) if len(preds_m) > 2 else 0.0,
+        }
+
+    coastal_deltas = [
+        abs(float(r["nsrdb_2km_golden_truth_pct"]) - float(r["era5_31km_golden_truth_pct"]))
+        for r in rc_results
+        if r["region"] == "coastal" and r.get("nsrdb_2km_golden_truth_pct") is not None
+    ]
+
+    mean_burner_rb = float(np.mean([r["webcam_ref"]["sky_chromaticity"]["rb_warmth_p90"] for r in burner_wb])) if burner_wb else 1.0
+    mean_overcast_rb = float(np.mean([r["webcam_ref"]["sky_chromaticity"]["rb_warmth_p90"] for r in overcast_wb])) if overcast_wb else 1.0
+    mean_burner_emp = float(np.mean([r["webcam_ref"]["sky_chromaticity"]["empirical_alpenglow_score"] for r in burner_wb])) if burner_wb else 0.0
+    mean_overcast_emp = float(np.mean([r["webcam_ref"]["sky_chromaticity"]["empirical_alpenglow_score"] for r in overcast_wb])) if overcast_wb else 0.0
+
+    webcam_chromaticity_verification = {
+        "n_events": len(rc_results),
+        "n_matched_archive_cameras": sum(1 for r in rc_results if r.get("webcam_ref") is not None),
+        "n_valid_rgb_frames": len(wb_valid_events),
+        "archive_recall_pct": round(100.0 * len(wb_valid_events) / max(1, len(rc_results)), 1),
+        "cameras_used": sorted({r["webcam_ref"]["camera_id"] for r in wb_valid_events}),
+        "regime_chromaticity_separation": {
+            "n_burner_or_clear_events": len(burner_wb),
+            "n_overcast_or_fog_events": len(overcast_wb),
+            "mean_burner_rb_warmth_p90": round(mean_burner_rb, 3),
+            "mean_overcast_rb_warmth_p90": round(mean_overcast_rb, 3),
+            "rb_warmth_separation_ratio": round(mean_burner_rb / max(1e-4, mean_overcast_rb), 3),
+            "mean_burner_kelvin": int(round(float(np.mean([r["webcam_ref"]["sky_chromaticity"]["estimated_color_temp_kelvin"] for r in burner_wb])))) if burner_wb else 0,
+            "mean_overcast_kelvin": int(round(float(np.mean([r["webcam_ref"]["sky_chromaticity"]["estimated_color_temp_kelvin"] for r in overcast_wb])))) if overcast_wb else 0,
+            "mean_burner_empirical_glow": round(mean_burner_emp, 1),
+            "mean_overcast_empirical_glow": round(mean_overcast_emp, 1),
+            "empirical_glow_separation_pts": round(mean_burner_emp - mean_overcast_emp, 1),
+        },
+        "alpenglow_score_alignment": {
+            "all_events_n": len(wb_valid_events),
+            "all_events_mae_pts": round(float(np.mean(np.abs(np.array(emp_all) - np.array(sol_all)))), 2) if emp_all else None,
+            "all_events_pearson_r": round(float(np.corrcoef(emp_all, sol_all)[0, 1]), 3) if len(emp_all) > 2 else None,
+            "airmass_matched_n": len(wb_matched_events),
+            "airmass_matched_mae_pts": round(float(np.mean(np.abs(np.array(emp_mat) - np.array(sol_mat)))), 2) if emp_mat else None,
+            "airmass_matched_pearson_r": round(float(np.corrcoef(emp_mat, sol_mat)[0, 1]), 3) if len(emp_mat) > 2 else None,
+        },
+        "nsrdb_2km_vs_era5_31km_irradiance": {
+            "n_nsrdb_2km_events": sum(1 for r in rc_results if r.get("nsrdb_2km_golden_truth_pct") is not None),
+            "mean_coastal_grid_blur_delta_pp": round(float(np.mean(coastal_deltas)), 2) if coastal_deltas else 0.0,
+            "by_mode": nsrdb_audit_by_mode,
+        },
+    }
+
     elapsed_s = round(time.perf_counter() - t_start, 2)
     summary = {
-        "schema_version": "v4.1",
+        "schema_version": "v4.2",
         "generated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "elapsed_seconds": elapsed_s,
         "n_events": len(BENCHMARK_EVENTS),
@@ -1522,6 +1692,7 @@ def run_full_backtest_suite(
         "lead_time_hindcast_skill": lead_time_hindcast_skill,
         "raycast_calibration_by_lead": raycast_skill_by_lead,
         "confidence_calibration_verification": confidence_calibration,
+        "webcam_chromaticity_verification": webcam_chromaticity_verification,
         "seasonal_breakdown": seasonal_breakdown,
         "regional_breakdown": regional_breakdown,
         "events_detail": rc_results,
@@ -1535,7 +1706,7 @@ def run_full_backtest_suite(
 
 
 if __name__ == "__main__":
-    print("Running PhotoPlanner v4.1 Multi-Sensor + Native HRRR S3 Benchmark (N=24 events across 4 seasons)...", flush=True)
+    print("Running PhotoPlanner v4.2 Multi-Sensor + HRRR S3 + 2km NSRDB + Webcam Chromaticity Benchmark (N=24)...", flush=True)
     res = run_full_backtest_suite(max_workers=2)
     print(f"\nCompleted in {res['elapsed_seconds']}s — saved to {SUMMARY_JSON_PATH} and {BENCHMARK_REPORT_JSON_PATH}", flush=True)
     print("\n=== TRACK 1: Vertical Altitude & Inversion Accuracy vs 00Z RAOB Balloons & ASOS ===")
@@ -1544,11 +1715,20 @@ if __name__ == "__main__":
     print("\n=== TRACK 2: Multi-Layer CCLC+BTD vs Single-Layer ACTPC ===")
     mlv = res["multilayer_under_cirrus_verification"]
     print(f"  Overlap/Stratus Events (N={mlv['n_overlap_or_stratus_events']}): Single-Layer MAE={mlv['single_layer_actpc_low_mae_vs_asos_pct']}% -> Multi-Layer CCLC+BTD MAE={mlv['multilayer_cclc_btd_low_mae_vs_asos_pct']}% ({mlv['satellite_low_cloud_error_reduction_pct']}% reduction)")
-    print("\n=== TRACK 3: Lead-Time Forecast Skill Curve (+1h -> +72h Hindcasts) ===")
+    print("\n=== TRACK 3: Lead-Time Forecast Skill Curve (+1h -> +72h Hindcasts, 2km NSRDB v4.0.0) ===")
     for mk, mv in res["lead_time_hindcast_skill"].items():
-        print(f"  {mk:14s} | Low MAE: {mv['cloud_low_mae_pp']:5.2f} pp | High MAE: {mv['cloud_high_mae_pp']:5.2f} pp | Ray MAE: {mv['sunset_ray_transmittance_mae_pp']:5.2f} pp | DNI MAE: {mv['golden_hour_dni_mae_pp']:5.2f} pp (r={mv['golden_hour_dni_pearson_r']:.3f}) | Alpenglow MAE: {mv['alpenglow_score_mae_pts']:5.2f}")
+        print(f"  {mk:14s} | Low MAE: {mv['cloud_low_mae_pp']:5.2f} pp | High MAE: {mv['cloud_high_mae_pp']:5.2f} pp | Ray MAE: {mv['sunset_ray_transmittance_mae_pp']:5.2f} pp | 2km DNI MAE: {mv['golden_hour_dni_mae_pp']:5.2f} pp (r={mv['golden_hour_dni_pearson_r']:.3f} vs ERA5 r={mv['era5_31km_dni_pearson_r']:.3f}) | Alpenglow MAE: {mv['alpenglow_score_mae_pts']:5.2f}")
     print("\n=== TRACK 4: 3D Hover-Card Confidence Calibration ===")
     cc = res["confidence_calibration_verification"]
     print(f"  ECE = {cc['expected_calibration_error_pct']}% across {cc['n_total_layer_predictions']} layer predictions")
     for b_k, b_v in cc["reliability_bins"].items():
         print(f"    {b_k:16s} (n={b_v['n_layer_predictions']:3d}): Pred Conf={b_v['mean_predicted_confidence_pct']:5.1f}% vs Empirical={b_v['mean_empirical_accuracy_pct']:5.1f}% (<=20pp hit={b_v['within_20pp_hit_rate_pct']:5.1f}%)")
+    print("\n=== TRACK 5: Mountain Webcam Sky Chromaticity & 2km NSRDB Irradiance Verification ===")
+    wv = res["webcam_chromaticity_verification"]
+    sep = wv["regime_chromaticity_separation"]
+    ali = wv["alpenglow_score_alignment"]
+    nsa = wv["nsrdb_2km_vs_era5_31km_irradiance"]
+    print(f"  Archived RGB Recall: {wv['n_valid_rgb_frames']}/{wv['n_events']} ({wv['archive_recall_pct']}%) across {wv['cameras_used']}")
+    print(f"  Burner/Clear vs Overcast/Fog Sky Warmth: RB_p90 {sep['mean_burner_rb_warmth_p90']:.2f} ({sep['mean_burner_kelvin']}K, Glow {sep['mean_burner_empirical_glow']}) vs {sep['mean_overcast_rb_warmth_p90']:.2f} ({sep['mean_overcast_kelvin']}K, Glow {sep['mean_overcast_empirical_glow']}) -> +{sep['empirical_glow_separation_pts']} pts")
+    print(f"  Alpenglow Alignment (Airmass-Matched N={ali['airmass_matched_n']}): r={ali['airmass_matched_pearson_r']:.3f}, MAE={ali['airmass_matched_mae_pts']} pts")
+    print(f"  2km NSRDB vs 31km ERA5 Coastal Blur Delta: {nsa['mean_coastal_grid_blur_delta_pp']} pp | Truth r: {nsa['by_mode']['truth']['era5_31km_pearson_r']:.3f} -> {nsa['by_mode']['truth']['nsrdb_2km_pearson_r']:.3f}")

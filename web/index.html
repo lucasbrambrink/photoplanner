@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="color-scheme" content="light dark" />
   <title>PhotoPlanner 3D — GPU Volumetric Cloud, 3D Cirrus &amp; Topographic Ray Engine</title>
-  <link rel="stylesheet" href="/styles.css?v=20261117a" />
+  <link rel="stylesheet" href="/styles.css?v=20261117b" />
   <script type="importmap">
     {
       "imports": {
@@ -328,6 +328,20 @@
             <p class="atmo-sim-disclosure" id="atmo-sim-disclosure">
               Layer altitudes, coverage &amp; wind shear come from satellite, METAR &amp; NWP soundings; fine 1m 3D billows &amp; cirrus wisps are physically simulated on GPU.
             </p>
+          </div>
+
+          <!-- Matched Mountain / Coastal Webcam Ground-Truth Summary Strip -->
+          <div class="webcam-sidebar-strip" id="webcam-sidebar-strip">
+            <div class="webcam-sidebar-meta">
+              <span class="webcam-swatch-dot" id="webcam-sidebar-swatch" aria-hidden="true"></span>
+              <div class="webcam-sidebar-text">
+                <strong id="webcam-sidebar-title">Matching Mountain Webcam…</strong>
+                <span id="webcam-sidebar-sub">PhenoCam / ALERTCalifornia RGB sky chromaticity</span>
+              </div>
+            </div>
+            <button type="button" class="btn-ghost btn-sm webcam-open-btn" id="btn-sidebar-open-webcam">
+              📷 Split View
+            </button>
           </div>
 
           <!-- Altitude-Ordered 4-Layer Vertical Stack (High Ice -> Mid Ac/Wave -> Low Cu -> Sub-Inversion Fog) -->
@@ -750,6 +764,16 @@
             >
               ✨ Scenarios
             </button>
+
+            <button
+              type="button"
+              class="toolbar-pill-btn webcam-toolbar-pill"
+              id="btn-toggle-webcam-drawer"
+              aria-expanded="false"
+              title="Side-by-side mountain/coastal webcam ground truth &amp; 3D camera snap"
+            >
+              📷 Webcam
+            </button>
           </div>
 
           <div class="hud-cluster-right">
@@ -773,7 +797,7 @@
           </div>
         </div>
 
-        <!-- Row 2: Elastic Middle Framing Stage (Viewfinder Reticle, Sightline Inspector, Coords) -->
+        <!-- Row 2: Elastic Middle Framing Stage (Viewfinder Reticle, Sightline Inspector, Webcam Split-View, Coords) -->
         <div class="viewport-hud-middle">
           <!-- First-Person Camera Viewfinder Reticle Overlay -->
           <div class="viewfinder-overlay" id="viewfinder-overlay" hidden>
@@ -792,6 +816,72 @@
               VP1 VIEWFINDER • 24–50mm • Bearing 117.9° (ESE) • 1.66 mi to Half Dome
             </div>
           </div>
+
+          <!-- Side-by-Side Mountain / Coastal Webcam Ground-Truth Verification Drawer -->
+          <aside class="webcam-truth-card" id="webcam-truth-card" hidden aria-label="Mountain Webcam Ground-Truth Verification">
+            <div class="inspector-header webcam-card-header">
+              <div class="inspector-title-wrap">
+                <span class="inspector-eyebrow webcam-eyebrow" id="webcam-card-eyebrow">WEBCAM GROUND TRUTH • SKY CHROMATICITY</span>
+                <h4 class="inspector-title" id="webcam-card-title">Matched Mountain Camera</h4>
+              </div>
+              <div class="inspector-header-actions">
+                <button type="button" class="btn-ghost btn-sm" id="btn-close-webcam-card" aria-label="Close Webcam Ground Truth">
+                  ✕
+                </button>
+              </div>
+            </div>
+
+            <div class="webcam-camera-tabs" id="webcam-camera-tabs" role="tablist" aria-label="Matched Webcams" hidden></div>
+
+            <div class="webcam-frame-wrap" id="webcam-frame-wrap">
+              <img
+                id="webcam-frame-img"
+                class="webcam-frame-img"
+                crossorigin="anonymous"
+                alt="Matched timestamped mountain or coastal webcam photograph"
+              />
+              <div class="webcam-sky-roi-band" id="webcam-sky-roi-band" title="Calibrated sky chromaticity sampling band (y = 4%–20%)">
+                <span>SKY CHROMATICITY ROI (4–20%)</span>
+              </div>
+              <div class="webcam-frame-badges">
+                <span class="webcam-ts-pill" id="webcam-ts-pill">--:-- Local</span>
+                <span class="webcam-az-pill" id="webcam-az-pill">Az ---° • FOV 62°</span>
+              </div>
+            </div>
+
+            <div class="webcam-timeline-chips" id="webcam-timeline-chips" role="group" aria-label="Golden-Hour Archive Timeline"></div>
+
+            <div class="metric-tiles-grid webcam-chroma-grid" id="webcam-chroma-grid">
+              <div class="metric-tile">
+                <span class="metric-tile-label">Sky R/B Warmth</span>
+                <strong class="metric-tile-val" id="val-wc-rb">--</strong>
+              </div>
+              <div class="metric-tile">
+                <span class="metric-tile-label">Webcam / Sim K</span>
+                <strong class="metric-tile-val" id="val-wc-kelvin">-- / -- K</strong>
+              </div>
+              <div class="metric-tile">
+                <span class="metric-tile-label">Observed Glow</span>
+                <strong class="metric-tile-val" id="val-wc-emp-score">-- / 100</strong>
+              </div>
+              <div class="metric-tile">
+                <span class="metric-tile-label">3D Engine Glow</span>
+                <strong class="metric-tile-val" id="val-wc-sim-score">-- / 100</strong>
+              </div>
+            </div>
+
+            <div class="webcam-snap-actions">
+              <button type="button" class="btn-primary webcam-snap-btn" id="btn-snap-webcam-camera">
+                🎯 Snap 3D Camera to Webcam Azimuth / FOV
+              </button>
+              <button type="button" class="btn-ghost btn-sm" id="btn-reset-webcam-snap" hidden>
+                ↺ 3D Orbit
+              </button>
+            </div>
+            <p class="webcam-snap-note" id="webcam-snap-note">
+              Matches Three.js horizontal FOV &amp; compass azimuth so you can compare simulated clouds &amp; Chappuis glow side-by-side against real photography.
+            </p>
+          </aside>
 
           <!-- Contextual Clicked Tripod & Sightline Cross-Section Inspector -->
           <aside class="tripod-inspector-card" id="tripod-inspector-card" hidden aria-label="Custom Tripod Line-of-Sight Inspector">
@@ -897,6 +987,6 @@
     </section>
   </main>
 
-  <script type="module" src="/app.js?v=20261117a"></script>
+  <script type="module" src="/app.js?v=20261117b"></script>
 </body>
 </html>

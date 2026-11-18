@@ -8,13 +8,23 @@ from .backtest import BENCHMARK_REPORT_JSON_PATH, SUMMARY_JSON_PATH, run_full_ba
 from .corridor_solver import CALIBRATION_CONFIG, solve_weather_and_corridor
 from .hrrr_s3 import fetch_hrrr_s3_corridor
 from .raob_sounding import fetch_raob_sounding
+from .webcam_truth import (
+    analyze_webcam_sky_chromaticity,
+    fetch_cached_webcam_jpeg,
+    fetch_nsrdb_2km_golden_hour_dni,
+    fetch_webcam_ground_truth,
+)
 
 __all__ = [
     "BENCHMARK_REPORT_JSON_PATH",
     "CALIBRATION_CONFIG",
     "SUMMARY_JSON_PATH",
+    "analyze_webcam_sky_chromaticity",
+    "fetch_cached_webcam_jpeg",
     "fetch_hrrr_s3_corridor",
+    "fetch_nsrdb_2km_golden_hour_dni",
     "fetch_raob_sounding",
+    "fetch_webcam_ground_truth",
     "run_full_backtest_suite",
     "solve_weather_and_corridor",
 ]

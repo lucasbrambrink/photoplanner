@@ -1072,6 +1072,8 @@ const CORRIDOR_LUT_HELPER_GLSL3 = /* glsl */ `
   uniform float uHasCorridorHorizon;
   uniform float uUseCorridorAtmo;
   uniform float uCorridorLutSunElDeg;
+  uniform float uChappuisStrength;
+  uniform float uCorridorWarmth;
 
   vec4 sampleCorridorLut(float azimuthDeg, float zAslM) {
     float uAz = fract(azimuthDeg / 360.0) + (0.5 / 180.0);
@@ -1957,13 +1959,18 @@ const VOLUMETRIC_RAYMARCH_FRAGMENT_GLSL3 = /* glsl */ `
     float sinEl = sin(radians(max(localSunElDeg, 0.25)));
     float airMass = clamp(pressureRatio / (sinEl + 0.14 * pow(max(0.0, localSunElDeg + 3.4), -0.72)), 0.15, 11.5);
 
-    // Balanced Rayleigh + Chappuis ozone attenuation: luminous warm champagne-gold / apricot-ivory
-    // matching sunlit granite at sunset, transitioning to delicate coral-rose only at final horizon!
-    vec3 betaExt = vec3(0.024, 0.066, 0.134);
+    // Webcam-calibrated Rayleigh + Chappuis ozone attenuation: scales horizon crimson-amber warmth
+    // with live 380 km corridor transmittance & ozone slant path while keeping storm overcast cool slate-grey!
+    vec3 betaExt = vec3(0.024, 0.066 * mix(0.94, 1.08, clamp(uChappuisStrength * 0.5, 0.0, 1.0)), 0.134);
     vec3 sunCol = exp(-betaExt * airMass) * 3.35;
 
-    float roseHorizon = smoothstep(3.2, -1.2, localSunElDeg);
-    sunCol *= mix(vec3(1.0), vec3(1.16, 0.92, 0.84), roseHorizon);
+    float roseHorizon = smoothstep(3.4, -1.3, localSunElDeg) * clamp(uChappuisStrength, 0.35, 1.45);
+    vec3 chappuisTint = vec3(
+      1.16 * clamp(uCorridorWarmth, 0.86, 1.18),
+      0.91,
+      0.83 / clamp(uCorridorWarmth, 0.88, 1.16)
+    );
+    sunCol *= mix(vec3(1.0), chappuisTint, clamp(roseHorizon, 0.0, 1.15));
 
     float limbVis = smoothstep(-2.1, 0.45, localSunElDeg);
     if (uHasCorridorHorizon > 0.5 || uUseCorridorAtmo > 0.5) {
@@ -1984,18 +1991,19 @@ const VOLUMETRIC_RAYMARCH_FRAGMENT_GLSL3 = /* glsl */ `
     float dayT = smoothstep(-3.5, 12.0, uSunElDeg);
     float goldT = smoothstep(-6.0, -0.2, uSunElDeg) * (1.0 - smoothstep(3.5, 13.0, uSunElDeg));
     float nightT = 1.0 - smoothstep(-9.0, -2.2, uSunElDeg);
+    float warmGain = clamp(uCorridorWarmth, 0.82, 1.22);
 
     vec3 daySky = vec3(0.38, 0.52, 0.74) * (0.88 + 0.22 * clamp(zAsl / 10000.0, 0.0, 1.0));
-    vec3 duskSky = vec3(0.28, 0.32, 0.52) + vec3(0.16, 0.08, 0.14) * clamp(zAsl / 9500.0, 0.0, 1.15);
+    vec3 duskSky = vec3(0.28, 0.32, 0.52) + vec3(0.16 * warmGain, 0.08, 0.14) * clamp(zAsl / 9500.0, 0.0, 1.15);
     vec3 nightSky = vec3(0.012, 0.020, 0.042) + vec3(0.026, 0.040, 0.070) * uMoonIllum * smoothstep(-2.0, 14.0, uMoonElDeg);
 
     skyZenithIrr = mix(duskSky, daySky, dayT);
-    skyZenithIrr = mix(skyZenithIrr, vec3(0.32, 0.36, 0.56), goldT * 0.65);
+    skyZenithIrr = mix(skyZenithIrr, vec3(0.32 * warmGain, 0.36, 0.56), goldT * 0.65);
     skyZenithIrr = mix(skyZenithIrr, nightSky, nightT);
 
     // Subtle warm sunlit granite / coastal alpenglow bounce onto lower cloud bases
     vec3 dayBounce = vec3(0.22, 0.21, 0.20);
-    vec3 goldBounce = vec3(0.34, 0.24, 0.18);
+    vec3 goldBounce = vec3(0.34 * warmGain, 0.24, 0.18 / max(0.90, warmGain));
     vec3 duskBounce = vec3(0.12, 0.09, 0.12);
     groundBounceIrr = mix(duskBounce, dayBounce, dayT);
     groundBounceIrr = mix(groundBounceIrr, goldBounce, goldT * 0.75 + smoothstep(8.0, 0.5, uSunElDeg) * dayT * 0.35);
@@ -2569,6 +2577,8 @@ export class VolumetricAtmosphereEngine {
       uHasCorridorHorizon: { value: 0.0 },
       uUseCorridorAtmo: { value: 0.0 },
       uCorridorLutSunElDeg: { value: 0.6 },
+      uChappuisStrength: { value: 1.0 },
+      uCorridorWarmth: { value: 1.0 },
     };
 
     this.mesoscaleUniforms = {
@@ -3651,6 +3661,17 @@ export class VolumetricAtmosphereEngine {
     if (weather.corridor_lut) {
       this.setCorridorLut(weather.corridor_lut);
     }
+    const chappuisIdx = Number(weather.chappuis_rose_index ?? weather.corridor_raycast?.chappuis_rose_index ?? 0.28);
+    const beamTransPct = Number(weather.ray_transmittance_pct ?? 55.0);
+    const beamKelvin = Number(weather.color_temperature_kelvin ?? 2800.0);
+    const transGate = Math.max(0.28, Math.min(1.12, (beamTransPct + 14.0) / 68.0));
+    const kelvinWarmth = Math.max(0.84, Math.min(1.16, 1.18 - (beamKelvin - 2100.0) / 11500.0));
+    this.corridorUniforms.uChappuisStrength.value = Math.max(
+      0.38,
+      Math.min(1.38, (0.68 + chappuisIdx * 1.15) * transGate)
+    );
+    this.corridorUniforms.uCorridorWarmth.value =
+      beamTransPct < 16.0 ? Math.min(0.88, kelvinWarmth) : kelvinWarmth;
     if (weather.mesoscale_cloud_grid) {
       this.setMesoscaleCloudGrid(weather.mesoscale_cloud_grid);
     } else if (weather.spatial_cloud_field?.cells?.length) {

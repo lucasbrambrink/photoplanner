@@ -1,7 +1,7 @@
 {
-  "schema_version": "v4.1",
-  "generated_at_utc": "2026-11-17T18:14:00.034726+00:00",
-  "elapsed_seconds": 63.65,
+  "schema_version": "v4.2",
+  "generated_at_utc": "2026-11-17T19:28:21.444441+00:00",
+  "elapsed_seconds": 0.49,
   "n_events": 24,
   "calibration_config": {
     "nowcast_decay_hours": 2.65,
@@ -394,9 +394,11 @@
       "all_layer_mean_mae_pp": 11.03,
       "sunset_ray_transmittance_mae_pp": 13.12,
       "alpenglow_score_mae_pts": 12.04,
-      "golden_hour_dni_mae_pp": 32.56,
-      "golden_hour_dni_pearson_r": 0.431,
-      "golden_hour_p10_p90_coverage_pct": 45.8,
+      "golden_hour_dni_mae_pp": 22.84,
+      "golden_hour_dni_pearson_r": 0.809,
+      "era5_31km_dni_mae_pp": 32.56,
+      "era5_31km_dni_pearson_r": 0.431,
+      "golden_hour_p10_p90_coverage_pct": 58.3,
       "sunset_p10_p90_coverage_pct": 79.2
     },
     "nowcast_3h": {
@@ -406,9 +408,11 @@
       "all_layer_mean_mae_pp": 13.14,
       "sunset_ray_transmittance_mae_pp": 17.54,
       "alpenglow_score_mae_pts": 13.75,
-      "golden_hour_dni_mae_pp": 30.85,
-      "golden_hour_dni_pearson_r": 0.46,
-      "golden_hour_p10_p90_coverage_pct": 50.0,
+      "golden_hour_dni_mae_pp": 20.15,
+      "golden_hour_dni_pearson_r": 0.819,
+      "era5_31km_dni_mae_pp": 30.85,
+      "era5_31km_dni_pearson_r": 0.46,
+      "golden_hour_p10_p90_coverage_pct": 62.5,
       "sunset_p10_p90_coverage_pct": 79.2
     },
     "hindcast_24h": {
@@ -418,8 +422,10 @@
       "all_layer_mean_mae_pp": 12.24,
       "sunset_ray_transmittance_mae_pp": 18.04,
       "alpenglow_score_mae_pts": 16.54,
-      "golden_hour_dni_mae_pp": 27.93,
-      "golden_hour_dni_pearson_r": 0.497,
+      "golden_hour_dni_mae_pp": 24.89,
+      "golden_hour_dni_pearson_r": 0.683,
+      "era5_31km_dni_mae_pp": 27.93,
+      "era5_31km_dni_pearson_r": 0.497,
       "golden_hour_p10_p90_coverage_pct": 83.3,
       "sunset_p10_p90_coverage_pct": 75.0
     },
@@ -430,8 +436,10 @@
       "all_layer_mean_mae_pp": 19.29,
       "sunset_ray_transmittance_mae_pp": 22.79,
       "alpenglow_score_mae_pts": 19.79,
-      "golden_hour_dni_mae_pp": 24.9,
-      "golden_hour_dni_pearson_r": 0.526,
+      "golden_hour_dni_mae_pp": 27.42,
+      "golden_hour_dni_pearson_r": 0.578,
+      "era5_31km_dni_mae_pp": 24.9,
+      "era5_31km_dni_pearson_r": 0.526,
       "golden_hour_p10_p90_coverage_pct": 75.0,
       "sunset_p10_p90_coverage_pct": 75.0
     },
@@ -442,83 +450,85 @@
       "all_layer_mean_mae_pp": 12.32,
       "sunset_ray_transmittance_mae_pp": 23.12,
       "alpenglow_score_mae_pts": 21.08,
-      "golden_hour_dni_mae_pp": 25.42,
-      "golden_hour_dni_pearson_r": 0.526,
-      "golden_hour_p10_p90_coverage_pct": 79.2,
+      "golden_hour_dni_mae_pp": 18.31,
+      "golden_hour_dni_pearson_r": 0.809,
+      "era5_31km_dni_mae_pp": 25.42,
+      "era5_31km_dni_pearson_r": 0.526,
+      "golden_hour_p10_p90_coverage_pct": 87.5,
       "sunset_p10_p90_coverage_pct": 70.8
     }
   },
   "raycast_calibration_by_lead": {
     "1.0h": {
       "calibrated": {
-        "golden_hour_dni_mae_pct": 32.56,
-        "golden_hour_dni_rmse_pct": 41.7,
-        "golden_hour_dni_pearson_r": 0.431,
-        "golden_hour_p10_p90_coverage_pct": 45.8,
+        "golden_hour_dni_mae_pct": 22.84,
+        "golden_hour_dni_rmse_pct": 32.83,
+        "golden_hour_dni_pearson_r": 0.809,
+        "golden_hour_p10_p90_coverage_pct": 58.3,
         "golden_hour_mean_interval_width_pct": 34.0,
         "sunset_ray_mae_pct": 13.12,
         "sunset_ray_rmse_pct": 22.72,
         "sunset_p10_p90_coverage_pct": 79.2,
-        "sunset_mean_interval_width_pct": 0.0
+        "sunset_mean_interval_width_pct": 29.7
       },
       "uncalibrated": {
-        "golden_hour_dni_mae_pct": 30.7,
-        "golden_hour_dni_rmse_pct": 39.86,
-        "golden_hour_dni_pearson_r": 0.48,
-        "golden_hour_p10_p90_coverage_pct": 33.3,
+        "golden_hour_dni_mae_pct": 26.65,
+        "golden_hour_dni_rmse_pct": 36.31,
+        "golden_hour_dni_pearson_r": 0.771,
+        "golden_hour_p10_p90_coverage_pct": 29.2,
         "golden_hour_mean_interval_width_pct": 30.4,
         "sunset_ray_mae_pct": 13.58,
         "sunset_ray_rmse_pct": 25.23,
         "sunset_p10_p90_coverage_pct": 70.8,
-        "sunset_mean_interval_width_pct": 0.0
+        "sunset_mean_interval_width_pct": 17.0
       }
     },
     "3.0h": {
       "calibrated": {
-        "golden_hour_dni_mae_pct": 30.85,
-        "golden_hour_dni_rmse_pct": 39.44,
-        "golden_hour_dni_pearson_r": 0.46,
-        "golden_hour_p10_p90_coverage_pct": 50.0,
+        "golden_hour_dni_mae_pct": 20.15,
+        "golden_hour_dni_rmse_pct": 30.18,
+        "golden_hour_dni_pearson_r": 0.819,
+        "golden_hour_p10_p90_coverage_pct": 62.5,
         "golden_hour_mean_interval_width_pct": 37.6,
         "sunset_ray_mae_pct": 17.54,
         "sunset_ray_rmse_pct": 29.7,
         "sunset_p10_p90_coverage_pct": 79.2,
-        "sunset_mean_interval_width_pct": 0.0
+        "sunset_mean_interval_width_pct": 31.2
       },
       "uncalibrated": {
-        "golden_hour_dni_mae_pct": 28.39,
-        "golden_hour_dni_rmse_pct": 37.29,
-        "golden_hour_dni_pearson_r": 0.514,
+        "golden_hour_dni_mae_pct": 24.85,
+        "golden_hour_dni_rmse_pct": 34.2,
+        "golden_hour_dni_pearson_r": 0.783,
         "golden_hour_p10_p90_coverage_pct": 37.5,
         "golden_hour_mean_interval_width_pct": 34.7,
         "sunset_ray_mae_pct": 16.25,
         "sunset_ray_rmse_pct": 28.97,
         "sunset_p10_p90_coverage_pct": 66.7,
-        "sunset_mean_interval_width_pct": 0.0
+        "sunset_mean_interval_width_pct": 22.2
       }
     },
     "24.0h": {
       "calibrated": {
-        "golden_hour_dni_mae_pct": 27.93,
-        "golden_hour_dni_rmse_pct": 36.93,
-        "golden_hour_dni_pearson_r": 0.497,
+        "golden_hour_dni_mae_pct": 24.89,
+        "golden_hour_dni_rmse_pct": 35.24,
+        "golden_hour_dni_pearson_r": 0.683,
         "golden_hour_p10_p90_coverage_pct": 83.3,
         "golden_hour_mean_interval_width_pct": 61.2,
         "sunset_ray_mae_pct": 18.04,
         "sunset_ray_rmse_pct": 30.16,
         "sunset_p10_p90_coverage_pct": 75.0,
-        "sunset_mean_interval_width_pct": 0.0
+        "sunset_mean_interval_width_pct": 44.3
       },
       "uncalibrated": {
-        "golden_hour_dni_mae_pct": 25.72,
-        "golden_hour_dni_rmse_pct": 33.7,
-        "golden_hour_dni_pearson_r": 0.598,
-        "golden_hour_p10_p90_coverage_pct": 41.7,
+        "golden_hour_dni_mae_pct": 27.21,
+        "golden_hour_dni_rmse_pct": 37.4,
+        "golden_hour_dni_pearson_r": 0.671,
+        "golden_hour_p10_p90_coverage_pct": 37.5,
         "golden_hour_mean_interval_width_pct": 35.5,
         "sunset_ray_mae_pct": 19.67,
         "sunset_ray_rmse_pct": 28.77,
         "sunset_p10_p90_coverage_pct": 54.2,
-        "sunset_mean_interval_width_pct": 0.0
+        "sunset_mean_interval_width_pct": 30.5
       }
     }
   },
@@ -582,38 +592,101 @@
       }
     }
   },
+  "webcam_chromaticity_verification": {
+    "n_events": 24,
+    "n_matched_archive_cameras": 24,
+    "n_valid_rgb_frames": 24,
+    "archive_recall_pct": 100.0,
+    "cameras_used": [
+      "NEON.D17.SOAP.DP1.00033",
+      "NEON.D17.TEAK.DP1.00033",
+      "jasperridge",
+      "rushranch",
+      "santaluciapreserve1"
+    ],
+    "regime_chromaticity_separation": {
+      "n_burner_or_clear_events": 9,
+      "n_overcast_or_fog_events": 7,
+      "mean_burner_rb_warmth_p90": 1.403,
+      "mean_overcast_rb_warmth_p90": 0.99,
+      "rb_warmth_separation_ratio": 1.416,
+      "mean_burner_kelvin": 4102,
+      "mean_overcast_kelvin": 5310,
+      "mean_burner_empirical_glow": 58.4,
+      "mean_overcast_empirical_glow": 24.3,
+      "empirical_glow_separation_pts": 34.2
+    },
+    "alpenglow_score_alignment": {
+      "all_events_n": 24,
+      "all_events_mae_pts": 23.71,
+      "all_events_pearson_r": 0.442,
+      "airmass_matched_n": 20,
+      "airmass_matched_mae_pts": 23.25,
+      "airmass_matched_pearson_r": 0.525
+    },
+    "nsrdb_2km_vs_era5_31km_irradiance": {
+      "n_nsrdb_2km_events": 24,
+      "mean_coastal_grid_blur_delta_pp": 33.93,
+      "by_mode": {
+        "truth": {
+          "era5_31km_mae_pp": 35.33,
+          "nsrdb_2km_mae_pp": 26.0,
+          "era5_31km_pearson_r": 0.317,
+          "nsrdb_2km_pearson_r": 0.821
+        },
+        "nowcast_1h": {
+          "era5_31km_mae_pp": 32.56,
+          "nsrdb_2km_mae_pp": 22.84,
+          "era5_31km_pearson_r": 0.431,
+          "nsrdb_2km_pearson_r": 0.809
+        },
+        "nowcast_3h": {
+          "era5_31km_mae_pp": 30.85,
+          "nsrdb_2km_mae_pp": 20.15,
+          "era5_31km_pearson_r": 0.46,
+          "nsrdb_2km_pearson_r": 0.819
+        },
+        "hindcast_24h": {
+          "era5_31km_mae_pp": 27.93,
+          "nsrdb_2km_mae_pp": 24.89,
+          "era5_31km_pearson_r": 0.497,
+          "nsrdb_2km_pearson_r": 0.683
+        }
+      }
+    }
+  },
   "seasonal_breakdown": {
     "winter": {
       "n_events": 4,
       "nowcast_1h_ray_mae_pp": 21.5,
       "hindcast_24h_ray_mae_pp": 21.0,
       "hindcast_72h_ray_mae_pp": 18.0,
-      "nowcast_1h_dni_mae_pp": 29.52,
-      "hindcast_24h_dni_mae_pp": 32.25
+      "nowcast_1h_dni_mae_pp": 9.4,
+      "hindcast_24h_dni_mae_pp": 18.27
     },
     "spring": {
       "n_events": 9,
       "nowcast_1h_ray_mae_pp": 11.89,
       "hindcast_24h_ray_mae_pp": 20.67,
       "hindcast_72h_ray_mae_pp": 26.56,
-      "nowcast_1h_dni_mae_pp": 39.09,
-      "hindcast_24h_dni_mae_pp": 23.37
+      "nowcast_1h_dni_mae_pp": 38.18,
+      "hindcast_24h_dni_mae_pp": 37.32
     },
     "summer": {
       "n_events": 7,
       "nowcast_1h_ray_mae_pp": 6.57,
       "hindcast_24h_ray_mae_pp": 12.29,
       "hindcast_72h_ray_mae_pp": 22.57,
-      "nowcast_1h_dni_mae_pp": 40.31,
-      "hindcast_24h_dni_mae_pp": 43.84
+      "nowcast_1h_dni_mae_pp": 22.07,
+      "hindcast_24h_dni_mae_pp": 25.71
     },
     "autumn": {
       "n_events": 4,
       "nowcast_1h_ray_mae_pp": 19.0,
       "hindcast_24h_ray_mae_pp": 19.25,
       "hindcast_72h_ray_mae_pp": 19.5,
-      "nowcast_1h_dni_mae_pp": 7.35,
-      "hindcast_24h_dni_mae_pp": 6.0
+      "nowcast_1h_dni_mae_pp": 3.1,
+      "hindcast_24h_dni_mae_pp": 2.1
     }
   },
   "regional_breakdown": {
@@ -1290,6 +1363,44 @@
             }
           }
         }
+      },
+      "dni_truth_source": "nsrdb_2km_goes18_v4",
+      "era5_31km_golden_truth_pct": 99.0,
+      "nsrdb_2km_golden_truth_pct": 99.0,
+      "nsrdb_2km_ref": {
+        "available": true,
+        "source": "NREL NSRDB GOES-18 CONUS v4.0.0 (2 km, 5-min, 2025)",
+        "date": "2025-01-18",
+        "gid_0km": 55097,
+        "grid_lat": 37.6,
+        "grid_lon": -122.51,
+        "onshore_0km_transmittance_pct": 100.0,
+        "corridor_8km_transmittance_pct": 100.0,
+        "golden_hour_rel_transmittance_pct": 99.0,
+        "mean_dni_wm2": 660.7,
+        "mean_clearsky_dni_wm2": 660.7
+      },
+      "webcam_ref": {
+        "camera_id": "jasperridge",
+        "provider_label": "PhenoCam / NEON Scientific Archive",
+        "distance_km": 32.8,
+        "camera_lat": 37.40203,
+        "camera_lon": -122.22104,
+        "camera_elev_m": 197.0,
+        "azimuth_deg": 0.0,
+        "timestamp_local": "16:47",
+        "offset_vs_sunset_min": -19,
+        "is_airmass_matched": true,
+        "sky_chromaticity": {
+          "available": true,
+          "is_ir_night_mode": false,
+          "rb_warmth_p90": 1.169,
+          "rg_ratio_p90": 1.028,
+          "saturation_p85": 0.328,
+          "estimated_color_temp_kelvin": 4669,
+          "empirical_alpenglow_score": 41,
+          "sky_grade": "Crisp Clear Sky / Above-Inversion Dome"
+        }
       }
     },
     {
@@ -1301,7 +1412,7 @@
       "elev_m": 220.0,
       "date": "2025-05-06",
       "regime": "marine_stratus",
-      "dni_golden_truth_pct": 30.1,
+      "dni_golden_truth_pct": 63.5,
       "dni_18h_wm2": 263.3,
       "dni_19h_wm2": 59.2,
       "dni_samples": [
@@ -1931,6 +2042,44 @@
             }
           }
         }
+      },
+      "dni_truth_source": "nsrdb_2km_goes18_v4",
+      "era5_31km_golden_truth_pct": 30.1,
+      "nsrdb_2km_golden_truth_pct": 63.5,
+      "nsrdb_2km_ref": {
+        "available": true,
+        "source": "NREL NSRDB GOES-18 CONUS v4.0.0 (2 km, 5-min, 2025)",
+        "date": "2025-05-06",
+        "gid_0km": 55097,
+        "grid_lat": 37.6,
+        "grid_lon": -122.51,
+        "onshore_0km_transmittance_pct": 100.0,
+        "corridor_8km_transmittance_pct": 13.2,
+        "golden_hour_rel_transmittance_pct": 63.5,
+        "mean_dni_wm2": 550.8,
+        "mean_clearsky_dni_wm2": 550.8
+      },
+      "webcam_ref": {
+        "camera_id": "jasperridge",
+        "provider_label": "PhenoCam / NEON Scientific Archive",
+        "distance_km": 32.8,
+        "camera_lat": 37.40203,
+        "camera_lon": -122.22104,
+        "camera_elev_m": 197.0,
+        "azimuth_deg": 0.0,
+        "timestamp_local": "19:47",
+        "offset_vs_sunset_min": -7,
+        "is_airmass_matched": true,
+        "sky_chromaticity": {
+          "available": true,
+          "is_ir_night_mode": false,
+          "rb_warmth_p90": 1.112,
+          "rg_ratio_p90": 0.978,
+          "saturation_p85": 0.328,
+          "estimated_color_temp_kelvin": 4801,
+          "empirical_alpenglow_score": 37,
+          "sky_grade": "Crisp Clear Sky / Above-Inversion Dome"
+        }
       }
     },
     {
@@ -1942,7 +2091,7 @@
       "elev_m": 220.0,
       "date": "2025-05-12",
       "regime": "broken_coastal",
-      "dni_golden_truth_pct": 70.7,
+      "dni_golden_truth_pct": 13.6,
       "dni_18h_wm2": 422.0,
       "dni_19h_wm2": 215.4,
       "dni_samples": [
@@ -2572,6 +2721,44 @@
             }
           }
         }
+      },
+      "dni_truth_source": "nsrdb_2km_goes18_v4",
+      "era5_31km_golden_truth_pct": 70.7,
+      "nsrdb_2km_golden_truth_pct": 13.6,
+      "nsrdb_2km_ref": {
+        "available": true,
+        "source": "NREL NSRDB GOES-18 CONUS v4.0.0 (2 km, 5-min, 2025)",
+        "date": "2025-05-12",
+        "gid_0km": 55097,
+        "grid_lat": 37.6,
+        "grid_lon": -122.51,
+        "onshore_0km_transmittance_pct": 7.7,
+        "corridor_8km_transmittance_pct": 21.6,
+        "golden_hour_rel_transmittance_pct": 13.6,
+        "mean_dni_wm2": 56.9,
+        "mean_clearsky_dni_wm2": 494.6
+      },
+      "webcam_ref": {
+        "camera_id": "jasperridge",
+        "provider_label": "PhenoCam / NEON Scientific Archive",
+        "distance_km": 32.8,
+        "camera_lat": 37.40203,
+        "camera_lon": -122.22104,
+        "camera_elev_m": 197.0,
+        "azimuth_deg": 0.0,
+        "timestamp_local": "19:47",
+        "offset_vs_sunset_min": -11,
+        "is_airmass_matched": false,
+        "sky_chromaticity": {
+          "available": true,
+          "is_ir_night_mode": false,
+          "rb_warmth_p90": 0.881,
+          "rg_ratio_p90": 0.979,
+          "saturation_p85": 0.57,
+          "estimated_color_temp_kelvin": 5200,
+          "empirical_alpenglow_score": 29,
+          "sky_grade": "Crisp Clear Sky / Above-Inversion Dome"
+        }
       }
     },
     {
@@ -2583,7 +2770,7 @@
       "elev_m": 220.0,
       "date": "2025-05-16",
       "regime": "coastal_cirrus_burner",
-      "dni_golden_truth_pct": 97.3,
+      "dni_golden_truth_pct": 18.8,
       "dni_18h_wm2": 591.4,
       "dni_19h_wm2": 338.6,
       "dni_samples": [
@@ -3213,6 +3400,44 @@
             }
           }
         }
+      },
+      "dni_truth_source": "nsrdb_2km_goes18_v4",
+      "era5_31km_golden_truth_pct": 97.3,
+      "nsrdb_2km_golden_truth_pct": 18.8,
+      "nsrdb_2km_ref": {
+        "available": true,
+        "source": "NREL NSRDB GOES-18 CONUS v4.0.0 (2 km, 5-min, 2025)",
+        "date": "2025-05-16",
+        "gid_0km": 55097,
+        "grid_lat": 37.6,
+        "grid_lon": -122.51,
+        "onshore_0km_transmittance_pct": 12.3,
+        "corridor_8km_transmittance_pct": 27.7,
+        "golden_hour_rel_transmittance_pct": 18.8,
+        "mean_dni_wm2": 48.8,
+        "mean_clearsky_dni_wm2": 448.7
+      },
+      "webcam_ref": {
+        "camera_id": "jasperridge",
+        "provider_label": "PhenoCam / NEON Scientific Archive",
+        "distance_km": 32.8,
+        "camera_lat": 37.40203,
+        "camera_lon": -122.22104,
+        "camera_elev_m": 197.0,
+        "azimuth_deg": 0.0,
+        "timestamp_local": "19:17",
+        "offset_vs_sunset_min": -45,
+        "is_airmass_matched": true,
+        "sky_chromaticity": {
+          "available": true,
+          "is_ir_night_mode": false,
+          "rb_warmth_p90": 1.178,
+          "rg_ratio_p90": 0.978,
+          "saturation_p85": 0.339,
+          "estimated_color_temp_kelvin": 4663,
+          "empirical_alpenglow_score": 45,
+          "sky_grade": "Crisp Clear Sky / Above-Inversion Dome"
+        }
       }
     },
     {
@@ -3224,7 +3449,7 @@
       "elev_m": 220.0,
       "date": "2025-06-14",
       "regime": "clear_corridor",
-      "dni_golden_truth_pct": 98.8,
+      "dni_golden_truth_pct": 97.2,
       "dni_18h_wm2": 665.0,
       "dni_19h_wm2": 451.6,
       "dni_samples": [
@@ -3854,6 +4079,44 @@
             }
           }
         }
+      },
+      "dni_truth_source": "nsrdb_2km_goes18_v4",
+      "era5_31km_golden_truth_pct": 98.8,
+      "nsrdb_2km_golden_truth_pct": 97.2,
+      "nsrdb_2km_ref": {
+        "available": true,
+        "source": "NREL NSRDB GOES-18 CONUS v4.0.0 (2 km, 5-min, 2025)",
+        "date": "2025-06-14",
+        "gid_0km": 55097,
+        "grid_lat": 37.6,
+        "grid_lon": -122.51,
+        "onshore_0km_transmittance_pct": 100.0,
+        "corridor_8km_transmittance_pct": 93.3,
+        "golden_hour_rel_transmittance_pct": 97.2,
+        "mean_dni_wm2": 446.9,
+        "mean_clearsky_dni_wm2": 446.9
+      },
+      "webcam_ref": {
+        "camera_id": "jasperridge",
+        "provider_label": "PhenoCam / NEON Scientific Archive",
+        "distance_km": 32.8,
+        "camera_lat": 37.40203,
+        "camera_lon": -122.22104,
+        "camera_elev_m": 197.0,
+        "azimuth_deg": 0.0,
+        "timestamp_local": "20:17",
+        "offset_vs_sunset_min": -5,
+        "is_airmass_matched": true,
+        "sky_chromaticity": {
+          "available": true,
+          "is_ir_night_mode": false,
+          "rb_warmth_p90": 1.149,
+          "rg_ratio_p90": 0.984,
+          "saturation_p85": 0.325,
+          "estimated_color_temp_kelvin": 4724,
+          "empirical_alpenglow_score": 37,
+          "sky_grade": "Crisp Clear Sky / Above-Inversion Dome"
+        }
       }
     },
     {
@@ -3865,7 +4128,7 @@
       "elev_m": 220.0,
       "date": "2025-09-29",
       "regime": "frontal_overcast",
-      "dni_golden_truth_pct": 9.6,
+      "dni_golden_truth_pct": 10.0,
       "dni_18h_wm2": 27.8,
       "dni_19h_wm2": 0.0,
       "dni_samples": [
@@ -4495,6 +4758,44 @@
             }
           }
         }
+      },
+      "dni_truth_source": "nsrdb_2km_goes18_v4",
+      "era5_31km_golden_truth_pct": 9.6,
+      "nsrdb_2km_golden_truth_pct": 10.0,
+      "nsrdb_2km_ref": {
+        "available": true,
+        "source": "NREL NSRDB GOES-18 CONUS v4.0.0 (2 km, 5-min, 2025)",
+        "date": "2025-09-29",
+        "gid_0km": 55097,
+        "grid_lat": 37.6,
+        "grid_lon": -122.51,
+        "onshore_0km_transmittance_pct": 15.3,
+        "corridor_8km_transmittance_pct": 2.7,
+        "golden_hour_rel_transmittance_pct": 10.0,
+        "mean_dni_wm2": 53.5,
+        "mean_clearsky_dni_wm2": 460.6
+      },
+      "webcam_ref": {
+        "camera_id": "jasperridge",
+        "provider_label": "PhenoCam / NEON Scientific Archive",
+        "distance_km": 32.8,
+        "camera_lat": 37.40203,
+        "camera_lon": -122.22104,
+        "camera_elev_m": 197.0,
+        "azimuth_deg": 0.0,
+        "timestamp_local": "18:47",
+        "offset_vs_sunset_min": -3,
+        "is_airmass_matched": false,
+        "sky_chromaticity": {
+          "available": true,
+          "is_ir_night_mode": false,
+          "rb_warmth_p90": 1.0,
+          "rg_ratio_p90": 1.065,
+          "saturation_p85": 0.341,
+          "estimated_color_temp_kelvin": 4961,
+          "empirical_alpenglow_score": 26,
+          "sky_grade": "Mixed Broken Cloud & Twilight Scatter"
+        }
       }
     },
     {
@@ -4506,7 +4807,7 @@
       "elev_m": 784.0,
       "date": "2025-02-08",
       "regime": "broken_coastal",
-      "dni_golden_truth_pct": 96.8,
+      "dni_golden_truth_pct": 99.0,
       "dni_18h_wm2": 150.5,
       "dni_19h_wm2": 0.0,
       "dni_samples": [
@@ -5136,6 +5437,44 @@
             }
           }
         }
+      },
+      "dni_truth_source": "nsrdb_2km_goes18_v4",
+      "era5_31km_golden_truth_pct": 96.8,
+      "nsrdb_2km_golden_truth_pct": 99.0,
+      "nsrdb_2km_ref": {
+        "available": true,
+        "source": "NREL NSRDB GOES-18 CONUS v4.0.0 (2 km, 5-min, 2025)",
+        "date": "2025-02-08",
+        "gid_0km": 52830,
+        "grid_lat": 37.92,
+        "grid_lon": -122.59,
+        "onshore_0km_transmittance_pct": 100.0,
+        "corridor_8km_transmittance_pct": 100.0,
+        "golden_hour_rel_transmittance_pct": 99.0,
+        "mean_dni_wm2": 697.9,
+        "mean_clearsky_dni_wm2": 697.9
+      },
+      "webcam_ref": {
+        "camera_id": "rushranch",
+        "provider_label": "PhenoCam / NEON Scientific Archive",
+        "distance_km": 58.7,
+        "camera_lat": 38.2006,
+        "camera_lon": -122.0264,
+        "camera_elev_m": 8.0,
+        "azimuth_deg": 270.0,
+        "timestamp_local": "17:15",
+        "offset_vs_sunset_min": -15,
+        "is_airmass_matched": true,
+        "sky_chromaticity": {
+          "available": true,
+          "is_ir_night_mode": false,
+          "rb_warmth_p90": 3.102,
+          "rg_ratio_p90": 1.631,
+          "saturation_p85": 0.684,
+          "estimated_color_temp_kelvin": 2050,
+          "empirical_alpenglow_score": 97,
+          "sky_grade": "Vivid Crimson-Amber Golden Hour"
+        }
       }
     },
     {
@@ -5147,7 +5486,7 @@
       "elev_m": 578.0,
       "date": "2025-04-12",
       "regime": "marine_cloud_sea",
-      "dni_golden_truth_pct": 94.3,
+      "dni_golden_truth_pct": 99.0,
       "dni_18h_wm2": 561.4,
       "dni_19h_wm2": 138.9,
       "dni_samples": [
@@ -5777,6 +6116,44 @@
             }
           }
         }
+      },
+      "dni_truth_source": "nsrdb_2km_goes18_v4",
+      "era5_31km_golden_truth_pct": 94.3,
+      "nsrdb_2km_golden_truth_pct": 99.0,
+      "nsrdb_2km_ref": {
+        "available": true,
+        "source": "NREL NSRDB GOES-18 CONUS v4.0.0 (2 km, 5-min, 2025)",
+        "date": "2025-04-12",
+        "gid_0km": 56224,
+        "grid_lat": 37.56,
+        "grid_lon": -122.47,
+        "onshore_0km_transmittance_pct": 100.0,
+        "corridor_8km_transmittance_pct": 100.0,
+        "golden_hour_rel_transmittance_pct": 99.0,
+        "mean_dni_wm2": 503.5,
+        "mean_clearsky_dni_wm2": 503.5
+      },
+      "webcam_ref": {
+        "camera_id": "jasperridge",
+        "provider_label": "PhenoCam / NEON Scientific Archive",
+        "distance_km": 28.7,
+        "camera_lat": 37.40203,
+        "camera_lon": -122.22104,
+        "camera_elev_m": 197.0,
+        "azimuth_deg": 0.0,
+        "timestamp_local": "19:47",
+        "offset_vs_sunset_min": 13,
+        "is_airmass_matched": false,
+        "sky_chromaticity": {
+          "available": true,
+          "is_ir_night_mode": false,
+          "rb_warmth_p90": 1.077,
+          "rg_ratio_p90": 1.087,
+          "saturation_p85": 0.315,
+          "estimated_color_temp_kelvin": 5936,
+          "empirical_alpenglow_score": 26,
+          "sky_grade": "Cool Diffuse Overcast / Marine Lid"
+        }
       }
     },
     {
@@ -5788,7 +6165,7 @@
       "elev_m": 784.0,
       "date": "2025-06-05",
       "regime": "marine_cloud_sea",
-      "dni_golden_truth_pct": 19.0,
+      "dni_golden_truth_pct": 87.0,
       "dni_18h_wm2": 174.9,
       "dni_19h_wm2": 93.6,
       "dni_samples": [
@@ -6418,6 +6795,44 @@
             }
           }
         }
+      },
+      "dni_truth_source": "nsrdb_2km_goes18_v4",
+      "era5_31km_golden_truth_pct": 19.0,
+      "nsrdb_2km_golden_truth_pct": 87.0,
+      "nsrdb_2km_ref": {
+        "available": true,
+        "source": "NREL NSRDB GOES-18 CONUS v4.0.0 (2 km, 5-min, 2025)",
+        "date": "2025-06-05",
+        "gid_0km": 52830,
+        "grid_lat": 37.92,
+        "grid_lon": -122.59,
+        "onshore_0km_transmittance_pct": 100.0,
+        "corridor_8km_transmittance_pct": 27.5,
+        "golden_hour_rel_transmittance_pct": 87.0,
+        "mean_dni_wm2": 424.6,
+        "mean_clearsky_dni_wm2": 424.6
+      },
+      "webcam_ref": {
+        "camera_id": "rushranch",
+        "provider_label": "PhenoCam / NEON Scientific Archive",
+        "distance_km": 58.7,
+        "camera_lat": 38.2006,
+        "camera_lon": -122.0264,
+        "camera_elev_m": 8.0,
+        "azimuth_deg": 270.0,
+        "timestamp_local": "19:45",
+        "offset_vs_sunset_min": -33,
+        "is_airmass_matched": true,
+        "sky_chromaticity": {
+          "available": true,
+          "is_ir_night_mode": false,
+          "rb_warmth_p90": 1.927,
+          "rg_ratio_p90": 1.182,
+          "saturation_p85": 0.475,
+          "estimated_color_temp_kelvin": 2846,
+          "empirical_alpenglow_score": 97,
+          "sky_grade": "Vivid Crimson-Amber Golden Hour"
+        }
       }
     },
     {
@@ -6429,7 +6844,7 @@
       "elev_m": 578.0,
       "date": "2025-07-15",
       "regime": "marine_stratus",
-      "dni_golden_truth_pct": 18.3,
+      "dni_golden_truth_pct": 99.0,
       "dni_18h_wm2": 152.1,
       "dni_19h_wm2": 90.8,
       "dni_samples": [
@@ -7059,6 +7474,44 @@
             }
           }
         }
+      },
+      "dni_truth_source": "nsrdb_2km_goes18_v4",
+      "era5_31km_golden_truth_pct": 18.3,
+      "nsrdb_2km_golden_truth_pct": 99.0,
+      "nsrdb_2km_ref": {
+        "available": true,
+        "source": "NREL NSRDB GOES-18 CONUS v4.0.0 (2 km, 5-min, 2025)",
+        "date": "2025-07-15",
+        "gid_0km": 56224,
+        "grid_lat": 37.56,
+        "grid_lon": -122.47,
+        "onshore_0km_transmittance_pct": 100.0,
+        "corridor_8km_transmittance_pct": 100.0,
+        "golden_hour_rel_transmittance_pct": 99.0,
+        "mean_dni_wm2": 440.0,
+        "mean_clearsky_dni_wm2": 440.0
+      },
+      "webcam_ref": {
+        "camera_id": "jasperridge",
+        "provider_label": "PhenoCam / NEON Scientific Archive",
+        "distance_km": 28.7,
+        "camera_lat": 37.40203,
+        "camera_lon": -122.22104,
+        "camera_elev_m": 197.0,
+        "azimuth_deg": 0.0,
+        "timestamp_local": "19:47",
+        "offset_vs_sunset_min": -35,
+        "is_airmass_matched": false,
+        "sky_chromaticity": {
+          "available": true,
+          "is_ir_night_mode": false,
+          "rb_warmth_p90": 1.789,
+          "rg_ratio_p90": 1.117,
+          "saturation_p85": 0.421,
+          "estimated_color_temp_kelvin": 3237,
+          "empirical_alpenglow_score": 97,
+          "sky_grade": "Vivid Crimson-Amber Golden Hour"
+        }
       }
     },
     {
@@ -7070,7 +7523,7 @@
       "elev_m": 784.0,
       "date": "2025-08-09",
       "regime": "marine_cloud_sea",
-      "dni_golden_truth_pct": 14.4,
+      "dni_golden_truth_pct": 99.0,
       "dni_18h_wm2": 98.4,
       "dni_19h_wm2": 70.5,
       "dni_samples": [
@@ -7700,6 +8153,44 @@
             }
           }
         }
+      },
+      "dni_truth_source": "nsrdb_2km_goes18_v4",
+      "era5_31km_golden_truth_pct": 14.4,
+      "nsrdb_2km_golden_truth_pct": 99.0,
+      "nsrdb_2km_ref": {
+        "available": true,
+        "source": "NREL NSRDB GOES-18 CONUS v4.0.0 (2 km, 5-min, 2025)",
+        "date": "2025-08-09",
+        "gid_0km": 52830,
+        "grid_lat": 37.92,
+        "grid_lon": -122.59,
+        "onshore_0km_transmittance_pct": 100.0,
+        "corridor_8km_transmittance_pct": 100.0,
+        "golden_hour_rel_transmittance_pct": 99.0,
+        "mean_dni_wm2": 554.2,
+        "mean_clearsky_dni_wm2": 554.2
+      },
+      "webcam_ref": {
+        "camera_id": "rushranch",
+        "provider_label": "PhenoCam / NEON Scientific Archive",
+        "distance_km": 58.7,
+        "camera_lat": 38.2006,
+        "camera_lon": -122.0264,
+        "camera_elev_m": 8.0,
+        "azimuth_deg": 270.0,
+        "timestamp_local": "19:45",
+        "offset_vs_sunset_min": -17,
+        "is_airmass_matched": true,
+        "sky_chromaticity": {
+          "available": true,
+          "is_ir_night_mode": false,
+          "rb_warmth_p90": 2.356,
+          "rg_ratio_p90": 1.337,
+          "saturation_p85": 0.571,
+          "estimated_color_temp_kelvin": 2050,
+          "empirical_alpenglow_score": 97,
+          "sky_grade": "Vivid Crimson-Amber Golden Hour"
+        }
       }
     },
     {
@@ -7711,7 +8202,7 @@
       "elev_m": 784.0,
       "date": "2025-10-18",
       "regime": "coastal_cirrus_burner",
-      "dni_golden_truth_pct": 86.2,
+      "dni_golden_truth_pct": 99.0,
       "dni_18h_wm2": 50.1,
       "dni_19h_wm2": 0.0,
       "dni_samples": [
@@ -8341,6 +8832,44 @@
             }
           }
         }
+      },
+      "dni_truth_source": "nsrdb_2km_goes18_v4",
+      "era5_31km_golden_truth_pct": 86.2,
+      "nsrdb_2km_golden_truth_pct": 99.0,
+      "nsrdb_2km_ref": {
+        "available": true,
+        "source": "NREL NSRDB GOES-18 CONUS v4.0.0 (2 km, 5-min, 2025)",
+        "date": "2025-10-18",
+        "gid_0km": 52830,
+        "grid_lat": 37.92,
+        "grid_lon": -122.59,
+        "onshore_0km_transmittance_pct": 100.0,
+        "corridor_8km_transmittance_pct": 100.0,
+        "golden_hour_rel_transmittance_pct": 99.0,
+        "mean_dni_wm2": 571.8,
+        "mean_clearsky_dni_wm2": 571.8
+      },
+      "webcam_ref": {
+        "camera_id": "rushranch",
+        "provider_label": "PhenoCam / NEON Scientific Archive",
+        "distance_km": 58.7,
+        "camera_lat": 38.2006,
+        "camera_lon": -122.0264,
+        "camera_elev_m": 8.0,
+        "azimuth_deg": 270.0,
+        "timestamp_local": "18:15",
+        "offset_vs_sunset_min": -7,
+        "is_airmass_matched": true,
+        "sky_chromaticity": {
+          "available": true,
+          "is_ir_night_mode": false,
+          "rb_warmth_p90": 1.468,
+          "rg_ratio_p90": 1.152,
+          "saturation_p85": 0.319,
+          "estimated_color_temp_kelvin": 3850,
+          "empirical_alpenglow_score": 83,
+          "sky_grade": "Warm Golden-Hour Horizon Glow"
+        }
       }
     },
     {
@@ -8352,7 +8881,7 @@
       "elev_m": 180.0,
       "date": "2025-01-25",
       "regime": "broken_coastal",
-      "dni_golden_truth_pct": 75.1,
+      "dni_golden_truth_pct": 1.6,
       "dni_18h_wm2": 37.0,
       "dni_19h_wm2": 0.0,
       "dni_samples": [
@@ -8982,6 +9511,44 @@
             }
           }
         }
+      },
+      "dni_truth_source": "nsrdb_2km_goes18_v4",
+      "era5_31km_golden_truth_pct": 75.1,
+      "nsrdb_2km_golden_truth_pct": 1.6,
+      "nsrdb_2km_ref": {
+        "available": true,
+        "source": "NREL NSRDB GOES-18 CONUS v4.0.0 (2 km, 5-min, 2025)",
+        "date": "2025-01-25",
+        "gid_0km": 72922,
+        "grid_lat": 36.46,
+        "grid_lon": -121.93,
+        "onshore_0km_transmittance_pct": 1.6,
+        "corridor_8km_transmittance_pct": 1.6,
+        "golden_hour_rel_transmittance_pct": 1.6,
+        "mean_dni_wm2": 13.4,
+        "mean_clearsky_dni_wm2": 395.6
+      },
+      "webcam_ref": {
+        "camera_id": "santaluciapreserve1",
+        "provider_label": "PhenoCam / NEON Scientific Archive",
+        "distance_km": 8.5,
+        "camera_lat": 36.5265,
+        "camera_lon": -121.8682,
+        "camera_elev_m": 500.0,
+        "azimuth_deg": 245.1,
+        "timestamp_local": "16:58",
+        "offset_vs_sunset_min": -15,
+        "is_airmass_matched": true,
+        "sky_chromaticity": {
+          "available": true,
+          "is_ir_night_mode": false,
+          "rb_warmth_p90": 1.114,
+          "rg_ratio_p90": 1.044,
+          "saturation_p85": 0.15,
+          "estimated_color_temp_kelvin": 6113,
+          "empirical_alpenglow_score": 20,
+          "sky_grade": "Cool Diffuse Overcast / Marine Lid"
+        }
       }
     },
     {
@@ -8993,7 +9560,7 @@
       "elev_m": 180.0,
       "date": "2025-04-20",
       "regime": "broken_coastal",
-      "dni_golden_truth_pct": 99.0,
+      "dni_golden_truth_pct": 69.6,
       "dni_18h_wm2": 564.6,
       "dni_19h_wm2": 151.4,
       "dni_samples": [
@@ -9613,6 +10180,44 @@
             }
           }
         }
+      },
+      "dni_truth_source": "nsrdb_2km_goes18_v4",
+      "era5_31km_golden_truth_pct": 99.0,
+      "nsrdb_2km_golden_truth_pct": 69.6,
+      "nsrdb_2km_ref": {
+        "available": true,
+        "source": "NREL NSRDB GOES-18 CONUS v4.0.0 (2 km, 5-min, 2025)",
+        "date": "2025-04-20",
+        "gid_0km": 72922,
+        "grid_lat": 36.46,
+        "grid_lon": -121.93,
+        "onshore_0km_transmittance_pct": 69.6,
+        "corridor_8km_transmittance_pct": 69.6,
+        "golden_hour_rel_transmittance_pct": 69.6,
+        "mean_dni_wm2": 361.6,
+        "mean_clearsky_dni_wm2": 501.9
+      },
+      "webcam_ref": {
+        "camera_id": "santaluciapreserve1",
+        "provider_label": "PhenoCam / NEON Scientific Archive",
+        "distance_km": 8.5,
+        "camera_lat": 36.5265,
+        "camera_lon": -121.8682,
+        "camera_elev_m": 500.0,
+        "azimuth_deg": 283.8,
+        "timestamp_local": "19:28",
+        "offset_vs_sunset_min": -10,
+        "is_airmass_matched": true,
+        "sky_chromaticity": {
+          "available": true,
+          "is_ir_night_mode": false,
+          "rb_warmth_p90": 1.284,
+          "rg_ratio_p90": 1.111,
+          "saturation_p85": 0.288,
+          "estimated_color_temp_kelvin": 4297,
+          "empirical_alpenglow_score": 44,
+          "sky_grade": "Warm Golden-Hour Horizon Glow"
+        }
       }
     },
     {
@@ -9624,7 +10229,7 @@
       "elev_m": 180.0,
       "date": "2025-07-22",
       "regime": "marine_stratus",
-      "dni_golden_truth_pct": 18.3,
+      "dni_golden_truth_pct": 2.3,
       "dni_18h_wm2": 207.1,
       "dni_19h_wm2": 46.2,
       "dni_samples": [
@@ -10253,6 +10858,44 @@
               }
             }
           }
+        }
+      },
+      "dni_truth_source": "nsrdb_2km_goes18_v4",
+      "era5_31km_golden_truth_pct": 18.3,
+      "nsrdb_2km_golden_truth_pct": 2.3,
+      "nsrdb_2km_ref": {
+        "available": true,
+        "source": "NREL NSRDB GOES-18 CONUS v4.0.0 (2 km, 5-min, 2025)",
+        "date": "2025-07-22",
+        "gid_0km": 72922,
+        "grid_lat": 36.46,
+        "grid_lon": -121.93,
+        "onshore_0km_transmittance_pct": 2.3,
+        "corridor_8km_transmittance_pct": 2.3,
+        "golden_hour_rel_transmittance_pct": 2.3,
+        "mean_dni_wm2": 8.0,
+        "mean_clearsky_dni_wm2": 529.3
+      },
+      "webcam_ref": {
+        "camera_id": "santaluciapreserve1",
+        "provider_label": "PhenoCam / NEON Scientific Archive",
+        "distance_km": 8.5,
+        "camera_lat": 36.5265,
+        "camera_lon": -121.8682,
+        "camera_elev_m": 500.0,
+        "azimuth_deg": 295.1,
+        "timestamp_local": "19:57",
+        "offset_vs_sunset_min": -17,
+        "is_airmass_matched": true,
+        "sky_chromaticity": {
+          "available": true,
+          "is_ir_night_mode": false,
+          "rb_warmth_p90": 0.864,
+          "rg_ratio_p90": 0.938,
+          "saturation_p85": 0.198,
+          "estimated_color_temp_kelvin": 5200,
+          "empirical_alpenglow_score": 26,
+          "sky_grade": "Crisp Clear Sky / Above-Inversion Dome"
         }
       }
     },
@@ -10895,6 +11538,44 @@
             }
           }
         }
+      },
+      "dni_truth_source": "nsrdb_2km_goes18_v4",
+      "era5_31km_golden_truth_pct": 99.0,
+      "nsrdb_2km_golden_truth_pct": 99.0,
+      "nsrdb_2km_ref": {
+        "available": true,
+        "source": "NREL NSRDB GOES-18 CONUS v4.0.0 (2 km, 5-min, 2025)",
+        "date": "2025-10-11",
+        "gid_0km": 72922,
+        "grid_lat": 36.46,
+        "grid_lon": -121.93,
+        "onshore_0km_transmittance_pct": 100.0,
+        "corridor_8km_transmittance_pct": 100.0,
+        "golden_hour_rel_transmittance_pct": 99.0,
+        "mean_dni_wm2": 548.5,
+        "mean_clearsky_dni_wm2": 548.5
+      },
+      "webcam_ref": {
+        "camera_id": "santaluciapreserve1",
+        "provider_label": "PhenoCam / NEON Scientific Archive",
+        "distance_km": 8.5,
+        "camera_lat": 36.5265,
+        "camera_lon": -121.8682,
+        "camera_elev_m": 500.0,
+        "azimuth_deg": 260.9,
+        "timestamp_local": "17:56",
+        "offset_vs_sunset_min": -34,
+        "is_airmass_matched": true,
+        "sky_chromaticity": {
+          "available": true,
+          "is_ir_night_mode": false,
+          "rb_warmth_p90": 1.185,
+          "rg_ratio_p90": 1.065,
+          "saturation_p85": 0.196,
+          "estimated_color_temp_kelvin": 4576,
+          "empirical_alpenglow_score": 34,
+          "sky_grade": "Cool Diffuse Overcast / Marine Lid"
+        }
       }
     },
     {
@@ -10906,7 +11587,7 @@
       "elev_m": 2693.0,
       "date": "2025-01-11",
       "regime": "clear_alpine",
-      "dni_golden_truth_pct": 77.6,
+      "dni_golden_truth_pct": 99.0,
       "dni_18h_wm2": 0.0,
       "dni_19h_wm2": 0.0,
       "dni_samples": [
@@ -11518,6 +12199,44 @@
             }
           }
         }
+      },
+      "dni_truth_source": "nsrdb_2km_goes18_v4",
+      "era5_31km_golden_truth_pct": 77.6,
+      "nsrdb_2km_golden_truth_pct": 99.0,
+      "nsrdb_2km_ref": {
+        "available": true,
+        "source": "NREL NSRDB GOES-18 CONUS v4.0.0 (2 km, 5-min, 2025)",
+        "date": "2025-01-11",
+        "gid_0km": 159790,
+        "grid_lat": 37.74,
+        "grid_lon": -119.53,
+        "onshore_0km_transmittance_pct": 100.0,
+        "corridor_8km_transmittance_pct": 100.0,
+        "golden_hour_rel_transmittance_pct": 99.0,
+        "mean_dni_wm2": 765.8,
+        "mean_clearsky_dni_wm2": 765.8
+      },
+      "webcam_ref": {
+        "camera_id": "NEON.D17.TEAK.DP1.00033",
+        "provider_label": "PhenoCam / NEON Scientific Archive",
+        "distance_km": 94.6,
+        "camera_lat": 37.00583,
+        "camera_lon": -119.00602,
+        "camera_elev_m": 2149.0,
+        "azimuth_deg": 241.4,
+        "timestamp_local": "16:30",
+        "offset_vs_sunset_min": -20,
+        "is_airmass_matched": true,
+        "sky_chromaticity": {
+          "available": true,
+          "is_ir_night_mode": false,
+          "rb_warmth_p90": 1.502,
+          "rg_ratio_p90": 1.136,
+          "saturation_p85": 0.333,
+          "estimated_color_temp_kelvin": 3803,
+          "empirical_alpenglow_score": 80,
+          "sky_grade": "Warm Golden-Hour Horizon Glow"
+        }
       }
     },
     {
@@ -11529,7 +12248,7 @@
       "elev_m": 2693.0,
       "date": "2025-05-03",
       "regime": "storm_overcast",
-      "dni_golden_truth_pct": 6.5,
+      "dni_golden_truth_pct": 41.2,
       "dni_18h_wm2": 107.6,
       "dni_19h_wm2": 21.0,
       "dni_samples": [
@@ -12141,6 +12860,44 @@
             }
           }
         }
+      },
+      "dni_truth_source": "nsrdb_2km_goes18_v4",
+      "era5_31km_golden_truth_pct": 6.5,
+      "nsrdb_2km_golden_truth_pct": 41.2,
+      "nsrdb_2km_ref": {
+        "available": true,
+        "source": "NREL NSRDB GOES-18 CONUS v4.0.0 (2 km, 5-min, 2025)",
+        "date": "2025-05-03",
+        "gid_0km": 159790,
+        "grid_lat": 37.74,
+        "grid_lon": -119.53,
+        "onshore_0km_transmittance_pct": 41.2,
+        "corridor_8km_transmittance_pct": 41.2,
+        "golden_hour_rel_transmittance_pct": 41.2,
+        "mean_dni_wm2": 285.6,
+        "mean_clearsky_dni_wm2": 517.4
+      },
+      "webcam_ref": {
+        "camera_id": "NEON.D17.SOAP.DP1.00033",
+        "provider_label": "PhenoCam / NEON Scientific Archive",
+        "distance_km": 82.8,
+        "camera_lat": 37.03337,
+        "camera_lon": -119.26219,
+        "camera_elev_m": 1210.0,
+        "azimuth_deg": 0.0,
+        "timestamp_local": "19:30",
+        "offset_vs_sunset_min": -12,
+        "is_airmass_matched": true,
+        "sky_chromaticity": {
+          "available": true,
+          "is_ir_night_mode": false,
+          "rb_warmth_p90": 0.93,
+          "rg_ratio_p90": 0.97,
+          "saturation_p85": 0.296,
+          "estimated_color_temp_kelvin": 5179,
+          "empirical_alpenglow_score": 21,
+          "sky_grade": "Mixed Broken Cloud & Twilight Scatter"
+        }
       }
     },
     {
@@ -12152,7 +12909,7 @@
       "elev_m": 2693.0,
       "date": "2025-05-06",
       "regime": "clear_alpine",
-      "dni_golden_truth_pct": 57.0,
+      "dni_golden_truth_pct": 99.0,
       "dni_18h_wm2": 684.8,
       "dni_19h_wm2": 292.5,
       "dni_samples": [
@@ -12764,6 +13521,44 @@
             }
           }
         }
+      },
+      "dni_truth_source": "nsrdb_2km_goes18_v4",
+      "era5_31km_golden_truth_pct": 57.0,
+      "nsrdb_2km_golden_truth_pct": 99.0,
+      "nsrdb_2km_ref": {
+        "available": true,
+        "source": "NREL NSRDB GOES-18 CONUS v4.0.0 (2 km, 5-min, 2025)",
+        "date": "2025-05-06",
+        "gid_0km": 159790,
+        "grid_lat": 37.74,
+        "grid_lon": -119.53,
+        "onshore_0km_transmittance_pct": 100.0,
+        "corridor_8km_transmittance_pct": 100.0,
+        "golden_hour_rel_transmittance_pct": 99.0,
+        "mean_dni_wm2": 620.0,
+        "mean_clearsky_dni_wm2": 620.0
+      },
+      "webcam_ref": {
+        "camera_id": "NEON.D17.SOAP.DP1.00033",
+        "provider_label": "PhenoCam / NEON Scientific Archive",
+        "distance_km": 82.8,
+        "camera_lat": 37.03337,
+        "camera_lon": -119.26219,
+        "camera_elev_m": 1210.0,
+        "azimuth_deg": 0.0,
+        "timestamp_local": "19:30",
+        "offset_vs_sunset_min": -12,
+        "is_airmass_matched": true,
+        "sky_chromaticity": {
+          "available": true,
+          "is_ir_night_mode": false,
+          "rb_warmth_p90": 0.913,
+          "rg_ratio_p90": 0.968,
+          "saturation_p85": 0.373,
+          "estimated_color_temp_kelvin": 5200,
+          "empirical_alpenglow_score": 26,
+          "sky_grade": "Crisp Clear Sky / Above-Inversion Dome"
+        }
       }
     },
     {
@@ -12775,7 +13570,7 @@
       "elev_m": 2693.0,
       "date": "2025-05-13",
       "regime": "crest_attenuation",
-      "dni_golden_truth_pct": 17.9,
+      "dni_golden_truth_pct": 93.5,
       "dni_18h_wm2": 185.2,
       "dni_19h_wm2": 111.4,
       "dni_samples": [
@@ -13387,6 +14182,44 @@
             }
           }
         }
+      },
+      "dni_truth_source": "nsrdb_2km_goes18_v4",
+      "era5_31km_golden_truth_pct": 17.9,
+      "nsrdb_2km_golden_truth_pct": 93.5,
+      "nsrdb_2km_ref": {
+        "available": true,
+        "source": "NREL NSRDB GOES-18 CONUS v4.0.0 (2 km, 5-min, 2025)",
+        "date": "2025-05-13",
+        "gid_0km": 159790,
+        "grid_lat": 37.74,
+        "grid_lon": -119.53,
+        "onshore_0km_transmittance_pct": 93.5,
+        "corridor_8km_transmittance_pct": 93.5,
+        "golden_hour_rel_transmittance_pct": 93.5,
+        "mean_dni_wm2": 550.8,
+        "mean_clearsky_dni_wm2": 621.4
+      },
+      "webcam_ref": {
+        "camera_id": "NEON.D17.SOAP.DP1.00033",
+        "provider_label": "PhenoCam / NEON Scientific Archive",
+        "distance_km": 82.8,
+        "camera_lat": 37.03337,
+        "camera_lon": -119.26219,
+        "camera_elev_m": 1210.0,
+        "azimuth_deg": 0.0,
+        "timestamp_local": "19:30",
+        "offset_vs_sunset_min": -20,
+        "is_airmass_matched": true,
+        "sky_chromaticity": {
+          "available": true,
+          "is_ir_night_mode": false,
+          "rb_warmth_p90": 1.004,
+          "rg_ratio_p90": 0.982,
+          "saturation_p85": 0.149,
+          "estimated_color_temp_kelvin": 6140,
+          "empirical_alpenglow_score": 12,
+          "sky_grade": "Cool Diffuse Overcast / Marine Lid"
+        }
       }
     },
     {
@@ -13398,7 +14231,7 @@
       "elev_m": 2693.0,
       "date": "2025-05-25",
       "regime": "sierra_cirrus_burner",
-      "dni_golden_truth_pct": 63.5,
+      "dni_golden_truth_pct": 71.3,
       "dni_18h_wm2": 703.4,
       "dni_19h_wm2": 413.9,
       "dni_samples": [
@@ -14010,6 +14843,44 @@
             }
           }
         }
+      },
+      "dni_truth_source": "nsrdb_2km_goes18_v4",
+      "era5_31km_golden_truth_pct": 63.5,
+      "nsrdb_2km_golden_truth_pct": 71.3,
+      "nsrdb_2km_ref": {
+        "available": true,
+        "source": "NREL NSRDB GOES-18 CONUS v4.0.0 (2 km, 5-min, 2025)",
+        "date": "2025-05-25",
+        "gid_0km": 159790,
+        "grid_lat": 37.74,
+        "grid_lon": -119.53,
+        "onshore_0km_transmittance_pct": 71.3,
+        "corridor_8km_transmittance_pct": 71.3,
+        "golden_hour_rel_transmittance_pct": 71.3,
+        "mean_dni_wm2": 463.2,
+        "mean_clearsky_dni_wm2": 575.4
+      },
+      "webcam_ref": {
+        "camera_id": "NEON.D17.SOAP.DP1.00033",
+        "provider_label": "PhenoCam / NEON Scientific Archive",
+        "distance_km": 82.8,
+        "camera_lat": 37.03337,
+        "camera_lon": -119.26219,
+        "camera_elev_m": 1210.0,
+        "azimuth_deg": 0.0,
+        "timestamp_local": "19:30",
+        "offset_vs_sunset_min": -28,
+        "is_airmass_matched": true,
+        "sky_chromaticity": {
+          "available": true,
+          "is_ir_night_mode": false,
+          "rb_warmth_p90": 0.962,
+          "rg_ratio_p90": 0.978,
+          "saturation_p85": 0.295,
+          "estimated_color_temp_kelvin": 5112,
+          "empirical_alpenglow_score": 20,
+          "sky_grade": "Mixed Broken Cloud & Twilight Scatter"
+        }
       }
     },
     {
@@ -14021,7 +14892,7 @@
       "elev_m": 3026.0,
       "date": "2025-06-07",
       "regime": "sierra_cirrus_wave",
-      "dni_golden_truth_pct": 51.4,
+      "dni_golden_truth_pct": 2.7,
       "dni_18h_wm2": 555.5,
       "dni_19h_wm2": 406.8,
       "dni_samples": [
@@ -14633,6 +15504,44 @@
             }
           }
         }
+      },
+      "dni_truth_source": "nsrdb_2km_goes18_v4",
+      "era5_31km_golden_truth_pct": 51.4,
+      "nsrdb_2km_golden_truth_pct": 2.7,
+      "nsrdb_2km_ref": {
+        "available": true,
+        "source": "NREL NSRDB GOES-18 CONUS v4.0.0 (2 km, 5-min, 2025)",
+        "date": "2025-06-07",
+        "gid_0km": 161361,
+        "grid_lat": 37.76,
+        "grid_lon": -119.49,
+        "onshore_0km_transmittance_pct": 2.7,
+        "corridor_8km_transmittance_pct": 2.7,
+        "golden_hour_rel_transmittance_pct": 2.7,
+        "mean_dni_wm2": 18.4,
+        "mean_clearsky_dni_wm2": 536.4
+      },
+      "webcam_ref": {
+        "camera_id": "NEON.D17.SOAP.DP1.00033",
+        "provider_label": "PhenoCam / NEON Scientific Archive",
+        "distance_km": 84.1,
+        "camera_lat": 37.03337,
+        "camera_lon": -119.26219,
+        "camera_elev_m": 1210.0,
+        "azimuth_deg": 0.0,
+        "timestamp_local": "20:00",
+        "offset_vs_sunset_min": -6,
+        "is_airmass_matched": true,
+        "sky_chromaticity": {
+          "available": true,
+          "is_ir_night_mode": false,
+          "rb_warmth_p90": 0.984,
+          "rg_ratio_p90": 0.984,
+          "saturation_p85": 0.187,
+          "estimated_color_temp_kelvin": 6076,
+          "empirical_alpenglow_score": 12,
+          "sky_grade": "Cool Diffuse Overcast / Marine Lid"
+        }
       }
     },
     {
@@ -14644,7 +15553,7 @@
       "elev_m": 3026.0,
       "date": "2025-08-16",
       "regime": "mixed_orographic",
-      "dni_golden_truth_pct": 50.3,
+      "dni_golden_truth_pct": 99.0,
       "dni_18h_wm2": 666.4,
       "dni_19h_wm2": 278.0,
       "dni_samples": [
@@ -15256,6 +16165,44 @@
             }
           }
         }
+      },
+      "dni_truth_source": "nsrdb_2km_goes18_v4",
+      "era5_31km_golden_truth_pct": 50.3,
+      "nsrdb_2km_golden_truth_pct": 99.0,
+      "nsrdb_2km_ref": {
+        "available": true,
+        "source": "NREL NSRDB GOES-18 CONUS v4.0.0 (2 km, 5-min, 2025)",
+        "date": "2025-08-16",
+        "gid_0km": 161361,
+        "grid_lat": 37.76,
+        "grid_lon": -119.49,
+        "onshore_0km_transmittance_pct": 100.0,
+        "corridor_8km_transmittance_pct": 100.0,
+        "golden_hour_rel_transmittance_pct": 99.0,
+        "mean_dni_wm2": 676.8,
+        "mean_clearsky_dni_wm2": 676.8
+      },
+      "webcam_ref": {
+        "camera_id": "NEON.D17.SOAP.DP1.00033",
+        "provider_label": "PhenoCam / NEON Scientific Archive",
+        "distance_km": 84.1,
+        "camera_lat": 37.03337,
+        "camera_lon": -119.26219,
+        "camera_elev_m": 1210.0,
+        "azimuth_deg": 0.0,
+        "timestamp_local": "19:30",
+        "offset_vs_sunset_min": -12,
+        "is_airmass_matched": true,
+        "sky_chromaticity": {
+          "available": true,
+          "is_ir_night_mode": false,
+          "rb_warmth_p90": 0.964,
+          "rg_ratio_p90": 0.98,
+          "saturation_p85": 0.313,
+          "estimated_color_temp_kelvin": 5108,
+          "empirical_alpenglow_score": 22,
+          "sky_grade": "Mixed Broken Cloud & Twilight Scatter"
+        }
       }
     },
     {
@@ -15267,7 +16214,7 @@
       "elev_m": 2693.0,
       "date": "2025-10-25",
       "regime": "sierra_cirrus_wave",
-      "dni_golden_truth_pct": 6.5,
+      "dni_golden_truth_pct": 1.9,
       "dni_18h_wm2": 0.0,
       "dni_19h_wm2": 0.0,
       "dni_samples": [
@@ -15878,6 +16825,44 @@
               }
             }
           }
+        }
+      },
+      "dni_truth_source": "nsrdb_2km_goes18_v4",
+      "era5_31km_golden_truth_pct": 6.5,
+      "nsrdb_2km_golden_truth_pct": 1.9,
+      "nsrdb_2km_ref": {
+        "available": true,
+        "source": "NREL NSRDB GOES-18 CONUS v4.0.0 (2 km, 5-min, 2025)",
+        "date": "2025-10-25",
+        "gid_0km": 159790,
+        "grid_lat": 37.74,
+        "grid_lon": -119.53,
+        "onshore_0km_transmittance_pct": 1.9,
+        "corridor_8km_transmittance_pct": 1.9,
+        "golden_hour_rel_transmittance_pct": 1.9,
+        "mean_dni_wm2": 11.1,
+        "mean_clearsky_dni_wm2": 667.1
+      },
+      "webcam_ref": {
+        "camera_id": "NEON.D17.TEAK.DP1.00033",
+        "provider_label": "PhenoCam / NEON Scientific Archive",
+        "distance_km": 94.6,
+        "camera_lat": 37.00583,
+        "camera_lon": -119.00602,
+        "camera_elev_m": 2149.0,
+        "azimuth_deg": 254.5,
+        "timestamp_local": "17:37",
+        "offset_vs_sunset_min": -25,
+        "is_airmass_matched": true,
+        "sky_chromaticity": {
+          "available": true,
+          "is_ir_night_mode": false,
+          "rb_warmth_p90": 0.854,
+          "rg_ratio_p90": 0.97,
+          "saturation_p85": 0.364,
+          "estimated_color_temp_kelvin": 5200,
+          "empirical_alpenglow_score": 28,
+          "sky_grade": "Crisp Clear Sky / Above-Inversion Dome"
         }
       }
     }

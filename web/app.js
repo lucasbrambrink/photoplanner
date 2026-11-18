@@ -51,6 +51,10 @@ const state = {
   showAtmosphere: true,
   showSightlines: true,
   highlightLandingZone: false,
+  webcamReport: null,
+  selectedWebcamIdx: 0,
+  selectedWebcamFrameIdx: -1,
+  showWebcamCard: false,
 };
 
 function isPastShootDate(dateStr = state.date) {
@@ -71,6 +75,12 @@ const vfOverlay = document.getElementById("viewfinder-overlay");
 const vfHudReadout = document.getElementById("vf-hud-readout");
 const cursorCoordsBar = document.getElementById("cursor-coords-bar");
 const inspectorCard = document.getElementById("tripod-inspector-card");
+const webcamTruthCard = document.getElementById("webcam-truth-card");
+const btnToggleWebcamDrawer = document.getElementById("btn-toggle-webcam-drawer");
+const btnCloseWebcamCard = document.getElementById("btn-close-webcam-card");
+const btnSidebarOpenWebcam = document.getElementById("btn-sidebar-open-webcam");
+const btnSnapWebcamCamera = document.getElementById("btn-snap-webcam-camera");
+const btnResetWebcamSnap = document.getElementById("btn-reset-webcam-snap");
 const weatherDisclosure = document.getElementById("weather-disclosure");
 const btnOrbitMode = document.getElementById("btn-orbit-mode");
 const viewportStageEl = document.getElementById("viewport-stage");
@@ -3050,11 +3060,14 @@ function updateSunRaysAndShader() {
 function setCameraMode(mode) {
   state.cameraMode = mode;
   volumetricEngine.invalidateTemporalHistory();
+  if (btnResetWebcamSnap) {
+    btnResetWebcamSnap.hidden = mode !== "webcam-snap";
+  }
 
   if (mode === "orbit") {
     if (btnOrbitMode) btnOrbitMode.hidden = true;
     if (hudClickModeGroup) hudClickModeGroup.hidden = false;
-    viewportStageEl?.classList.remove("is-viewfinder");
+    viewportStageEl?.classList.remove("is-viewfinder", "is-webcam-snap");
     vfOverlay.hidden = true;
     trailsGroup.visible = state.showSightlines;
     customPinGroup.visible = true;
@@ -3069,18 +3082,93 @@ function setCameraMode(mode) {
       controls.update();
     }
     updateSunRaysAndShader();
+    wakeRenderLoop(true);
     return;
   }
 
   if (btnOrbitMode) btnOrbitMode.hidden = false;
   if (hudClickModeGroup) hudClickModeGroup.hidden = true;
   viewportStageEl?.classList.add("is-viewfinder");
+  viewportStageEl?.classList.toggle("is-webcam-snap", mode === "webcam-snap");
   trailsGroup.visible = false;
   customPinGroup.visible = false;
   sunBeamsGroup.visible = false;
 
   const lm = state.shootReport?.target_landmark;
   if (!lm) return;
+
+  if (mode === "webcam-snap") {
+    const cam =
+      state.webcamReport?.cameras?.[state.selectedWebcamIdx] ||
+      state.webcamReport?.primary_camera;
+    if (!cam || !state.terrainPatch) return;
+
+    const patch = state.terrainPatch;
+    const hfovDeg = Math.max(24.0, Math.min(92.0, Number(cam.hfov_deg || 62.0)));
+    const hfovRad = (hfovDeg * Math.PI) / 180.0;
+    const vfovDeg =
+      (2.0 * Math.atan(Math.tan(hfovRad * 0.5) / Math.max(0.45, camera.aspect)) * 180.0) /
+      Math.PI;
+    camera.fov = Math.max(20.0, Math.min(76.0, vfovDeg));
+    camera.updateProjectionMatrix();
+
+    const candWorld = latLonElevToWorld(cam.lat, cam.lon, cam.elev_m);
+    const halfSpan = patch.span_m * 0.5;
+    const insidePatch =
+      Math.abs(candWorld.x) <= halfSpan * 1.15 && Math.abs(candWorld.z) <= halfSpan * 1.15;
+
+    let camWorld;
+    if (insidePatch) {
+      const clampedX = Math.max(-halfSpan * 0.98, Math.min(halfSpan * 0.98, candWorld.x));
+      const clampedZ = Math.max(-halfSpan * 0.98, Math.min(halfSpan * 0.98, candWorld.z));
+      const terrY = sampleLocalTerrainY(clampedX, -clampedZ);
+      camWorld = new THREE.Vector3(clampedX, Math.max(candWorld.y, terrY + 12.0), clampedZ);
+    } else {
+      const vp0 =
+        state.shootReport?.top_viewpoints?.[Math.max(0, state.selectedVpIndex)] ||
+        state.shootReport?.top_viewpoints?.[0];
+      if (vp0) {
+        camWorld = latLonElevToWorld(vp0.viewpoint_lat, vp0.viewpoint_lon, vp0.viewpoint_elevation_m);
+      } else {
+        camWorld = latLonElevToWorld(lm.summit_lat, lm.summit_lon, lm.summit_elevation_m);
+      }
+      const terrY = sampleLocalTerrainY(camWorld.x, -camWorld.z);
+      camWorld.y = Math.max(camWorld.y, terrY) + 14.0;
+    }
+
+    const lookAzDeg = Number(cam.azimuth_deg ?? state.weatherReport?.sun_azimuth_deg ?? 259.0);
+    const tiltDeg = Math.max(-12.0, Math.min(8.0, Number(cam.tilt_deg ?? -1.2)));
+    const azRad = (lookAzDeg * Math.PI) / 180.0;
+    const tiltRad = (tiltDeg * Math.PI) / 180.0;
+    const cosT = Math.cos(tiltRad);
+    const dirWorld = new THREE.Vector3(
+      Math.sin(azRad) * cosT,
+      Math.sin(tiltRad),
+      -Math.cos(azRad) * cosT
+    ).normalize();
+
+    camera.position.copy(camWorld);
+    controls.target.copy(camWorld).addScaledVector(dirWorld, 2600.0);
+    controls.update();
+
+    // Sync solar timeline to the active webcam frame timestamp on historical replays
+    const frames = cam.timeline_frames || [];
+    const activeFrame =
+      (state.selectedWebcamFrameIdx >= 0 && frames[state.selectedWebcamFrameIdx]) ||
+      cam.primary_frame;
+    if (isPastShootDate(state.date) && activeFrame?.minutes_local != null) {
+      state.currentMinutes = Math.max(330, Math.min(1410, Number(activeFrame.minutes_local)));
+      timeScrubber.value = String(Math.round(state.currentMinutes));
+      syncSliderValue(timeScrubber);
+    }
+    updateSunRaysAndShader();
+
+    const posTag = insidePatch ? "EXACT WEBCAM GPS" : "MATCHED AZIMUTH/FOV";
+    vfOverlay.hidden = false;
+    vfHudReadout.textContent = `WEBCAM SNAP (${posTag}) · ${cam.short_name || cam.camera_id} · Az ${lookAzDeg.toFixed(1)}° (${compassLabel(lookAzDeg)}) · HFOV ${Math.round(hfovDeg)}°`;
+    wakeRenderLoop(true);
+    return;
+  }
 
   if (mode === "custom-tripod" && state.customTripodReport) {
     const rep = state.customTripodReport;
@@ -3887,7 +3975,316 @@ async function fetchWeatherForCorridor(phase = "sunset") {
     _lastSyncedFluidMinutes = -999;
     volumetricEngine.setLiveWeatherReport(state.weatherReport);
     renderWeatherCard(state.weatherReport);
+    renderWebcamChromaComparison();
     updateSunRaysAndShader();
+  }
+  fetchWebcamTruthForScenario(phase);
+}
+
+// ============================================================================
+// Phase 2 (v4.2): Mountain Webcam Ground-Truth Verification & Sky Chromaticity
+// ============================================================================
+let _webcamCanvas = null;
+let _webcamCtx = null;
+let _activeWebcamReqId = 0;
+
+function computeClientSkyChromaticity(imgEl) {
+  if (!imgEl || !imgEl.naturalWidth || !imgEl.naturalHeight) return null;
+  try {
+    if (!_webcamCanvas) {
+      _webcamCanvas = document.createElement("canvas");
+      _webcamCanvas.width = 160;
+      _webcamCanvas.height = 120;
+      _webcamCtx = _webcamCanvas.getContext("2d", { willReadFrequently: true });
+    }
+    _webcamCtx.drawImage(imgEl, 0, 0, 160, 120);
+    const y0 = Math.round(120 * 0.04);
+    const y1 = Math.round(120 * 0.20);
+    const x0 = Math.round(160 * 0.04);
+    const x1 = Math.round(160 * 0.96);
+    const imgData = _webcamCtx.getImageData(x0, y0, x1 - x0, y1 - y0).data;
+
+    const rbs = [];
+    const rgs = [];
+    const sats = [];
+    const warmSats = [];
+    const lums = [];
+    let blueCnt = 0;
+    let warmCnt = 0;
+    let greyCnt = 0;
+    let validCnt = 0;
+    let rSum = 0;
+    let gSum = 0;
+    let bSum = 0;
+
+    for (let i = 0; i < imgData.length; i += 4) {
+      const r = imgData[i] / 255.0;
+      const g = imgData[i + 1] / 255.0;
+      const b = imgData[i + 2] / 255.0;
+      const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      if (lum <= 0.085 || lum >= 0.975) continue;
+      const cMax = Math.max(r, g, b);
+      const cMin = Math.min(r, g, b);
+      const sat = (cMax - cMin) / Math.max(cMax, 1e-4);
+      const rb = (r + 0.018) / (b + 0.018);
+      const rg = (r + 0.018) / (g + 0.018);
+      const wFactor = Math.max(0.0, Math.min(1.0, (rb - 0.96) / 0.30));
+      rbs.push(rb);
+      rgs.push(rg);
+      sats.push(sat);
+      warmSats.push(sat * wFactor);
+      lums.push(lum);
+      if (rb < 0.84 && sat > 0.17) blueCnt++;
+      if (rb > 1.14 && lum > 0.16) warmCnt++;
+      if (rb >= 0.86 && rb <= 1.13 && sat < 0.165) greyCnt++;
+      validCnt++;
+      rSum += r;
+      gSum += g;
+      bSum += b;
+    }
+    if (validCnt < 30) return null;
+    rbs.sort((a, b) => a - b);
+    rgs.sort((a, b) => a - b);
+    sats.sort((a, b) => a - b);
+    warmSats.sort((a, b) => a - b);
+    const rbP90 = rbs[Math.min(rbs.length - 1, Math.floor(rbs.length * 0.9))];
+    const rgP90 = rgs[Math.min(rgs.length - 1, Math.floor(rgs.length * 0.9))];
+    const satP85 = sats[Math.min(sats.length - 1, Math.floor(sats.length * 0.85))];
+    const warmSatP85 = warmSats[Math.min(warmSats.length - 1, Math.floor(warmSats.length * 0.85))];
+    const lumMean = lums.reduce((s, v) => s + v, 0) / validCnt;
+    const lumStd = Math.sqrt(lums.reduce((s, v) => s + (v - lumMean) ** 2, 0) / validCnt);
+    const blueFrac = blueCnt / validCnt;
+    const warmFrac = warmCnt / validCnt;
+    const greyFrac = greyCnt / validCnt;
+
+    const warmIdx = Math.max(0.0, Math.min(1.35, (rbP90 - 0.92) * 0.85 + Math.max(0.0, rgP90 - 1.02) * 0.65));
+    const estKelvin =
+      greyFrac > 0.55 && rbP90 < 1.18
+        ? Math.round(5550 + Math.min(750, greyFrac * 700))
+        : Math.round(Math.max(2050, Math.min(6300, 5200 - warmIdx * 2450)));
+
+    const warmPts = Math.min(56, Math.max(0, (rbP90 - 0.98) * 52 + Math.max(0, rgP90 - 1.02) * 34 + warmFrac * 22));
+    const satPts = Math.min(22, warmSatP85 * 54);
+    const clarPts = Math.min(14, blueFrac * 12 + Math.min(6, lumStd * 36));
+    const empScore = Math.round(Math.max(12, Math.min(97, 16 + warmPts + satPts + clarPts - greyFrac * 18)));
+
+    return {
+      available: true,
+      rb_warmth_p90: Number(rbP90.toFixed(2)),
+      saturation_p85: Number(satP85.toFixed(2)),
+      estimated_color_temp_kelvin: estKelvin,
+      empirical_alpenglow_score: empScore,
+      horizon_swatch_rgb: [
+        Math.round((rSum / validCnt) * 255),
+        Math.round((gSum / validCnt) * 255),
+        Math.round((bSum / validCnt) * 255),
+      ],
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function renderWebcamChromaComparison(overrideChroma = null) {
+  const cam =
+    state.webcamReport?.cameras?.[state.selectedWebcamIdx] ||
+    state.webcamReport?.primary_camera;
+  const ch = overrideChroma || cam?.sky_chromaticity || {};
+  const w = state.weatherReport;
+
+  const rbEl = document.getElementById("val-wc-rb");
+  const kelvEl = document.getElementById("val-wc-kelvin");
+  const empEl = document.getElementById("val-wc-emp-score");
+  const simEl = document.getElementById("val-wc-sim-score");
+  const sbSwatch = document.getElementById("webcam-sidebar-swatch");
+  const sbTitle = document.getElementById("webcam-sidebar-title");
+  const sbSub = document.getElementById("webcam-sidebar-sub");
+
+  if (!cam) {
+    if (sbTitle) sbTitle.textContent = "No Nearby Mountain Webcam Found";
+    if (sbSub) sbSub.textContent = "Try selecting a California Coast or Sierra landmark";
+    return;
+  }
+
+  const swatch = ch.horizon_swatch_rgb;
+  if (sbSwatch && Array.isArray(swatch) && swatch.length === 3) {
+    sbSwatch.style.background = `rgb(${swatch[0]}, ${swatch[1]}, ${swatch[2]})`;
+  }
+
+  const empScore = ch.available && ch.empirical_alpenglow_score > 0 ? ch.empirical_alpenglow_score : null;
+  const estK = ch.available && ch.estimated_color_temp_kelvin ? ch.estimated_color_temp_kelvin : null;
+  const simScore = w?.alpenglow_score ?? null;
+  const simK = w?.color_temperature_kelvin ?? null;
+
+  if (rbEl) {
+    rbEl.textContent = ch.available
+      ? `${Number(ch.rb_warmth_p90 || 1.0).toFixed(2)}× · Sat ${Math.round((ch.saturation_p85 || 0) * 100)}%`
+      : "Loading RGB…";
+  }
+  if (kelvEl) {
+    kelvEl.textContent = `${estK ? `${estK}K` : "--"} / ${simK ? `${simK}K` : "--"}`;
+  }
+  if (empEl) {
+    empEl.textContent = empScore != null ? `${empScore} / 100` : "NIR / Night";
+  }
+  if (simEl) {
+    if (simScore != null && empScore != null) {
+      const diff = simScore - empScore;
+      const sign = diff > 0 ? `+${diff}` : `${diff}`;
+      simEl.textContent = `${simScore} / 100 (${sign})`;
+    } else {
+      simEl.textContent = simScore != null ? `${simScore} / 100` : "-- / 100";
+    }
+  }
+
+  if (sbTitle) {
+    const tag = cam.source === "alertca" ? "Live HD" : "Archive";
+    sbTitle.textContent = `${cam.short_name || cam.camera_id} (${tag} • ${cam.distance_miles} mi)`;
+  }
+  if (sbSub) {
+    if (empScore != null && simScore != null) {
+      sbSub.textContent = `Webcam Glow ${empScore}/100 (${estK}K) vs 3D Engine ${simScore}/100`;
+    } else {
+      sbSub.textContent = `Az ${cam.azimuth_deg}° ${cam.azimuth_cardinal} • ${cam.elev_ft.toLocaleString()} ft ASL`;
+    }
+  }
+}
+
+function renderWebcamTruthUI() {
+  const rep = state.webcamReport;
+  const cams = rep?.cameras || [];
+  const cam = cams[state.selectedWebcamIdx] || rep?.primary_camera;
+
+  const eyebrowEl = document.getElementById("webcam-card-eyebrow");
+  const titleEl = document.getElementById("webcam-card-title");
+  const tabsEl = document.getElementById("webcam-camera-tabs");
+  const imgEl = document.getElementById("webcam-frame-img");
+  const tsPill = document.getElementById("webcam-ts-pill");
+  const azPill = document.getElementById("webcam-az-pill");
+  const chipsEl = document.getElementById("webcam-timeline-chips");
+  const snapNoteEl = document.getElementById("webcam-snap-note");
+
+  if (!cam) {
+    renderWebcamChromaComparison();
+    return;
+  }
+
+  if (eyebrowEl) {
+    eyebrowEl.textContent =
+      cam.source === "alertca"
+        ? "ALERTCALIFORNIA LIVE HD • MOUNTAIN GROUND TRUTH"
+        : "PHENOCAM ARCHIVE • GOLDEN-HOUR SKY CHROMATICITY";
+  }
+  if (titleEl) {
+    titleEl.textContent = `${cam.short_name || cam.camera_id} • ${cam.elev_ft.toLocaleString()} ft • ${cam.distance_miles} mi`;
+  }
+
+  if (tabsEl) {
+    if (cams.length > 1) {
+      tabsEl.hidden = false;
+      tabsEl.innerHTML = cams
+        .map((c, idx) => {
+          const badge = c.source === "alertca" ? "📡 Live" : "📚 Science";
+          return `<button type="button" class="corridor-tab ${idx === state.selectedWebcamIdx ? "is-active" : ""}" data-wc-idx="${idx}">${badge} ${c.short_name || c.camera_id}</button>`;
+        })
+        .join("");
+    } else {
+      tabsEl.hidden = true;
+      tabsEl.innerHTML = "";
+    }
+  }
+
+  const frames = cam.timeline_frames || [];
+  let fIdx = state.selectedWebcamFrameIdx;
+  if (fIdx < 0 || fIdx >= frames.length) {
+    fIdx = Math.max(
+      0,
+      frames.findIndex((f) => f.is_primary)
+    );
+    state.selectedWebcamFrameIdx = fIdx;
+  }
+  const activeFrame = frames[fIdx] || cam.primary_frame;
+
+  if (imgEl && activeFrame?.proxy_url) {
+    if (imgEl.dataset.activeSrc !== activeFrame.proxy_url) {
+      imgEl.dataset.activeSrc = activeFrame.proxy_url;
+      imgEl.onload = () => {
+        const liveCh = computeClientSkyChromaticity(imgEl);
+        renderWebcamChromaComparison(liveCh || cam.sky_chromaticity);
+      };
+      imgEl.src = activeFrame.proxy_url;
+    }
+  }
+
+  if (tsPill && activeFrame) {
+    const offMin = activeFrame.offset_vs_sunset_min;
+    const offStr =
+      cam.source === "alertca"
+        ? "Live Frame"
+        : offMin === 0
+          ? "At Sunset"
+          : `${offMin > 0 ? "+" : ""}${offMin}m vs Sunset`;
+    tsPill.textContent = `${activeFrame.timestamp_local} • ${offStr}`;
+  }
+  if (azPill) {
+    azPill.textContent = `Az ${cam.azimuth_deg}° ${cam.azimuth_cardinal} • FOV ${Math.round(cam.hfov_deg || 62)}°`;
+  }
+
+  if (chipsEl) {
+    if (frames.length > 1) {
+      chipsEl.innerHTML = frames
+        .map(
+          (f, idx) =>
+            `<button type="button" class="webcam-time-chip ${idx === fIdx ? "is-active" : ""}" data-wc-frame="${idx}">${f.timestamp_local} (${f.chip_label || ""})</button>`
+        )
+        .join("");
+    } else {
+      chipsEl.innerHTML = "";
+    }
+  }
+
+  if (snapNoteEl) {
+    snapNoteEl.textContent = cam.is_inside_terrain_patch
+      ? `Exact GPS vantage inside 1m DEM (${cam.elev_ft.toLocaleString()} ft ASL) — snaps 3D camera to exact webcam coordinates, Az ${cam.azimuth_deg}°, and ${Math.round(cam.hfov_deg || 62)}° HFOV.`
+      : `Regional ${cam.provider_label} (${cam.distance_miles} mi away) — snaps 3D camera at active summit/viewpoint to matched Az ${cam.azimuth_deg}° (${cam.azimuth_cardinal}) & ${Math.round(cam.hfov_deg || 62)}° HFOV.`;
+  }
+
+  renderWebcamChromaComparison(cam.sky_chromaticity);
+}
+
+function toggleWebcamDrawer(forceShow = null) {
+  const next = forceShow !== null ? Boolean(forceShow) : !state.showWebcamCard;
+  state.showWebcamCard = next;
+  if (webcamTruthCard) webcamTruthCard.hidden = !next;
+  if (btnToggleWebcamDrawer) {
+    btnToggleWebcamDrawer.classList.toggle("is-active", next);
+    btnToggleWebcamDrawer.setAttribute("aria-expanded", String(next));
+  }
+  if (next) {
+    inspectorCard.hidden = true;
+    renderWebcamTruthUI();
+  }
+}
+
+async function fetchWebcamTruthForScenario(phase = "sunset") {
+  const lm = state.shootReport?.target_landmark;
+  if (!lm) return;
+  const reqId = ++_activeWebcamReqId;
+  const win = state.shootReport?.golden_hour_windows?.find((w) =>
+    w.phase.toLowerCase().includes(phase.toLowerCase())
+  );
+  const sunAz = win ? win.sun_azimuth_deg : phase === "sunrise" ? 102.5 : 259.1;
+  try {
+    const res = await fetch(
+      `/api/webcam-truth?lat=${lm.summit_lat}&lon=${lm.summit_lon}&date=${encodeURIComponent(state.date)}&phase=${encodeURIComponent(phase)}&elev_m=${lm.summit_elevation_m}&sun_az=${sunAz}`
+    );
+    if (!res.ok || reqId !== _activeWebcamReqId) return;
+    state.webcamReport = await res.json();
+    state.selectedWebcamIdx = 0;
+    state.selectedWebcamFrameIdx = -1;
+    renderWebcamTruthUI();
+  } catch (err) {
+    console.warn("Webcam truth fetch skipped:", err);
   }
 }
 
@@ -4101,6 +4498,7 @@ async function loadLandmarkScenario(customCoord = null) {
     renderSidebar();
     setCameraMode("orbit");
     updateSunRaysAndShader();
+    fetchWebcamTruthForScenario("sunset");
   } catch (err) {
     console.error("Failed to load scenario:", err);
     document.getElementById("summary-subtitle").textContent = `Error loading scenario: ${err.message}`;
@@ -4108,6 +4506,47 @@ async function loadLandmarkScenario(customCoord = null) {
     loadingEl.hidden = true;
   }
 }
+
+// Wire Mountain Webcam Split-View Drawer & 3D Azimuth/FOV Snap Controls
+btnToggleWebcamDrawer?.addEventListener("click", () => toggleWebcamDrawer());
+btnCloseWebcamCard?.addEventListener("click", () => toggleWebcamDrawer(false));
+btnSidebarOpenWebcam?.addEventListener("click", () => toggleWebcamDrawer(true));
+btnSnapWebcamCamera?.addEventListener("click", () => {
+  toggleWebcamDrawer(true);
+  setCameraMode("webcam-snap");
+});
+btnResetWebcamSnap?.addEventListener("click", () => setCameraMode("orbit"));
+
+document.getElementById("webcam-camera-tabs")?.addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-wc-idx]");
+  if (!btn) return;
+  state.selectedWebcamIdx = parseInt(btn.dataset.wcIdx, 10) || 0;
+  state.selectedWebcamFrameIdx = -1;
+  renderWebcamTruthUI();
+  if (state.cameraMode === "webcam-snap") {
+    setCameraMode("webcam-snap");
+  }
+});
+
+document.getElementById("webcam-timeline-chips")?.addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-wc-frame]");
+  if (!btn) return;
+  const idx = parseInt(btn.dataset.wcFrame, 10);
+  if (Number.isNaN(idx)) return;
+  state.selectedWebcamFrameIdx = idx;
+  renderWebcamTruthUI();
+  const cam =
+    state.webcamReport?.cameras?.[state.selectedWebcamIdx] ||
+    state.webcamReport?.primary_camera;
+  const frame = cam?.timeline_frames?.[idx];
+  if (frame?.minutes_local != null && isPastShootDate(state.date)) {
+    state.currentMinutes = Math.max(330, Math.min(1410, Number(frame.minutes_local)));
+    timeScrubber.value = String(Math.round(state.currentMinutes));
+    syncSliderValue(timeScrubber);
+    updateSunRaysAndShader();
+    wakeRenderLoop(true);
+  }
+});
 
 // ============================================================================
 // Interactive 3D Terrain & Volumetric Cloud Raycaster (Hover Provenance + Click)

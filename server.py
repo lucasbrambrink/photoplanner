@@ -25,6 +25,8 @@ from zoneinfo import ZoneInfo
 from planner.weather import (
     BENCHMARK_REPORT_JSON_PATH,
     SUMMARY_JSON_PATH,
+    fetch_cached_webcam_jpeg,
+    fetch_webcam_ground_truth,
     run_full_backtest_suite,
     solve_weather_and_corridor,
 )
@@ -67,6 +69,7 @@ ELEVATION_DIR = _resolve_elevation_dir()
 
 _CACHE: dict[str, bytes] = {}
 _WEATHER_TTL_CACHE: dict[str, tuple[float, bytes]] = {}
+_WEBCAM_TTL_CACHE: dict[str, tuple[float, bytes]] = {}
 
 
 SF_PENINSULA_LANDMARKS: dict[str, dict] = {
@@ -1431,6 +1434,52 @@ class PhotoPlannerHandler(BaseHTTPRequestHandler):
                 else:
                     data = json.dumps(run_full_backtest_suite()).encode("utf-8")
                 self._send_json(data, cache_control="public, max-age=3600")
+                return
+
+            if path == "/api/webcam-truth":
+                lat = float(qs.get("lat", ["37.5945"])[0])
+                lon = float(qs.get("lon", ["-122.5028"])[0])
+                date_str = qs.get("date", [default_date])[0]
+                phase = qs.get("phase", ["sunset"])[0]
+                elev_m = float(qs.get("elev_m", ["220.0"])[0])
+                sun_az_raw = qs.get("sun_az", [None])[0]
+                sun_az = float(sun_az_raw) if sun_az_raw is not None else None
+                w_key = f"wc:{lat:.4f}:{lon:.4f}:{date_str}:{phase}:{elev_m:.0f}:{sun_az or ''}"
+                now_m = time.monotonic()
+                ttl_s = 120.0 if date_str >= default_date else 3600.0
+                cached_wc = _WEBCAM_TTL_CACHE.get(w_key)
+                if cached_wc and (now_m - cached_wc[0]) < ttl_s:
+                    self._send_json(cached_wc[1], cache_control=f"public, max-age={int(ttl_s)}")
+                    return
+                res_wc = fetch_webcam_ground_truth(
+                    lat=lat,
+                    lon=lon,
+                    date_str=date_str,
+                    phase=phase,
+                    elev_m=elev_m,
+                    sun_az_deg=sun_az,
+                    analyze_pixels=True,
+                )
+                payload_wc = json.dumps(res_wc).encode("utf-8")
+                _WEBCAM_TTL_CACHE[w_key] = (now_m, payload_wc)
+                self._send_json(payload_wc, cache_control=f"public, max-age={int(ttl_s)}")
+                return
+
+            if path == "/api/webcam-image":
+                source = qs.get("source", ["phenocam"])[0].strip().lower()
+                ident = qs.get("path", qs.get("id", [""]))[0]
+                try:
+                    jpg = fetch_cached_webcam_jpeg(source, ident)
+                except ValueError as v_err:
+                    err = json.dumps({"error": str(v_err)}).encode("utf-8")
+                    self._send_json(err, status=400)
+                    return
+                max_age = 86400 if source == "phenocam" else 120
+                self._send_binary(
+                    jpg,
+                    content_type="image/jpeg",
+                    cache_control=f"public, max-age={max_age}",
+                )
                 return
 
             if path == "/api/annual-calendar":
