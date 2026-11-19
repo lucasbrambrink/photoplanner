@@ -81,6 +81,18 @@ def hrrr_latlon_to_ij(lat: float, lon: float) -> tuple[float, float]:
     return (x - _HRRR_X1_M) / _HRRR_DX_M, (y - _HRRR_Y1_M) / _HRRR_DX_M
 
 
+def hrrr_latlon_grid_to_ij(lat_grid: np.ndarray, lon_grid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorized `(lat_grid, lon_grid)` -> fractional HRRR 3 km `(fi_grid, fj_grid)`."""
+    phi = np.radians(np.clip(lat_grid, -80.0, 85.0))
+    lon_norm = np.mod(lon_grid + 180.0, 360.0) - 180.0
+    lam = np.radians(lon_norm)
+    rho = (_HRRR_R_M * _HRRR_F) / np.power(np.tan(math.pi * 0.25 + phi * 0.5), _HRRR_N)
+    theta = _HRRR_N * (lam - _HRRR_LAM0)
+    x = rho * np.sin(theta)
+    y = -rho * np.cos(theta)
+    return ((x - _HRRR_X1_M) / _HRRR_DX_M).astype(np.float32), ((y - _HRRR_Y1_M) / _HRRR_DX_M).astype(np.float32)
+
+
 def is_in_hrrr_conus(lat: float, lon: float, margin_cells: float = 4.0) -> bool:
     """Returns `True` when `(lat, lon)` lies safely inside the 3 km HRRR CONUS domain."""
     if not (21.0 <= lat <= 53.0 and -135.0 <= lon <= -60.0):
@@ -1021,6 +1033,27 @@ def fetch_hrrr_s3_corridor(
         if best_ocean_ij is not None:
             marine_ref = _analyze_hrrr_profile_at_ij(arrs, best_ocean_ij[0], best_ocean_ij[1])
 
+    default_lid_m = (
+        float(marine_ref["lid_asl_m"])
+        if (is_coastal and marine_ref is not None)
+        else float(stations[0]["lid_asl_m"])
+    )
+    default_base_m = (
+        float(marine_ref["stratus_base_asl_m"])
+        if (is_coastal and marine_ref is not None)
+        else float(stations[0]["stratus_base_asl_m"])
+    )
+    spatial_64x64 = _extract_hrrr_spatial_grid_64x64(
+        arrs,
+        tile_i0,
+        tile_j0,
+        lat,
+        lon,
+        is_coastal=is_coastal,
+        default_lid_m=default_lid_m,
+        default_base_m=default_base_m,
+    )
+
     return {
         "ok": True,
         "provider": "NOAA HRRR 3km Native S3 (GRIB2 .idx)",
@@ -1032,6 +1065,162 @@ def fetch_hrrr_s3_corridor(
         "elapsed_ms": meta["elapsed_ms"],
         "stations": stations,
         "marine_ref": marine_ref,
+        "spatial_64x64": spatial_64x64,
+    }
+
+
+def _sample_tile_bilinear_grid(
+    arr: np.ndarray | None,
+    fi_loc: np.ndarray,
+    fj_loc: np.ndarray,
+    default_val: float = 0.0,
+) -> np.ndarray:
+    """Vectorized NaN-safe bilinear sampler on a cropped HRRR 3 km tile."""
+    if arr is None or arr.size == 0:
+        return np.full_like(fi_loc, default_val, dtype=np.float32)
+    ny, nx = arr.shape
+    x = np.clip(fi_loc, 0.0, max(0.0, float(nx - 1.001)))
+    y = np.clip(fj_loc, 0.0, max(0.0, float(ny - 1.001)))
+    ix = np.minimum(nx - 2, np.floor(x).astype(np.int32)) if nx > 1 else np.zeros_like(x, dtype=np.int32)
+    iy = np.minimum(ny - 2, np.floor(y).astype(np.int32)) if ny > 1 else np.zeros_like(y, dtype=np.int32)
+    fx = (x - ix).astype(np.float32)
+    fy = (y - iy).astype(np.float32)
+    ix1 = np.minimum(nx - 1, ix + 1)
+    iy1 = np.minimum(ny - 1, iy + 1)
+
+    q00 = arr[iy, ix]
+    q10 = arr[iy, ix1]
+    q01 = arr[iy1, ix]
+    q11 = arr[iy1, ix1]
+
+    w00 = (1.0 - fx) * (1.0 - fy)
+    w10 = fx * (1.0 - fy)
+    w01 = (1.0 - fx) * fy
+    w11 = fx * fy
+
+    m00 = np.isfinite(q00)
+    m10 = np.isfinite(q10)
+    m01 = np.isfinite(q01)
+    m11 = np.isfinite(q11)
+
+    w_sum = (
+        np.where(m00, w00, 0.0)
+        + np.where(m10, w10, 0.0)
+        + np.where(m01, w01, 0.0)
+        + np.where(m11, w11, 0.0)
+    )
+    v_sum = (
+        np.where(m00, q00 * w00, 0.0)
+        + np.where(m10, q10 * w10, 0.0)
+        + np.where(m01, q01 * w01, 0.0)
+        + np.where(m11, q11 * w11, 0.0)
+    )
+    return np.where(w_sum > 1e-5, v_sum / np.maximum(1e-5, w_sum), default_val).astype(np.float32)
+
+
+def _extract_hrrr_spatial_grid_64x64(
+    arrs: dict[str, np.ndarray],
+    tile_i0: int,
+    tile_j0: int,
+    lat: float,
+    lon: float,
+    *,
+    is_coastal: bool,
+    default_lid_m: float,
+    default_base_m: float,
+    grid_size: int = 64,
+    span_m: float = 112000.0,
+) -> dict[str, Any]:
+    """
+    Samples a `64x64` (`112 km x 112 km`, `1.75 km` texel) spatial cloud & boundary-layer raster
+    directly from the native 3 km HRRR fields (`LCDC`, `TCDC:BL`, `MCDC`, `HCDC`, `CLMR`, `TCOLW`,
+    `HGT:surface`, `HGT:cloud ceiling`, `HGT:cloud top`).
+    Row 0 = South (`-half_span`), Row 63 = North (`+half_span`); Col 0 = West, Col 63 = East
+    (matching OpenGL `flipY=false` UV `(east, north)` layout!).
+    """
+    half_km = (span_m * 0.5) / 1000.0
+    m_per_lat = 111.13292
+    m_per_lon = max(22.0, 111.41284 * math.cos(math.radians(lat)))
+
+    u_1d = (np.arange(grid_size, dtype=np.float32) + 0.5) / float(grid_size) - 0.5
+    east_km_1d = u_1d * (2.0 * half_km)
+    north_km_1d = u_1d * (2.0 * half_km)
+    east_grid, north_grid = np.meshgrid(east_km_1d, north_km_1d, indexing="xy")
+
+    lat_grid = lat + north_grid / m_per_lat
+    lon_grid = lon + east_grid / m_per_lon
+    fi_abs, fj_abs = hrrr_latlon_grid_to_ij(lat_grid, lon_grid)
+    fi_loc = fi_abs - float(tile_i0)
+    fj_loc = fj_abs - float(tile_j0)
+
+    sfc_m = np.maximum(0.0, _sample_tile_bilinear_grid(arrs.get("sfc_hgt"), fi_loc, fj_loc, 0.0))
+    lcdc = np.clip(_sample_tile_bilinear_grid(arrs.get("lcdc"), fi_loc, fj_loc, 0.0), 0.0, 100.0)
+    tcdc_bl = np.clip(_sample_tile_bilinear_grid(arrs.get("tcdc_bl"), fi_loc, fj_loc, 0.0), 0.0, 100.0)
+    mcdc = np.clip(_sample_tile_bilinear_grid(arrs.get("mcdc"), fi_loc, fj_loc, 0.0), 0.0, 100.0)
+    hcdc = np.clip(_sample_tile_bilinear_grid(arrs.get("hcdc"), fi_loc, fj_loc, 0.0), 0.0, 100.0)
+    tcolw = np.maximum(0.0, _sample_tile_bilinear_grid(arrs.get("tcolw"), fi_loc, fj_loc, 0.0))
+    tcoli = np.maximum(0.0, _sample_tile_bilinear_grid(arrs.get("tcoli"), fi_loc, fj_loc, 0.0))
+    hpbl = np.clip(_sample_tile_bilinear_grid(arrs.get("hpbl"), fi_loc, fj_loc, 450.0), 80.0, 2600.0)
+
+    clmr_bl = np.maximum(
+        np.maximum(
+            _sample_tile_bilinear_grid(arrs.get("clmr_975"), fi_loc, fj_loc, 0.0),
+            _sample_tile_bilinear_grid(arrs.get("clmr_950"), fi_loc, fj_loc, 0.0),
+        ),
+        _sample_tile_bilinear_grid(arrs.get("clmr_925"), fi_loc, fj_loc, 0.0),
+    ) * 1000.0
+    clmr_cu = _sample_tile_bilinear_grid(arrs.get("clmr_850"), fi_loc, fj_loc, 0.0) * 1000.0
+
+    cbase_raw = _sample_tile_bilinear_grid(arrs.get("cbase_asl"), fi_loc, fj_loc, float("nan"))
+    ctop_raw = _sample_tile_bilinear_grid(arrs.get("ctop_asl"), fi_loc, fj_loc, float("nan"))
+
+    low_cf = np.clip(np.maximum(lcdc, tcdc_bl) / 100.0, 0.0, 1.0)
+    bl_stratus_w = np.where(
+        tcdc_bl >= 8.0,
+        np.clip((tcdc_bl + clmr_bl * 180.0) / np.maximum(12.0, lcdc + 4.0), 0.25, 1.0),
+        np.where(is_coastal & (sfc_m < 650.0), 0.78, 0.32),
+    )
+    fog_cf_raw = np.clip(low_cf * bl_stratus_w, 0.0, 1.0)
+
+    lid_est = np.where(
+        np.isfinite(ctop_raw) & (ctop_raw > 140.0) & (ctop_raw < 2350.0),
+        0.55 * ctop_raw + 0.45 * default_lid_m,
+        np.where(
+            is_coastal & (sfc_m < 900.0),
+            default_lid_m,
+            np.clip(sfc_m + hpbl * 0.82, 220.0, 2400.0),
+        ),
+    ).astype(np.float32)
+
+    base_est = np.where(
+        np.isfinite(cbase_raw) & (cbase_raw >= 35.0) & (cbase_raw < lid_est - 65.0),
+        0.60 * cbase_raw + 0.40 * default_base_m,
+        np.clip(default_base_m, 40.0, np.maximum(80.0, lid_est - 110.0)),
+    ).astype(np.float32)
+
+    # Physical coastal-ridge masking: sub-inversion marine stratus cannot climb over ridges higher than `lid_est`!
+    ridge_mask = np.clip((lid_est + 55.0 - sfc_m) / 125.0, 0.0, 1.0)
+    fog_cf = np.where(is_coastal, fog_cf_raw * ridge_mask, fog_cf_raw).astype(np.float32)
+    cu_above_cf = np.clip((clmr_cu / 0.08) * 0.45, 0.0, 0.85)
+    low_cf_out = np.where(
+        is_coastal & (sfc_m > lid_est + 40.0),
+        np.maximum(fog_cf, np.minimum(low_cf, cu_above_cf)),
+        np.maximum(fog_cf, low_cf),
+    ).astype(np.float32)
+
+    tau_tot = np.clip(135.0 * tcolw + 32.0 * tcoli + 0.8 * (hcdc / 100.0), 0.0, 32.0).astype(np.float32)
+
+    return {
+        "grid_size": grid_size,
+        "span_m": span_m,
+        "fog_cf": fog_cf,
+        "low_cf": low_cf_out,
+        "mid_cf": (mcdc / 100.0).astype(np.float32),
+        "high_cf": (hcdc / 100.0).astype(np.float32),
+        "fog_top_m": lid_est,
+        "fog_base_m": base_est,
+        "sfc_elev_m": sfc_m.astype(np.float32),
+        "tau_total": tau_tot,
     }
 
 
@@ -1090,11 +1279,18 @@ def apply_hrrr_column_to_sounding(
 
     # Cloud layer percentages from HRRR native `LCDC`, `TCDC:boundary layer`, `MCDC`, `HCDC`
     h_low_pct = max(float(hrrr_col["lcdc_pct"]), float(hrrr_col["tcdc_bl_pct"]))
+    offshore_low = (
+        max(float(marine_ref["lcdc_pct"]), float(marine_ref["tcdc_bl_pct"]))
+        if (is_coastal and marine_ref is not None)
+        else h_low_pct
+    )
     if is_coastal and marine_ref is not None and elev_m < h_lid_m - 25.0:
         # Coastal headlands/bluffs sitting BELOW the marine inversion lid experience coastal stratus
         # even when the 3 km grid box straddles dry inland hills (`Pedro Point` / `Garrapata`).
-        offshore_low = max(float(marine_ref["lcdc_pct"]), float(marine_ref["tcdc_bl_pct"]))
         h_low_pct = max(h_low_pct, 0.58 * offshore_low + 0.42 * h_low_pct)
+    elif is_coastal and elev_m > h_lid_m + 30.0:
+        st["above_lid_summit"] = True
+        st["sea_deck_low_pct"] = int(round(max(h_low_pct, offshore_low)))
 
     h_mid_pct = float(hrrr_col["mcdc_pct"])
     h_high_pct = float(hrrr_col["hcdc_pct"])

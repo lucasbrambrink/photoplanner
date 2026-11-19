@@ -27,7 +27,13 @@ import subprocess
 import tempfile
 from typing import Any
 
-from .goes_nowcast import fetch_goes_corridor_nowcast, sample_advected_goes_state
+import numpy as np
+
+from .goes_nowcast import (
+    fetch_goes_corridor_nowcast,
+    sample_advected_goes_grid_64x64,
+    sample_advected_goes_state,
+)
 from .hrrr_s3 import (
     apply_hrrr_column_to_sounding,
     fetch_hrrr_s3_corridor,
@@ -79,10 +85,12 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def _is_coastal_california(lat: float, lon: float) -> bool:
-    if 36.8 <= lat <= 38.4 and -123.2 <= lon <= -122.10:
+    if not (31.5 <= lat <= 42.5):
+        return False
+    if 36.8 <= lat <= 38.4 and -130.5 <= lon <= -122.05:
         return True
     coast_lon = -124.2 + max(0.0, 40.5 - lat) * 0.72
-    return (32.5 <= lat <= 42.0) and (abs(lon - coast_lon) <= 0.45)
+    return -130.5 <= lon <= (coast_lon + 0.45)
 
 
 def _solar_ephemeris_local(
@@ -360,7 +368,8 @@ def _blend_nowcast_into_station(
                 and sat_low_top_m > mbl_floor_m + 95.0
             )
             is_fog_like = (is_coastal_loc or elev_m < 1350.0) and (
-                blended_fog_cf >= 0.06
+                (is_coastal_loc and elev_m < 950.0 and orig_cu_band is None)
+                or blended_fog_cf >= 0.06
                 or st["inv_jump_k"] >= 1.0
                 or st["rh_2m_pct"] >= 86.0
                 or (has_sat_low_top and sat_low_top_m < mbl_floor_m + 950.0)
@@ -412,7 +421,7 @@ def _blend_nowcast_into_station(
             if is_fog_like:
                 st["inv_top_asl_m"] = round(top_m, 1)
 
-            primary_low_cf = max(blended_fog_cf, low_cf * 0.78) if is_fog_like else low_cf
+            primary_low_cf = max(blended_fog_cf, low_cf * 0.96) if is_fog_like else low_cf
             tau_nwp = primary_low_cf * min(26.0, 0.022 * (top_m - base_m))
             sat_tau_low = float(adv.get("tau_low", adv["tau_total"] * 0.72))
             if adv["low_cf"] > 0.05:
@@ -433,15 +442,20 @@ def _blend_nowcast_into_station(
                     "ice_fraction": 0.0,
                 }
             )
-            # Emit simultaneous above-inversion cumulus/stratocumulus deck (5-10 kft CCLC CF2 or NWP 850 hPa Sc)
-            residual_cu_cf = max(0.0, low_cf - 0.72 * primary_low_cf) if is_fog_like else 0.0
+            # Only emit a separate above-inversion cumulus deck (`5-10 kft`) when genuine above-lid
+            # convective/850 hPa cloud exists in the sounding or GOES L2 cloud-top height exceeds the MBL lid
             orig_cu_cf = (
                 float(orig_cu_band["cloud_fraction"])
-                if (orig_cu_band is not None and float(orig_cu_band["base_asl_m"]) > top_m + 130.0)
+                if (orig_cu_band is not None and float(orig_cu_band["base_asl_m"]) > top_m + 150.0)
                 else 0.0
             )
-            cu_cf = max(residual_cu_cf, orig_cu_cf * (1.0 - 0.35 * w_low_eff))
-            if is_fog_like and cu_cf >= 0.05:
+            sat_has_elevated_cu = bool(has_sat_low_top and sat_low_top_m > top_m + 450.0 and adv["low_cf"] >= 0.18)
+            cu_cf = (
+                orig_cu_cf * (1.0 - 0.25 * w_low_eff)
+                if sat_has_elevated_cu
+                else orig_cu_cf * (1.0 - 0.65 * w_low_eff)
+            )
+            if is_fog_like and cu_cf >= 0.07:
                 cu_base_m = max(
                     top_m + 180.0,
                     elev_m + 180.0,
@@ -465,17 +479,19 @@ def _blend_nowcast_into_station(
                 )
         if mid_cf >= 0.03:
             sat_mid_top = float(adv.get("mid_top_asl_m") or 4350.0)
+            is_cirrus_fallstreak = bool(high_cf >= 0.58 and mid_cf <= 0.30 and float(st.get("precip_mm", 0.0)) < 0.05)
             mid_top = max(
                 elev_m + 1450.0,
                 (1.0 - 0.55 * w_mid_eff) * max(elev_m + 2350.0, 4350.0) + (0.55 * w_mid_eff) * sat_mid_top,
             )
             mid_base = max(elev_m + 750.0, mid_top - 1350.0)
-            tau_mid_nwp = mid_cf * 6.2
-            sat_tau_mid = float(adv.get("tau_mid", mid_cf * 5.6))
+            tau_mid_nwp = mid_cf * (1.75 if is_cirrus_fallstreak else 6.2)
+            sat_tau_mid = float(adv.get("tau_mid", mid_cf * (1.6 if is_cirrus_fallstreak else 5.6)))
             if adv["mid_cf"] > 0.05:
-                tau_mid_sat = mid_cf * max(0.8, min(24.0, sat_tau_mid / adv["mid_cf"]))
+                incloud_mid = max(0.55, min(5.0 if is_cirrus_fallstreak else 24.0, sat_tau_mid / adv["mid_cf"]))
+                tau_mid_sat = mid_cf * incloud_mid
             else:
-                tau_mid_sat = mid_cf * 5.4
+                tau_mid_sat = mid_cf * (1.6 if is_cirrus_fallstreak else 5.4)
             tau_mid = (1.0 - w_mid_eff) * tau_mid_nwp + w_mid_eff * tau_mid_sat
             new_bands.append(
                 {
@@ -484,9 +500,9 @@ def _blend_nowcast_into_station(
                     "top_asl_m": round(mid_top, 1),
                     "cloud_fraction": round(mid_cf, 3),
                     "optical_depth_vertical": round(max(0.06, tau_mid), 2),
-                    "aspect_ratio_h_over_d": 0.22,
-                    "characteristic_cell_km": 6.5,
-                    "ice_fraction": 0.35,
+                    "aspect_ratio_h_over_d": 0.08 if is_cirrus_fallstreak else 0.22,
+                    "characteristic_cell_km": 22.0 if is_cirrus_fallstreak else 6.5,
+                    "ice_fraction": 0.85 if is_cirrus_fallstreak else 0.35,
                 }
             )
         if high_cf >= 0.03:
@@ -706,15 +722,15 @@ def _build_atmospheric_layers_provenance(
 
     # Empirically calibrated base skill vs lead time (calibrated against 384 multi-sensor layer verifications in backtest.py)
     if is_historical and hindcast_lead_days == 0 and not has_live_nowcast:
-        base_nwp_skill = 83.5
+        base_nwp_skill = 86.0 if has_hrrr_s3 else 83.5
     else:
         pos_lead = max(0.0, lead_hours)
-        base_nwp_skill = 86.5 * math.exp(-pos_lead / 440.0)
+        base_nwp_skill = (89.5 if has_hrrr_s3 else 86.5) * math.exp(-pos_lead / 460.0)
 
     obs_base_skill = (
-        (94.0 if (is_cal_l2 and has_cclc_ml) else (91.0 if is_cal_l2 else 84.0))
-        * (0.91 + 0.09 * motion_conf)
-        * math.exp(-max(0.0, lead_hours) / 22.0)
+        (94.5 if (is_cal_l2 and has_cclc_ml) else (91.5 if is_cal_l2 else 84.0))
+        * (0.92 + 0.08 * motion_conf)
+        * math.exp(-max(0.0, lead_hours) / 24.0)
         if (has_live_nowcast and goes_data is not None)
         else base_nwp_skill
     )
@@ -741,11 +757,14 @@ def _build_atmospheric_layers_provenance(
             0.25 * ((mh - mean_m) ** 2 + (me - mean_m) ** 2 + (ma - mean_m) ** 2 + (mg - mean_m) ** 2)
         )
         regime_pen = (
-            (1.5 if has_hrrr_s3 else 4.5)
+            (1.0 if has_hrrr_s3 else 4.5)
             if (layer_id == "fog" and is_coastal and w_nowcast < 0.35)
             else 0.0
         )
-        spread_pen = min(20.0, 0.45 * std_m) if is_historical else min(24.0, 0.52 * std_m)
+        if has_hrrr_s3:
+            spread_pen = min(15.5, 0.34 * std_m)
+        else:
+            spread_pen = min(20.0, 0.45 * std_m) if is_historical else min(24.0, 0.52 * std_m)
         nwp_conf = base_nwp_skill - spread_pen - regime_pen
 
         w_obs = 0.0
@@ -1039,87 +1058,239 @@ def _build_atmospheric_layers_provenance(
     }
 
 
-def _build_16x16_mesoscale_cloud_grid(
+def _build_64x64_multilayer_cloud_field(
     center_lat: float,
     center_lon: float,
-    anchor_samples: list[tuple[float, float, float, float, float, float]],
+    is_coastal: bool,
+    anchor_samples: list[tuple[float, float, float, float, float, float, float, float, float]],
+    hrrr_s3_data: dict[str, Any] | None,
+    use_hrrr_spatial: bool,
     goes_data: dict[str, Any] | None,
+    station_obs: dict[str, Any] | None,
+    raob_obs: dict[str, Any] | None,
     lead_minutes: float,
     w_nowcast: float,
-    wind_850_uv: tuple[float, float],
-    wind_500_uv: tuple[float, float],
-    wind_250_uv: tuple[float, float],
+    st0: dict[str, Any],
+    primary_mins: int,
 ) -> dict[str, Any]:
-    grid_n = 16
-    span_m = 160_000.0
-    half_km = 80.0
-    raw_bytes = bytearray(grid_n * grid_n * 4)
+    """
+    Constructs a `64x64` (`112 km x 112 km`, `1.75 km` texel) multi-layer spatial cloud & altitude field:
+      - `rgba8_b64` (`64x64` RGBA8): `R = low_cf`, `G = mid_cf`, `B = high_cf`, `A = fog_cf`
+      - `alt_rgba8_b64` (`64x64` RGBA8):
+          `R = fog_top_m / 2550`, `G = fog_base_m / 2550`, `B = sfc_elev_m / 4200`, `A = tau_total / 32`
+    Fuses vectorized 3-frame GOES-18/19 2 km L2 (`CCLC` + `BTD` + `COD` + `ACHA`), native 3 km NOAA HRRR S3
+    (`LCDC` + `TCDC:BL` + `MCDC` + `HCDC` + `CLMR` + `sfc_hgt`), 00Z/12Z RAOB lid, ASOS ceilometer, and NWP soundings.
+    """
+    grid_n = 64
+    span_m = 112_000.0
+    half_km = span_m * 0.5 / 1000.0
+    axis_km = np.linspace(-half_km, half_km, grid_n, dtype=np.float32)
+    ex_grid, ny_grid = np.meshgrid(axis_km, axis_km)
+
+    # 1. Smooth NWP multi-station IDW baseline across 112 km x 112 km
+    w_sum = np.zeros((grid_n, grid_n), dtype=np.float32)
+    low_p = np.zeros((grid_n, grid_n), dtype=np.float32)
+    mid_p = np.zeros((grid_n, grid_n), dtype=np.float32)
+    high_p = np.zeros((grid_n, grid_n), dtype=np.float32)
+    fog_p = np.zeros((grid_n, grid_n), dtype=np.float32)
+    top_m = np.zeros((grid_n, grid_n), dtype=np.float32)
+    base_m = np.zeros((grid_n, grid_n), dtype=np.float32)
+    elev_m = np.zeros((grid_n, grid_n), dtype=np.float32)
+
+    for ax_km, ay_km, alow, amid, ahigh, afog, atop, abase, aelev in anchor_samples:
+        d2 = (ex_grid - float(ax_km)) ** 2 + (ny_grid - float(ay_km)) ** 2
+        w = 1.0 / (d2 + 95.0) + 0.14 * np.exp(-d2 / (2.0 * 38.0 * 38.0))
+        w_sum += w
+        low_p += w * float(alow)
+        mid_p += w * float(amid)
+        high_p += w * float(ahigh)
+        fog_p += w * float(afog)
+        top_m += w * float(atop)
+        base_m += w * float(abase)
+        elev_m += w * float(aelev)
+
+    inv_w = 1.0 / np.maximum(w_sum, 1e-6)
+    low_p *= inv_w
+    mid_p *= inv_w
+    high_p *= inv_w
+    fog_p *= inv_w
+    top_m *= inv_w
+    base_m *= inv_w
+    elev_m *= inv_w
+    tau_arr = np.clip(0.08 * low_p + 0.055 * mid_p + 0.018 * high_p, 0.02, 32.0)
+
+    spatial_sources: list[str] = ["NWP Multi-Station Soundings"]
+
+    # 2. Native 3 km NOAA HRRR S3 64x64 spatial microphysics + terrain height (`1.75 km` upsampled)
+    h_sp = (hrrr_s3_data or {}).get("spatial_64x64") if (use_hrrr_spatial and hrrr_s3_data) else None
+    if isinstance(h_sp, dict) and "low_cf" in h_sp and h_sp["low_cf"].shape == (grid_n, grid_n):
+        w_hrrr = 0.88
+        low_p = (1.0 - w_hrrr) * low_p + w_hrrr * (np.asarray(h_sp["low_cf"], dtype=np.float32) * 100.0)
+        mid_p = (1.0 - w_hrrr) * mid_p + w_hrrr * (np.asarray(h_sp["mid_cf"], dtype=np.float32) * 100.0)
+        high_p = (1.0 - w_hrrr) * high_p + w_hrrr * (np.asarray(h_sp["high_cf"], dtype=np.float32) * 100.0)
+        fog_p = (1.0 - w_hrrr) * fog_p + w_hrrr * (np.asarray(h_sp["fog_cf"], dtype=np.float32) * 100.0)
+        top_m = (1.0 - 0.85) * top_m + 0.85 * np.asarray(h_sp["fog_top_m"], dtype=np.float32)
+        base_m = (1.0 - 0.85) * base_m + 0.85 * np.asarray(h_sp["fog_base_m"], dtype=np.float32)
+        elev_m = np.asarray(h_sp["sfc_elev_m"], dtype=np.float32)
+        tau_arr = (1.0 - 0.80) * tau_arr + 0.80 * np.asarray(h_sp["tau_total"], dtype=np.float32)
+        spatial_sources.insert(0, f"NOAA HRRR 3km S3 ({hrrr_s3_data.get('cycle_tag', 'native')})")
+
+    # 3. Vectorized 3-frame GOES-18/19 2 km L2 (`CCLC` + `BTD` + `ACHA` + `COD`) 64x64 advection
+    if goes_data is not None and w_nowcast > 0.03:
+        g_sp = sample_advected_goes_grid_64x64(
+            goes_data,
+            center_lat,
+            center_lon,
+            lead_minutes,
+            tuple(st0["wind_850_uv_ms"]),
+            tuple(st0["wind_500_uv_ms"]),
+            tuple(st0["wind_250_uv_ms"]),
+            grid_size=grid_n,
+            span_m=span_m,
+        )
+        if g_sp is not None:
+            g_low = g_sp["low_cf"] * 100.0
+            g_mid = g_sp["mid_cf"] * 100.0
+            g_hi = g_sp["high_cf"] * 100.0
+            g_fog = g_sp["fog_cf"] * 100.0
+
+            # Protect sub-canopy fog under thick upper cirrus shield from spaceborne IR masking
+            up_shield = np.clip((g_hi + 0.75 * g_mid - 45.0) / 40.0, 0.0, 1.0)
+            occ_mask = (up_shield > 0.22) & (g_low < 38.0)
+            occ_atten = np.where(occ_mask, 1.0 - 0.68 * up_shield, 1.0)
+            w_lo_grid = np.clip(w_nowcast * (1.04 + 0.10 * g_sp["pin_weight_low"]) * occ_atten, 0.0, 0.95)
+            w_mi_grid = min(0.94, w_nowcast * 0.95)
+            w_hi_grid = min(0.92, w_nowcast * 0.88)
+
+            low_p = (1.0 - w_lo_grid) * low_p + w_lo_grid * g_low
+            mid_p = (1.0 - w_mi_grid) * mid_p + w_mi_grid * g_mid
+            high_p = (1.0 - w_hi_grid) * high_p + w_hi_grid * g_hi
+            fog_p = (1.0 - w_lo_grid) * fog_p + w_lo_grid * g_fog
+
+            has_g_top = (g_sp["low_cf"] >= 0.12) & (g_sp["low_top_m"] > 120.0)
+            top_m = np.where(has_g_top, 0.65 * top_m + 0.35 * g_sp["low_top_m"], top_m)
+            tau_arr = (1.0 - 0.75 * w_nowcast) * tau_arr + (0.75 * w_nowcast) * g_sp["tau_total"]
+            spatial_sources.insert(0, f"{goes_data.get('satellite', 'GOES-18')} 2km L2 Advected")
+
+    # 4. Anchor marine inversion lid & ceilometer base + enforce coastal-ridge clearance physics
+    if st0.get("raob_assimilated") and st0.get("raob_lid_asl_m") is not None:
+        r_lid = float(st0["raob_lid_asl_m"])
+        marine_mask = elev_m < 420.0
+        top_m = np.where(marine_mask, 0.25 * top_m + 0.75 * r_lid, top_m)
+        spatial_sources.append(f"{raob_obs['station_id'] if raob_obs else 'RAOB'} Balloon Lid")
+
+    if station_obs is not None and station_obs.get("fog_base_asl_m") is not None:
+        ceil_b = float(station_obs["fog_base_asl_m"])
+        d_origin_km = np.hypot(ex_grid, ny_grid)
+        w_ceil = 0.70 * np.exp(-d_origin_km / 28.0)
+        base_m = (1.0 - w_ceil) * base_m + w_ceil * ceil_b
+        spatial_sources.append(f"{station_obs['station_id']} Ceilometer")
+
+    if is_coastal:
+        # Sub-inversion marine stratus cannot exist below ground on coastal ridges poking above the lid!
+        ridge_clear = np.clip((top_m + 50.0 - elev_m) / 130.0, 0.0, 1.0)
+        fog_p *= ridge_clear
+        # Preserve genuine elevated cumulus if top_m >> lid, otherwise attenuate sub-lid low_p on high ridges
+        low_p = np.maximum(fog_p, low_p * (0.20 + 0.80 * ridge_clear))
+
+    top_m = np.clip(top_m, 140.0, 2550.0)
+    base_m = np.clip(np.minimum(base_m, top_m - 75.0), 25.0, 2450.0)
+    elev_m = np.clip(elev_m, 0.0, 4200.0)
+    low_p = np.clip(low_p, 0.0, 100.0)
+    mid_p = np.clip(mid_p, 0.0, 100.0)
+    high_p = np.clip(high_p, 0.0, 100.0)
+    fog_p = np.clip(np.minimum(fog_p, low_p), 0.0, 100.0)
+    tau_arr = np.clip(np.maximum(tau_arr, 0.05 * low_p + 0.035 * mid_p + 0.012 * high_p), 0.02, 32.0)
+
+    # Pack 64x64 RGBA8 cloud coverage texture (`R=low, G=mid, B=high, A=fog`)
+    cov_u8 = np.empty((grid_n, grid_n, 4), dtype=np.uint8)
+    cov_u8[:, :, 0] = np.clip(np.rint(low_p * 2.55), 0, 255).astype(np.uint8)
+    cov_u8[:, :, 1] = np.clip(np.rint(mid_p * 2.55), 0, 255).astype(np.uint8)
+    cov_u8[:, :, 2] = np.clip(np.rint(high_p * 2.55), 0, 255).astype(np.uint8)
+    cov_u8[:, :, 3] = np.clip(np.rint(fog_p * 2.55), 0, 255).astype(np.uint8)
+
+    # Pack 64x64 RGBA8 altitude + optical-depth texture (`R=top/2550, G=base/2550, B=elev/4200, A=tau/32`)
+    alt_u8 = np.empty((grid_n, grid_n, 4), dtype=np.uint8)
+    alt_u8[:, :, 0] = np.clip(np.rint((top_m / 2550.0) * 255.0), 0, 255).astype(np.uint8)
+    alt_u8[:, :, 1] = np.clip(np.rint((base_m / 2550.0) * 255.0), 0, 255).astype(np.uint8)
+    alt_u8[:, :, 2] = np.clip(np.rint((elev_m / 4200.0) * 255.0), 0, 255).astype(np.uint8)
+    alt_u8[:, :, 3] = np.clip(np.rint((tau_arr / 32.0) * 255.0), 0, 255).astype(np.uint8)
+
+    # Strided 16x16 JSON preview cells for lightweight inspection & API consumers
     cells_preview: list[dict[str, Any]] = []
-
-    for gy in range(grid_n):
-        ny_km = -half_km + (gy / (grid_n - 1)) * (2.0 * half_km)
-        for gx in range(grid_n):
-            ex_km = -half_km + (gx / (grid_n - 1)) * (2.0 * half_km)
-            w_sum = 0.0
-            low_acc = 0.0
-            mid_acc = 0.0
-            high_acc = 0.0
-            fog_acc = 0.0
-            for ax_km, ay_km, alow, amid, ahigh, afog in anchor_samples:
-                d2 = (ex_km - ax_km) ** 2 + (ny_km - ay_km) ** 2
-                w = 1.0 / (d2 + 140.0) + 0.15 * math.exp(-d2 / (2.0 * 48.0 * 48.0))
-                w_sum += w
-                low_acc += w * alow
-                mid_acc += w * amid
-                high_acc += w * ahigh
-                fog_acc += w * afog
-
-            low_p = low_acc / max(1e-6, w_sum)
-            mid_p = mid_acc / max(1e-6, w_sum)
-            high_p = high_acc / max(1e-6, w_sum)
-            fog_p = fog_acc / max(1e-6, w_sum)
-
-            if goes_data is not None and w_nowcast > 0.03:
-                clat, clon = offset_lat_lon_km(center_lat, center_lon, ex_km, ny_km)
-                adv = sample_advected_goes_state(
-                    goes_data,
-                    clat,
-                    clon,
-                    lead_minutes,
-                    wind_850_uv,
-                    wind_500_uv,
-                    wind_250_uv,
-                )
-                low_p = (1.0 - w_nowcast) * low_p + w_nowcast * (adv["low_cf"] * 100.0)
-                mid_p = (1.0 - w_nowcast) * mid_p + w_nowcast * (adv["mid_cf"] * 100.0)
-                high_p = (1.0 - w_nowcast) * high_p + w_nowcast * (adv["high_cf"] * 100.0)
-                fog_p = (1.0 - w_nowcast) * fog_p + w_nowcast * (float(adv.get("fog_cf", adv["low_cf"] * 0.85)) * 100.0)
-
-            r_b = max(0, min(255, int(round((low_p / 100.0) * 255.0))))
-            g_b = max(0, min(255, int(round((mid_p / 100.0) * 255.0))))
-            b_b = max(0, min(255, int(round((high_p / 100.0) * 255.0))))
-            a_b = max(0, min(255, int(round((fog_p / 100.0) * 255.0))))
-            off = (gy * grid_n + gx) * 4
-            raw_bytes[off : off + 4] = bytes((r_b, g_b, b_b, a_b))
-
+    stride_idx = np.linspace(0, grid_n - 1, 16).round().astype(int)
+    for py, gy in enumerate(stride_idx):
+        for px, gx in enumerate(stride_idx):
             cells_preview.append(
                 {
-                    "gx": gx,
-                    "gy": gy,
-                    "east_km": round(ex_km, 1),
-                    "north_km": round(ny_km, 1),
-                    "low_pct": int(round(max(0.0, min(100.0, low_p)))),
-                    "mid_pct": int(round(max(0.0, min(100.0, mid_p)))),
-                    "high_pct": int(round(max(0.0, min(100.0, high_p)))),
-                    "fog_pct": int(round(max(0.0, min(100.0, fog_p)))),
+                    "gx": int(px),
+                    "gy": int(py),
+                    "east_km": round(float(axis_km[gx]), 1),
+                    "north_km": round(float(axis_km[gy]), 1),
+                    "low_pct": int(round(float(low_p[gy, gx]))),
+                    "mid_pct": int(round(float(mid_p[gy, gx]))),
+                    "high_pct": int(round(float(high_p[gy, gx]))),
+                    "fog_pct": int(round(float(fog_p[gy, gx]))),
+                    "fog_top_m": round(float(top_m[gy, gx]), 0),
+                    "sfc_elev_m": round(float(elev_m[gy, gx]), 0),
                 }
             )
+
+    c0, c1 = grid_n // 2 - 2, grid_n // 2 + 2
+    center_low = float(np.mean(low_p[c0:c1, c0:c1]))
+    center_mid = float(np.mean(mid_p[c0:c1, c0:c1]))
+    center_high = float(np.mean(high_p[c0:c1, c0:c1]))
+    center_fog = float(np.mean(fog_p[c0:c1, c0:c1]))
+    west_low = float(np.mean(low_p[:, :14]))
+    east_low = float(np.mean(low_p[:, -14:]))
+    tot_cov = 1.0 - (1.0 - low_p / 100.0) * (1.0 - mid_p / 100.0) * (1.0 - 0.65 * high_p / 100.0)
+    clear_frac = float(np.mean(tot_cov < 0.28))
 
     return {
         "grid_size": grid_n,
         "span_m": span_m,
-        "rgba8_b64": base64.b64encode(bytes(raw_bytes)).decode("ascii"),
+        "texel_resolution_km": round((span_m / 1000.0) / grid_n, 2),
+        "rgba8_b64": base64.b64encode(cov_u8.tobytes()).decode("ascii"),
+        "alt_rgba8_b64": base64.b64encode(alt_u8.tobytes()).decode("ascii"),
+        "alt_encoding": {
+            "fog_top_scale_m": 2550.0,
+            "fog_base_scale_m": 2550.0,
+            "sfc_elev_scale_m": 4200.0,
+            "tau_scale": 32.0,
+        },
+        "anchor_minutes_local": int(primary_mins),
+        "anchor_layer_pct": {
+            "low": int(round(center_low)),
+            "mid": int(round(center_mid)),
+            "high": int(round(center_high)),
+            "fog": int(round(center_fog)),
+        },
+        "wind_vectors_ms": {
+            "sfc": [round(float(st0["wind_sfc_uv_ms"][0]), 2), round(float(st0["wind_sfc_uv_ms"][1]), 2)],
+            "h850": [round(float(st0["wind_850_uv_ms"][0]), 2), round(float(st0["wind_850_uv_ms"][1]), 2)],
+            "h500": [round(float(st0["wind_500_uv_ms"][0]), 2), round(float(st0["wind_500_uv_ms"][1]), 2)],
+            "h250": [round(float(st0["wind_250_uv_ms"][0]), 2), round(float(st0["wind_250_uv_ms"][1]), 2)],
+        },
+        "spatial_sources": spatial_sources,
+        "spatial_stats": {
+            "west_offshore_low_pct": round(west_low, 1),
+            "center_low_pct": round(center_low, 1),
+            "east_inland_low_pct": round(east_low, 1),
+            "coastal_contrast_pp": round(west_low - east_low, 1),
+            "clear_sky_fraction": round(clear_frac, 3),
+        },
         "cells": cells_preview,
+        "_arrays": {
+            "axis_km": axis_km,
+            "low_p": low_p,
+            "mid_p": mid_p,
+            "high_p": high_p,
+            "fog_p": fog_p,
+            "top_m": top_m,
+            "base_m": base_m,
+            "elev_m": elev_m,
+            "tau_arr": tau_arr,
+        },
     }
 
 
@@ -1769,7 +1940,7 @@ def solve_weather_and_corridor(
                     snd = apply_hrrr_column_to_sounding(
                         snd,
                         hrrr_s3_data["stations"][idx_pt],
-                        marine_ref=None,
+                        marine_ref=hrrr_s3_data.get("marine_ref") if (pt_is_coastal and pdist_km <= 60.0) else None,
                         is_coastal=pt_is_coastal,
                         blend_weight=w_hrrr_hr,
                     )
@@ -1852,7 +2023,7 @@ def solve_weather_and_corridor(
     sunset_corridor_lut = corridor_lut if is_sunset else (conjugate_lut or corridor_lut)
     sunrise_corridor_lut = (conjugate_lut or corridor_lut) if is_sunset else corridor_lut
 
-    meso_anchors: list[tuple[float, float, float, float, float, float]] = []
+    meso_anchors: list[tuple[float, float, float, float, float, float, float, float, float]] = []
     m_per_lat = 111.13292
     m_per_lon = max(22.0, 111.41284 * math.cos(math.radians(lat)))
     for idx_pt, (_, plat, plon, pdist_km, paz_deg) in enumerate(coords_meta):
@@ -1873,14 +2044,17 @@ def solve_weather_and_corridor(
             snd_pt = apply_hrrr_column_to_sounding(
                 snd_pt,
                 hrrr_s3_data["stations"][idx_pt],
-                marine_ref=hrrr_s3_data.get("marine_ref") if idx_pt == 0 else None,
+                marine_ref=hrrr_s3_data.get("marine_ref") if (idx_pt == 0 or (pt_c and pdist_km <= 60.0)) else None,
                 is_coastal=pt_c,
                 target_elev_m=target_elev_m if idx_pt == 0 else None,
                 blend_weight=1.0,
             )
         ex_km = (plon - lon) * m_per_lon
         ny_km = (plat - lat) * m_per_lat
-        fog_pct = snd_pt["cloud_low_pct"] if snd_pt["inv_jump_k"] >= 0.8 else snd_pt["cloud_low_pct"] * 0.45
+        fog_pct = snd_pt["cloud_low_pct"] if (pt_c or snd_pt["inv_jump_k"] >= 0.8) else snd_pt["cloud_low_pct"] * 0.45
+        atop_m = float(snd_pt.get("inv_top_asl_m", 480.0))
+        abase_m = float(snd_pt.get("stratus_base_asl_m") or max(45.0, atop_m - 210.0))
+        aelev_m = float(snd_pt["rust_station"].get("surface_elevation_m", 0.0))
         meso_anchors.append(
             (
                 ex_km,
@@ -1889,21 +2063,29 @@ def solve_weather_and_corridor(
                 float(snd_pt["cloud_mid_pct"]),
                 float(snd_pt["cloud_high_pct"]),
                 float(fog_pct),
+                atop_m,
+                abase_m,
+                aelev_m,
             )
         )
 
     st0 = primary_corridor_stations_ui[0]
-    mesoscale_cloud_grid = _build_16x16_mesoscale_cloud_grid(
+    mesoscale_cloud_grid = _build_64x64_multilayer_cloud_field(
         lat,
         lon,
+        is_coastal,
         meso_anchors,
+        hrrr_s3_data if has_hrrr_s3 else None,
+        use_hrrr_s3_sounding,
         goes_data,
+        station_obs,
+        raob_obs,
         min(220.0, lead_minutes_primary),
         w_nowcast_primary,
-        st0["wind_850_uv_ms"],
-        st0["wind_500_uv_ms"],
-        st0["wind_250_uv_ms"],
+        st0,
+        primary_mins,
     )
+    meso_arrays = mesoscale_cloud_grid.pop("_arrays", None)
 
     spread_low_models = max(hrrr_low, ecmwf_low, aifs_low) - min(hrrr_low, ecmwf_low, aifs_low)
     spread_high_models = max(hrrr_high, ecmwf_high, aifs_high) - min(hrrr_high, ecmwf_high, aifs_high)
@@ -2024,7 +2206,16 @@ def solve_weather_and_corridor(
         if (is_coastal and len(primary_corridor_stations_ui) > 1)
         else int(st0["cloud_low_pct"])
     )
-    sea_deck_pct = max(int(st0["cloud_low_pct"]), offshore_low_pct) if is_coastal else int(st0["cloud_low_pct"])
+    sea_deck_pct = (
+        max(
+            int(st0["cloud_low_pct"]),
+            int(st0.get("sea_deck_low_pct") or 0),
+            offshore_low_pct,
+            int(round(mesoscale_cloud_grid["spatial_stats"]["west_offshore_low_pct"])) if is_coastal else 0,
+        )
+        if is_coastal
+        else int(st0["cloud_low_pct"])
+    )
 
     inversion_cap_score = min(45.0, max(0.0, (inversion_delta_t_f + 2.0) * 4.0))
     stratus_deck_score = (
@@ -2048,10 +2239,52 @@ def solve_weather_and_corridor(
     )
 
     beam_quality = 0.58 * exp_trans_pct + 0.27 * p90_pct + 0.15 * direct_prob_pct
+    gh_adj_hr = max(0, primary_hr_idx - 1) if is_sunset else min(23, primary_hr_idx + 1)
+    if gh_adj_hr < len(hourly_rust_results):
+        gh_exp, gh_prob, _, _, gh_p90 = _normalize_corridor_ray_pct(
+            (hourly_rust_results[gh_adj_hr] or {}).get("ray") or {},
+            primary_col_aod,
+        )
+        gh_beam_quality = 0.58 * gh_exp + 0.27 * gh_p90 + 0.15 * gh_prob
+    else:
+        gh_beam_quality = beam_quality
+
+    window_beam_quality = max(beam_quality, 0.76 * gh_beam_quality)
+    upper_canvas_pct = int(st0["cloud_high_pct"]) + int(st0["cloud_mid_pct"])
     effective_canvas = max(
         float(canvas_glow_score),
-        0.82 * beam_quality if (st0["cloud_high_pct"] + st0["cloud_mid_pct"]) < 25 else float(canvas_glow_score),
+        0.52 * window_beam_quality if upper_canvas_pct < 20 else float(canvas_glow_score),
     )
+
+    # High-cirrus geometric dip-angle (`~3.1 deg`) sub-horizon twilight under-illumination:
+    # A 9-11 km cirrus deck intercepts solar rays passing well above low/valley clouds out to 250+ km
+    overhead_hi_pct = max(
+        int(st0["cloud_high_pct"]),
+        int(primary_corridor_stations_ui[1]["cloud_high_pct"]) if len(primary_corridor_stations_ui) > 1 else 0,
+    )
+    observer_low_obscuration = (
+        0
+        if (is_coastal and summit_clearance_ft > 110)
+        else int(st0["cloud_low_pct"])
+    )
+    far_deep_wall = (
+        sum(
+            0.60 * float(s["cloud_mid_pct"]) + 0.35 * max(0.0, float(s["cloud_high_pct"]) - 88.0)
+            for s in primary_corridor_stations_ui[3:6]
+        )
+        / max(1, len(primary_corridor_stations_ui[3:6]))
+    )
+    if overhead_hi_pct >= 28 and observer_low_obscuration < 65:
+        sky_view_vis = max(0.0, 1.0 - observer_low_obscuration / 75.0)
+        hi_limb_open = max(0.18, 1.0 - far_deep_wall / 92.0)
+        cirrus_afterglow_score = (
+            (0.62 * float(canvas_glow_score) + 0.30 * max(window_beam_quality, 52.0 * hi_limb_open) + 8.0)
+            * sky_view_vis
+            * (0.55 + 0.45 * hi_limb_open)
+        )
+    else:
+        cirrus_afterglow_score = 0.0
+
     alpenglow_score = int(
         round(
             max(
@@ -2059,8 +2292,9 @@ def solve_weather_and_corridor(
                 min(
                     98.0,
                     max(
-                        0.58 * beam_quality + 0.32 * effective_canvas + min(10.0, chappuis_rose * 18.0),
-                        cloud_sea_score * 0.94 if (is_coastal and summit_clearance_ft > 140 and sea_deck_pct >= 50) else 0.0,
+                        0.55 * window_beam_quality + 0.35 * effective_canvas + min(9.0, chappuis_rose * 16.0),
+                        cirrus_afterglow_score,
+                        cloud_sea_score * 0.90 if (is_coastal and summit_clearance_ft > 130 and sea_deck_pct >= 50) else 0.0,
                     ),
                 ),
             )
@@ -2102,7 +2336,7 @@ def solve_weather_and_corridor(
             f"Capped marine stratus ({fog_base_ft:,}–{fog_top_ft:,} ft ASL, {sea_deck_pct}% offshore deck) sits {summit_clearance_ft:,} ft below summit. "
             f"380 km ray corridor delivers {direct_prob_pct}% direct-beam odds (P10 {p10_pct}% / P50 {p50_pct}% / P90 {p90_pct}%) at {kelvin} K."
         )
-    elif exp_trans_pct >= 58 and canvas_glow_score >= 62:
+    elif (exp_trans_pct >= 55 or cirrus_afterglow_score >= 62.0) and canvas_glow_score >= 60:
         verdict = f"High-Canvas Alpenglow Corridor ({kelvin} K){nowcast_tag}"
         recommendation = (
             f"380 km curved-Earth corridor yields {direct_prob_pct}% clear-beam survival (P50 {p50_pct}% / P90 {p90_pct}% transmittance, {kelvin} K Chappuis tint) "
@@ -2211,7 +2445,7 @@ def solve_weather_and_corridor(
             tsnd = apply_hrrr_column_to_sounding(
                 tsnd,
                 hrrr_s3_data["stations"][pt_idx],
-                marine_ref=hrrr_s3_data.get("marine_ref") if pt_idx == 0 else None,
+                marine_ref=hrrr_s3_data.get("marine_ref") if (pt_idx == 0 or (t_coastal and tdist <= 20.0)) else None,
                 is_coastal=t_coastal,
                 target_elev_m=target_elev_m if pt_idx == 0 else None,
                 blend_weight=1.0,
@@ -2254,29 +2488,27 @@ def solve_weather_and_corridor(
             ex_m = -9200.0 + (gx / 7.0) * 18400.0
             fx = max(0.0, min(4.0, (ex_m + 11000.0) / 5500.0))
             i0 = min(3, int(fx))
-            tx = fx - i0
-            tr0, tr1 = transect_west_to_east[i0], transect_west_to_east[i0 + 1]
-            low_v = (1.0 - tx) * tr0["low_cloud_pct"] + tx * tr1["low_cloud_pct"]
-            mid_v = (1.0 - tx) * tr0["mid_cloud_pct"] + tx * tr1["mid_cloud_pct"]
-            high_v = (1.0 - tx) * tr0["high_cloud_pct"] + tx * tr1["high_cloud_pct"]
-            top_m = (1.0 - tx) * tr0["fog_top_m"] + tx * tr1["fog_top_m"]
+            tr0 = transect_west_to_east[i0]
+            if meso_arrays is not None:
+                # Sample directly from the fused 64x64 (`1.75 km` texel) GOES + HRRR 3km + RAOB spatial rasters
+                mx = int(round(max(0.0, min(63.0, ((ex_m / 1000.0 + 56.0) / 112.0) * 63.0))))
+                my = int(round(max(0.0, min(63.0, ((ny_m / 1000.0 + 56.0) / 112.0) * 63.0))))
+                low_v = float(meso_arrays["low_p"][my, mx])
+                mid_v = float(meso_arrays["mid_p"][my, mx])
+                high_v = float(meso_arrays["high_p"][my, mx])
+                top_m = float(meso_arrays["top_m"][my, mx])
+                base_v = float(meso_arrays["base_m"][my, mx])
+                tau_col = round(min(12.0, max(0.04, float(meso_arrays["tau_arr"][my, mx]) * 0.42)), 2)
+            else:
+                tx = fx - i0
+                tr1 = transect_west_to_east[i0 + 1]
+                low_v = (1.0 - tx) * tr0["low_cloud_pct"] + tx * tr1["low_cloud_pct"]
+                mid_v = (1.0 - tx) * tr0["mid_cloud_pct"] + tx * tr1["mid_cloud_pct"]
+                high_v = (1.0 - tx) * tr0["high_cloud_pct"] + tx * tr1["high_cloud_pct"]
+                top_m = (1.0 - tx) * tr0["fog_top_m"] + tx * tr1["fog_top_m"]
+                base_v = max(35.0, top_m - 240.0)
+                tau_col = round(min(6.5, max(0.04, 0.025 * low_v + 0.018 * mid_v + 0.007 * high_v)), 2)
 
-            if goes_data is not None and w_nowcast_primary > 0.05:
-                clat, clon = offset_lat_lon_km(lat, lon, ex_m / 1000.0, ny_m / 1000.0)
-                adv_c = sample_advected_goes_state(
-                    goes_data,
-                    clat,
-                    clon,
-                    min(210.0, lead_minutes_primary),
-                    st0["wind_850_uv_ms"],
-                    st0["wind_500_uv_ms"],
-                    st0["wind_250_uv_ms"],
-                )
-                low_v = (1.0 - 0.5 * w_nowcast_primary) * low_v + 0.5 * w_nowcast_primary * (adv_c["low_cf"] * 100.0)
-                mid_v = (1.0 - 0.5 * w_nowcast_primary) * mid_v + 0.5 * w_nowcast_primary * (adv_c["mid_cf"] * 100.0)
-                high_v = (1.0 - 0.5 * w_nowcast_primary) * high_v + 0.5 * w_nowcast_primary * (adv_c["high_cf"] * 100.0)
-
-            tau_col = round(min(6.5, max(0.04, 0.025 * low_v + 0.018 * mid_v + 0.007 * high_v)), 2)
             col_trans = int(round(max(2.0, min(99.0, 100.0 * math.exp(-tau_col * 0.65)))))
             voxel_cells.append(
                 {
@@ -2285,7 +2517,7 @@ def solve_weather_and_corridor(
                     "east_m": round(ex_m, 1),
                     "north_m": round(ny_m, 1),
                     "stratus_pct": int(round(max(0.0, min(100.0, low_v)))),
-                    "fog_base_m": round(max(35.0, top_m - 240.0), 1),
+                    "fog_base_m": round(base_v, 1),
                     "fog_top_m": round(top_m, 1),
                     "fog_top_ft": int(round(top_m * 3.28084)),
                     "cumulus_pct": int(round(max(0.0, min(100.0, low_v * 0.75)))),

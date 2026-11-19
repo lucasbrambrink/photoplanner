@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { VolumetricAtmosphereEngine } from "./volumetric-engine.js?v=20261116u";
+import { VolumetricAtmosphereEngine } from "./volumetric-engine.js?v=20261117c";
 
 // Conditional Popover API polyfill loader (content-first-noise-reduction)
 if (!Object.hasOwn(HTMLElement.prototype, "popover")) {
@@ -41,7 +41,7 @@ const state = {
   customTripodReport: null,
   currentMinutes: 17 * 60 + 18,
   selectedVpIndex: 0, // 0..2 when a VP is expanded, -1 when collapsed or inspecting custom pin
-  cameraMode: "orbit", // "orbit" | "vp-0" | "vp-1" | "vp-2" | "custom-tripod"
+  cameraMode: "orbit", // "orbit" | "vp-0" | "vp-1" | "vp-2" | "custom-tripod" | "webcam-snap"
   clickMode: "tripod", // "tripod" | "target"
   surfaceStyle: 0, // 0 = Granite Relief, 1 = USGS Satellite, 2 = Topo Contours
   showViewshed: false,
@@ -55,6 +55,8 @@ const state = {
   selectedWebcamIdx: 0,
   selectedWebcamFrameIdx: -1,
   showWebcamCard: false,
+  webcamGhostEnabled: false,
+  webcamGhostOpacity: 0.38,
 };
 
 function isPastShootDate(dateStr = state.date) {
@@ -81,6 +83,10 @@ const btnCloseWebcamCard = document.getElementById("btn-close-webcam-card");
 const btnSidebarOpenWebcam = document.getElementById("btn-sidebar-open-webcam");
 const btnSnapWebcamCamera = document.getElementById("btn-snap-webcam-camera");
 const btnResetWebcamSnap = document.getElementById("btn-reset-webcam-snap");
+const webcamGhostOverlayEl = document.getElementById("webcam-ghost-overlay");
+const toggleWebcamGhostEl = document.getElementById("toggle-webcam-ghost");
+const webcamGhostOpacityEl = document.getElementById("webcam-ghost-opacity");
+const valWebcamGhostOpacityEl = document.getElementById("val-webcam-ghost-opacity");
 const weatherDisclosure = document.getElementById("weather-disclosure");
 const btnOrbitMode = document.getElementById("btn-orbit-mode");
 const viewportStageEl = document.getElementById("viewport-stage");
@@ -3054,6 +3060,32 @@ function updateSunRaysAndShader() {
   wakeRenderLoop(false);
 }
 
+function syncWebcamGhostOverlay() {
+  if (!webcamGhostOverlayEl) return;
+  const cam =
+    state.webcamReport?.cameras?.[state.selectedWebcamIdx] ||
+    state.webcamReport?.primary_camera;
+  const frames = cam?.timeline_frames || [];
+  const activeFrame =
+    (state.selectedWebcamFrameIdx >= 0 && frames[state.selectedWebcamFrameIdx]) ||
+    cam?.primary_frame;
+  const shouldShow =
+    Boolean(state.webcamGhostEnabled) &&
+    state.cameraMode === "webcam-snap" &&
+    Boolean(activeFrame?.proxy_url);
+
+  if (!shouldShow) {
+    webcamGhostOverlayEl.hidden = true;
+    return;
+  }
+  if (webcamGhostOverlayEl.dataset.activeSrc !== activeFrame.proxy_url) {
+    webcamGhostOverlayEl.dataset.activeSrc = activeFrame.proxy_url;
+    webcamGhostOverlayEl.src = activeFrame.proxy_url;
+  }
+  webcamGhostOverlayEl.style.opacity = String(state.webcamGhostOpacity);
+  webcamGhostOverlayEl.hidden = false;
+}
+
 // ============================================================================
 // Camera Mode Switching (3D Valley Orbit vs. VP1..VP3 or Custom Tripod Viewfinder)
 // ============================================================================
@@ -3063,6 +3095,7 @@ function setCameraMode(mode) {
   if (btnResetWebcamSnap) {
     btnResetWebcamSnap.hidden = mode !== "webcam-snap";
   }
+  syncWebcamGhostOverlay();
 
   if (mode === "orbit") {
     if (btnOrbitMode) btnOrbitMode.hidden = true;
@@ -3530,11 +3563,13 @@ function renderWeatherCard(w) {
   const transectGrid = document.getElementById("spatial-transect-grid");
   const transectPill = document.getElementById("spatial-transect-pill");
   const scf = w.spatial_cloud_field;
+  const mcg = w.mesoscale_cloud_grid;
   if (transectGrid && scf?.transect_west_to_east) {
     if (transectPill) {
       const gapCount = scf?.crepuscular_gaps?.length || 0;
+      const gSize = mcg?.grid_size || 64;
       const tauStr = scf?.mean_optical_depth_tau !== undefined ? ` • τ=${scf.mean_optical_depth_tau} (${gapCount} Gaps)` : "";
-      transectPill.textContent = `Wind ${Math.round(scf.wind_dir_deg || 295)}° • 16×16 Mesoscale${tauStr}`;
+      transectPill.textContent = `Wind ${Math.round(scf.wind_dir_deg || 295)}° • ${gSize}×${gSize} (1.75 km)${tauStr}`;
     }
     transectGrid.innerHTML = scf.transect_west_to_east
       .map((pt) => {
@@ -4507,7 +4542,7 @@ async function loadLandmarkScenario(customCoord = null) {
   }
 }
 
-// Wire Mountain Webcam Split-View Drawer & 3D Azimuth/FOV Snap Controls
+// Wire Mountain Webcam Split-View Drawer, 3D Azimuth/FOV Snap & Ghost Overlay Controls
 btnToggleWebcamDrawer?.addEventListener("click", () => toggleWebcamDrawer());
 btnCloseWebcamCard?.addEventListener("click", () => toggleWebcamDrawer(false));
 btnSidebarOpenWebcam?.addEventListener("click", () => toggleWebcamDrawer(true));
@@ -4516,6 +4551,32 @@ btnSnapWebcamCamera?.addEventListener("click", () => {
   setCameraMode("webcam-snap");
 });
 btnResetWebcamSnap?.addEventListener("click", () => setCameraMode("orbit"));
+
+toggleWebcamGhostEl?.addEventListener("change", (e) => {
+  state.webcamGhostEnabled = Boolean(e.target.checked);
+  if (state.webcamGhostEnabled && state.cameraMode !== "webcam-snap") {
+    setCameraMode("webcam-snap");
+  } else {
+    syncWebcamGhostOverlay();
+  }
+});
+
+webcamGhostOpacityEl?.addEventListener("input", (e) => {
+  const pct = Math.max(10, Math.min(85, parseInt(e.target.value, 10) || 38));
+  state.webcamGhostOpacity = pct / 100.0;
+  if (valWebcamGhostOpacityEl) {
+    valWebcamGhostOpacityEl.textContent = `${pct}%`;
+  }
+  if (!state.webcamGhostEnabled && toggleWebcamGhostEl) {
+    state.webcamGhostEnabled = true;
+    toggleWebcamGhostEl.checked = true;
+    if (state.cameraMode !== "webcam-snap") {
+      setCameraMode("webcam-snap");
+      return;
+    }
+  }
+  syncWebcamGhostOverlay();
+});
 
 document.getElementById("webcam-camera-tabs")?.addEventListener("click", (e) => {
   const btn = e.target.closest("button[data-wc-idx]");
@@ -4575,7 +4636,7 @@ const FALLBACK_LAYER_META = {
     id: "mid",
     short_name: "Mid Altocumulus / Wave",
     confidence_pct: 68,
-    sources: ["Mid-Level Sounding (700–500 hPa)", "16×16 Mesoscale Grid"],
+    sources: ["Mid-Level Sounding (700–500 hPa)", "64×64 (1.75 km) Spatial Grid"],
     hover_disclosure: "700–500 hPa moisture & Froude wave envelope from NWP sounding; 3D wave structure simulated.",
   },
   low: {
@@ -4646,8 +4707,9 @@ volumetricEngine.onCloudProbeCallback = (probe, meta) => {
 
   const baseConf = typeof layerMeta.confidence_pct === "number" ? layerMeta.confidence_pct : 68;
   const distM = Math.max(0, probe.meanDistM || 0);
-  // Far-corridor clouds (>25 km away) rely more heavily on coarser NWP spatial interpolation
-  const distPenalty = distM > 25000 ? Math.min(9, Math.round((distM - 25000) / 11000)) : 0;
+  const has64Grid = (state.weatherReport?.mesoscale_cloud_grid?.grid_size || 0) >= 64;
+  const fineRadiusM = has64Grid ? 50000 : 25000;
+  const distPenalty = distM > fineRadiusM ? Math.min(8, Math.round((distM - fineRadiusM) / 12000)) : 0;
   // Thin parcel wisps are governed more by simulated sub-grid turbulence than dense cloud cores
   const densityAdj = probe.cloudAlpha < 0.14 ? -4 : probe.cloudAlpha > 0.55 ? 2 : 0;
   const confPct = Math.max(18, Math.min(95, Math.round(baseConf - distPenalty + densityAdj)));

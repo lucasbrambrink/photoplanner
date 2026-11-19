@@ -30,8 +30,10 @@ import math
 import re
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -188,7 +190,7 @@ def analyze_webcam_sky_chromaticity(jpeg_bytes: bytes) -> dict[str, Any]:
         return {"available": False, "reason": "frame_too_small"}
 
     y0 = max(2, int(round(0.04 * h_px)))
-    y1 = max(y0 + 8, int(round(0.20 * h_px)))
+    y1 = max(y0 + 8, int(round(0.22 * h_px)))
     x0 = max(2, int(round(0.04 * w_px)))
     x1 = max(x0 + 16, int(round(0.96 * w_px)))
 
@@ -219,7 +221,10 @@ def analyze_webcam_sky_chromaticity(jpeg_bytes: bytes) -> dict[str, Any]:
     is_pink_nir = (rg_all > 1.38 and bg_all > 0.90 and lum_mean_all < 0.28)
     is_ir_night = bool(is_monochrome_ir or is_dark_night or is_pink_nir)
 
-    valid_mask = (lum > 0.085) & (lum < 0.975)
+    not_canopy = ~((lum < 0.24) & (g > b * 1.35) & (r < g * 1.28))
+    valid_mask = (lum > 0.085) & (lum < 0.975) & not_canopy
+    if int(np.sum(valid_mask)) < 120:
+        valid_mask = (lum > 0.085) & (lum < 0.975)
     if int(np.sum(valid_mask)) < 120:
         valid_mask = lum >= 0.0
 
@@ -453,6 +458,13 @@ def _list_phenocam_daily_frames(site: str, req_date: dt.date, is_today: bool = F
     )
     try:
         html = _fetch_url_bytes(url, timeout=12.0).decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as http_err:
+        if http_err.code == 404 and not is_today:
+            try:
+                cfile.write_text("[]", encoding="utf-8")
+            except Exception:
+                pass
+        return []
     except Exception:
         return []
 
@@ -512,7 +524,8 @@ def _match_phenocam_archive_camera(
         return None
 
     date_str = req_date.isoformat()
-    is_sierra = elev_m >= 1350.0 and not _is_coastal_california(lat, lon)
+    is_coastal_target = _is_coastal_california(lat, lon)
+    is_sierra = elev_m >= 1350.0 and not is_coastal_target
     candidates: list[tuple[float, dict[str, Any], float]] = []
 
     _NON_SKY_SITES = {"sequoia1", "sequoia2"}
@@ -526,7 +539,7 @@ def _match_phenocam_archive_camera(
             continue
         clat_f, clon_f = float(clat), float(clon)
         dist_km = _haversine_km(lat, lon, clat_f, clon_f)
-        if dist_km > 135.0:
+        if dist_km > 155.0:
             continue
 
         smeta = cam.get("sitemetadata") or {}
@@ -545,29 +558,49 @@ def _match_phenocam_archive_camera(
         elev_diff_m = abs(celev_m - elev_m)
         orient_raw = smeta.get("camera_orientation")
         az_deg, has_orient = _orientation_to_azimuth_deg(orient_raw, fallback_az=sun_az_deg)
-        az_pen_km = (_ang_diff_deg(az_deg, sun_az_deg) / 180.0) * 18.0 if has_orient else 8.0
+        az_pen_km = (_ang_diff_deg(az_deg, sun_az_deg) / 180.0) * 34.0 if has_orient else 12.0
+        if has_orient and (az_deg <= 35.0 or az_deg >= 325.0):
+            # Due-North phenology cameras miss East/West sunrise/sunset horizons
+            az_pen_km += 18.0
         tower_bonus_km = -18.0 if "DP1.00033" in site else 0.0
 
-        # For High Sierra targets, strongly prefer high-elevation Sierra towers (> 1,000 m ASL)
         regime_pen_km = 0.0
         if is_sierra and celev_m < 900.0:
             regime_pen_km = 65.0
         elif (not is_sierra) and celev_m > 1600.0:
             regime_pen_km = 45.0
 
-        rank_cost = dist_km + elev_diff_m * 0.012 + az_pen_km + regime_pen_km + tower_bonus_km
+        if is_coastal_target:
+            # Penalize sheltered inland/east-of-Coast-Range cameras (e.g. Palo Alto / Jasper Ridge east of Skyline)
+            inland_sheltered = (
+                (37.12 <= clat_f <= 37.72 and clon_f > -122.33 and lon <= -122.35)
+                or (not _is_coastal_california(clat_f, clon_f))
+            )
+            if inland_sheltered:
+                regime_pen_km += 54.0
+            # Match coastal elevation regime: sea-level bluffs (< 180 m) prefer low marine-bluff cameras,
+            # while above-inversion coastal summits (>= 420 m, e.g. Montara / Mt. Tam) prefer elevated coastal ridges!
+            if elev_m >= 420.0:
+                if celev_m >= 320.0 and not inland_sheltered:
+                    regime_pen_km -= 26.0
+                elif celev_m < 120.0:
+                    regime_pen_km += 24.0
+            elif elev_m < 180.0 and celev_m > 350.0:
+                regime_pen_km += 22.0
+
+        rank_cost = dist_km + elev_diff_m * 0.018 + az_pen_km + regime_pen_km + tower_bonus_km
         candidates.append((rank_cost, cam, dist_km))
 
     candidates.sort(key=lambda t: t[0])
     target_epoch = int(target_utc.timestamp())
 
-    for _, cam, dist_km in candidates[:6]:
+    for _, cam, dist_km in candidates[:8]:
         site = str(cam["Sitename"])
         frames = _list_phenocam_daily_frames(site, req_date, is_today=is_today)
         if not frames:
             continue
 
-        # Select golden-hour window [-110m, +25m] around target_utc
+        # Select golden-hour + civil-twilight window [-110m, +25m] around target_utc
         win_frames = [
             f for f in frames
             if -6600 <= (f["epoch_s"] - target_epoch) <= 1500
@@ -579,48 +612,78 @@ def _match_phenocam_archive_camera(
             if not win_frames or abs(win_frames[0]["epoch_s"] - target_epoch) > 12600:
                 continue
 
-        # Subsample up to 5 timeline frames spanning golden hour
-        if len(win_frames) > 5:
-            idxs = np.linspace(0, len(win_frames) - 1, 5).round().astype(int)
+        # Subsample up to 6 timeline frames spanning golden hour through twilight afterglow
+        if len(win_frames) > 6:
+            idxs = np.linspace(0, len(win_frames) - 1, 6).round().astype(int)
             timeline = [win_frames[int(i)] for i in sorted(set(idxs))]
         else:
             timeline = list(win_frames)
 
-        # Pick primary frame closest to -18 min before geometric sunset (sun_el ~ +1.5..+4 deg) that isn't NIR night mode
-        ideal_epoch = target_epoch - 1080
-        ordered_for_peak = sorted(
-            win_frames,
-            key=lambda f: abs(f["epoch_s"] - ideal_epoch) + (1200 if f["epoch_s"] > target_epoch + 180 else 0),
-        )
+        # Ensure frames inside the core golden/afterglow window [-38m .. +14m] are included
+        core_glow_frames = [
+            f for f in win_frames
+            if -2280 <= (f["epoch_s"] - target_epoch) <= 840
+        ]
+        for cf in core_glow_frames:
+            if cf not in timeline:
+                timeline.append(cf)
+        timeline.sort(key=lambda f: f["epoch_s"])
+        if len(timeline) > 7:
+            # Keep earliest context + core window + latest twilight
+            keep_set = {timeline[0]["archive_path"], timeline[-1]["archive_path"]}
+            for cf in sorted(timeline, key=lambda f: abs(f["epoch_s"] - (target_epoch - 480)))[:5]:
+                keep_set.add(cf["archive_path"])
+            timeline = [f for f in timeline if f["archive_path"] in keep_set]
 
-        primary_frame = ordered_for_peak[0]
+        ideal_epoch = target_epoch - 720  # -12 min before sunset
+        ordered_fallback = sorted(
+            timeline,
+            key=lambda f: abs(f["epoch_s"] - ideal_epoch) + (1200 if f["epoch_s"] > target_epoch + 360 else 0),
+        )
+        primary_frame = ordered_fallback[0]
         primary_chroma: dict[str, Any] = {"available": False}
 
         if analyze_pixels and Image is not None:
-            for cand_f in ordered_for_peak[:5]:
+            def _eval_cand_frame(cf_item: dict[str, Any]) -> dict[str, Any] | None:
                 try:
-                    jpg_b = fetch_cached_webcam_jpeg("phenocam", cand_f["archive_path"])
-                    ch = analyze_webcam_sky_chromaticity(jpg_b)
-                    if ch.get("available") and not ch.get("is_ir_night_mode"):
+                    jpg_b = fetch_cached_webcam_jpeg("phenocam", cf_item["archive_path"])
+                    return analyze_webcam_sky_chromaticity(jpg_b)
+                except Exception:
+                    return None
+
+            with ThreadPoolExecutor(max_workers=min(4, max(1, len(timeline)))) as f_pool:
+                ch_list = list(f_pool.map(_eval_cand_frame, timeline))
+
+            best_peak_val = -1e9
+            for cand_f, ch in zip(timeline, ch_list):
+                if ch is None:
+                    continue
+                cand_f["sky_chromaticity"] = ch
+                if ch.get("available") and not ch.get("is_ir_night_mode"):
+                    d_min_f = (cand_f["epoch_s"] - target_epoch) / 60.0
+                    in_peak_win = -38.0 <= d_min_f <= 14.0
+                    emp_sc = float(ch.get("empirical_alpenglow_score") or 0.0)
+                    rank_val = (
+                        emp_sc - 0.14 * abs(d_min_f + 10.0)
+                        if in_peak_win
+                        else (emp_sc - 18.0 - 0.30 * abs(d_min_f + 10.0))
+                    )
+                    if rank_val > best_peak_val:
+                        best_peak_val = rank_val
                         primary_frame = cand_f
                         primary_chroma = ch
-                        break
-                    if not primary_chroma.get("available"):
-                        primary_chroma = ch
-                except Exception:
-                    continue
-
-        if primary_frame not in timeline:
-            timeline.append(primary_frame)
-            timeline.sort(key=lambda f: f["epoch_s"])
+                elif not primary_chroma.get("available"):
+                    primary_chroma = ch
 
         for f in timeline:
             delta_min = int(round((f["epoch_s"] - target_epoch) / 60.0))
             f["offset_vs_sunset_min"] = delta_min
-            f["chip_label"] = (
-                "Peak" if abs(delta_min) <= 4 else (f"{delta_min:+d}m")
-            )
             f["is_primary"] = f["archive_path"] == primary_frame["archive_path"]
+            f["chip_label"] = (
+                f"Peak ({delta_min:+d}m)"
+                if (f["is_primary"] and abs(delta_min) > 4)
+                else ("Peak" if abs(delta_min) <= 4 else f"{delta_min:+d}m")
+            )
 
         clat_f = float(cam["Lat"])
         clon_f = float(cam["Lon"])

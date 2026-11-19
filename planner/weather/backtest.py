@@ -610,7 +610,7 @@ def _evaluate_corridor_nowcast_event(
     """
     BACKTEST_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     leads_tag = "_".join(f"{x:.1f}" for x in lead_hours_list)
-    ev_cache = BACKTEST_CACHE_DIR / f"nc_ev_v4_{ev['id']}_{leads_tag}.json"
+    ev_cache = BACKTEST_CACHE_DIR / f"nc_ev_v44_{ev['id']}_{leads_tag}.json"
     if (not refresh) and ev_cache.exists():
         try:
             cached = json.loads(ev_cache.read_text(encoding="utf-8"))
@@ -1010,23 +1010,12 @@ def _evaluate_multisensor_solver_event(ev: dict[str, Any], refresh: bool = False
     `PhenoCam` / `NEON` golden-hour sky chromaticity ground truth.
     """
     BACKTEST_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    ev_cache = BACKTEST_CACHE_DIR / f"rc_ev_v42_{ev['id']}.json"
+    ev_cache = BACKTEST_CACHE_DIR / f"rc_ev_v44_{ev['id']}.json"
     if (not refresh) and ev_cache.exists():
         try:
             cached = json.loads(ev_cache.read_text(encoding="utf-8"))
             print(f"  [Track 1/3/4/5 Solver] {ev['id']} ({ev['date']}) cached", flush=True)
             return cached
-        except Exception:
-            pass
-
-    ev_cache_v41 = BACKTEST_CACHE_DIR / f"rc_ev_v41_{ev['id']}.json"
-    if (not refresh) and ev_cache_v41.exists():
-        try:
-            base_rc = json.loads(ev_cache_v41.read_text(encoding="utf-8"))
-            out_rc = _attach_v42_nsrdb_and_webcam_truth(ev, base_rc)
-            ev_cache.write_text(json.dumps(out_rc), encoding="utf-8")
-            print(f"  [Track 1/3/4/5 Solver] {ev['id']} ({ev['date']}) upgraded v4.1->v4.2", flush=True)
-            return out_rc
         except Exception:
             pass
 
@@ -1109,6 +1098,10 @@ def _evaluate_multisensor_solver_event(ev: dict[str, Any], refresh: bool = False
         c_ray = doc["corridor_raycast"]
         inv_m = doc["inversion_model"]
         lmap = _layer_map(doc)
+        mcg = doc.get("mesoscale_cloud_grid") or {}
+        m_src_list = mcg.get("spatial_sources") or []
+        m_src_joined = " | ".join(str(s) for s in m_src_list)
+        m_stats = mcg.get("spatial_stats") or {}
         return {
             "sunset_exp_pct": float(c_ray["expected_transmittance_pct"]),
             "sunset_p10_pct": float(c_ray["transmittance_p10_pct"]),
@@ -1126,6 +1119,15 @@ def _evaluate_multisensor_solver_event(ev: dict[str, Any], refresh: bool = False
             "cloud_low_pct": int(doc["cloud_low_pct"]),
             "cloud_mid_pct": int(doc["cloud_mid_pct"]),
             "cloud_high_pct": int(doc["cloud_high_pct"]),
+            "spatial_64x64": {
+                "grid_size": int(mcg.get("grid_size", 0)),
+                "texel_resolution_km": float(mcg.get("texel_resolution_km", 0.0)),
+                "goes_2d_available": "GOES" in m_src_joined,
+                "hrrr_2d_available": "HRRR" in m_src_joined,
+                "west_offshore_low_pct": float(m_stats.get("west_offshore_low_pct", 0.0)),
+                "east_inland_low_pct": float(m_stats.get("east_inland_low_pct", 0.0)),
+                "coastal_contrast_pp": float(m_stats.get("coastal_contrast_pp", 0.0)),
+            },
             "layers": {
                 lid: {
                     "coverage_pct": int(lmap[lid]["coverage_pct"]),
@@ -1677,13 +1679,44 @@ def run_full_backtest_suite(
         },
     }
 
+    marine_stratus_events = [
+        r for r in rc_results
+        if r["regime"] in ("marine_stratus", "marine_cloud_sea", "broken_coastal")
+    ]
+    spatial_64x64_verification = {
+        "grid_size": 64,
+        "span_km": 112.0,
+        "texel_size_km": 1.75,
+        "n_events_64x64": sum(
+            1 for r in rc_results
+            if r["modes"]["truth"].get("spatial_64x64", {}).get("grid_size") == 64
+        ),
+        "n_goes_2d_events": sum(
+            1 for r in rc_results
+            if r["modes"]["truth"].get("spatial_64x64", {}).get("goes_2d_available")
+        ),
+        "n_hrrr_2d_events": sum(
+            1 for r in rc_results
+            if r["modes"]["nowcast_1h"].get("spatial_64x64", {}).get("hrrr_2d_available")
+        ),
+        "mean_marine_stratus_coastal_contrast_pp": round(
+            float(np.mean([
+                r["modes"]["truth"]["spatial_64x64"]["coastal_contrast_pp"]
+                for r in marine_stratus_events
+                if "spatial_64x64" in r["modes"]["truth"]
+            ])),
+            1,
+        ) if marine_stratus_events else 0.0,
+    }
+
     elapsed_s = round(time.perf_counter() - t_start, 2)
     summary = {
-        "schema_version": "v4.2",
+        "schema_version": "v4.4",
         "generated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "elapsed_seconds": elapsed_s,
         "n_events": len(BENCHMARK_EVENTS),
         "calibration_config": CALIBRATION_CONFIG,
+        "spatial_64x64_verification": spatial_64x64_verification,
         "vertical_inversion_verification": vertical_by_mode,
         "multilayer_under_cirrus_verification": multilayer_verification,
         "parallax_verification": parallax_summary,
@@ -1706,9 +1739,12 @@ def run_full_backtest_suite(
 
 
 if __name__ == "__main__":
-    print("Running PhotoPlanner v4.2 Multi-Sensor + HRRR S3 + 2km NSRDB + Webcam Chromaticity Benchmark (N=24)...", flush=True)
+    print("Running PhotoPlanner v4.4 64x64 Multi-Layer Spatial + HRRR S3 + 2km NSRDB + Webcam Chromaticity Benchmark (N=24)...", flush=True)
     res = run_full_backtest_suite(max_workers=2)
     print(f"\nCompleted in {res['elapsed_seconds']}s — saved to {SUMMARY_JSON_PATH} and {BENCHMARK_REPORT_JSON_PATH}", flush=True)
+    sp = res["spatial_64x64_verification"]
+    print(f"\n=== PHASE 3: 64x64 (1.75 km) Multi-Layer Spatial Field ===")
+    print(f"  64x64 Active: {sp['n_events_64x64']}/{res['n_events']} | GOES 2D: {sp['n_goes_2d_events']}/{res['n_events']} | HRRR 2D: {sp['n_hrrr_2d_events']}/{res['n_events']} | Marine Offshore-Inland Contrast: +{sp['mean_marine_stratus_coastal_contrast_pp']} pp")
     print("\n=== TRACK 1: Vertical Altitude & Inversion Accuracy vs 00Z RAOB Balloons & ASOS ===")
     for mk, mv in res["vertical_inversion_verification"].items():
         print(f"  {mk:22s} | Lid MAE: {str(mv['fog_lid_mae_ft']):>6s} ft ({str(mv['fog_lid_mae_m']):>5s} m) | Bias: {str(mv['fog_lid_bias_ft']):>6s} ft | Summit Above/In Fog Acc: {mv['summit_above_fog_accuracy_pct']}% | ASOS Base MAE: {mv['asos_ceilometer_base_mae_ft']} ft")

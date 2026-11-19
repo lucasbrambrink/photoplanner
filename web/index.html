@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="color-scheme" content="light dark" />
   <title>PhotoPlanner 3D — GPU Volumetric Cloud, 3D Cirrus &amp; Topographic Ray Engine</title>
-  <link rel="stylesheet" href="/styles.css?v=20261117b" />
+  <link rel="stylesheet" href="/styles.css?v=20261117c" />
   <script type="importmap">
     {
       "imports": {
@@ -128,7 +128,7 @@
     </ol>
     <div class="telemetry-grid popover-telemetry-grid" id="telemetry-details">
       <div><span>Near-Field DEM</span> <strong>USGS 3DEP 1m F32 Binary Stream</strong></div>
-      <div><span>3D Fluid Column</span> <strong>128×128×48 GPU + 160 km Mesoscale Grid</strong></div>
+      <div><span>3D Fluid Column</span> <strong>128×128×48 GPU + 64×64 (1.75 km) Spatial Field</strong></div>
       <div><span>Cloud Provenance</span> <strong>GOES-18 CCLC/BTD + ASOS + 00Z Balloon</strong></div>
       <div><span>Solar Ephemeris</span> <strong>380 km Curved-Earth 6-Band Radiative LUT</strong></div>
     </div>
@@ -599,7 +599,7 @@
           <div class="raypath-diagram-box" id="spatial-transect-box">
             <div class="raypath-diagram-header">
               <span id="spatial-transect-label">3D Positional Cloud &amp; Fog Transect (W → E)</span>
-              <span id="spatial-transect-pill" class="raypath-trans-pill">16×16 Mesoscale Field</span>
+              <span id="spatial-transect-pill" class="raypath-trans-pill">64×64 Multi-Layer (1.75 km)</span>
             </div>
             <div class="raypath-stations-grid spatial-transect-grid" id="spatial-transect-grid"></div>
           </div>
@@ -708,6 +708,7 @@
     <!-- 3D WebGL Topographic Viewport + Intrinsic 3-Row Studio HUD Grid (Zero Collisions) -->
     <section class="viewport-stage" id="viewport-stage" aria-label="Interactive 3D Topographic Sun-Ray Map">
       <div id="canvas-container" class="canvas-container"></div>
+      <img id="webcam-ghost-overlay" class="webcam-ghost-overlay" alt="" hidden />
 
       <!-- Floating 3D Cloud Hover Provenance & Confidence Tooltip (pointer-events: none) -->
       <div id="cloud-hover-tooltip" class="cloud-hover-tooltip" role="status" aria-live="polite" hidden></div>
@@ -840,8 +841,8 @@
                 crossorigin="anonymous"
                 alt="Matched timestamped mountain or coastal webcam photograph"
               />
-              <div class="webcam-sky-roi-band" id="webcam-sky-roi-band" title="Calibrated sky chromaticity sampling band (y = 4%–20%)">
-                <span>SKY CHROMATICITY ROI (4–20%)</span>
+              <div class="webcam-sky-roi-band" id="webcam-sky-roi-band" title="Calibrated sky chromaticity sampling band (y = 4%–22%, canopy-filtered)">
+                <span>SKY CHROMATICITY ROI (4–22%)</span>
               </div>
               <div class="webcam-frame-badges">
                 <span class="webcam-ts-pill" id="webcam-ts-pill">--:-- Local</span>
@@ -878,8 +879,27 @@
                 ↺ 3D Orbit
               </button>
             </div>
+
+            <div class="webcam-ghost-controls" id="webcam-ghost-controls">
+              <label class="webcam-ghost-toggle">
+                <input type="checkbox" id="toggle-webcam-ghost" />
+                <span>👻 3D Ghost Overlay</span>
+              </label>
+              <input
+                type="range"
+                id="webcam-ghost-opacity"
+                class="webcam-ghost-slider"
+                min="10"
+                max="85"
+                value="38"
+                step="1"
+                aria-label="3D Webcam Ghost Overlay Opacity"
+              />
+              <span class="webcam-ghost-pct" id="val-webcam-ghost-opacity">38%</span>
+            </div>
+
             <p class="webcam-snap-note" id="webcam-snap-note">
-              Matches Three.js horizontal FOV &amp; compass azimuth so you can compare simulated clouds &amp; Chappuis glow side-by-side against real photography.
+              Matches Three.js horizontal FOV &amp; compass azimuth so you can compare simulated clouds &amp; Chappuis glow side-by-side or via 3D Ghost Overlay.
             </p>
           </aside>
 
@@ -987,6 +1007,6 @@
     </section>
   </main>
 
-  <script type="module" src="/app.js?v=20261117b"></script>
+  <script type="module" src="/app.js?v=20261117c"></script>
 </body>
 </html>

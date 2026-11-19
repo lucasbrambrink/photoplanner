@@ -2720,7 +2720,7 @@ details.weather-card:not([open])::details-content {
 .webcam-sky-roi-band {
   position: absolute;
   inset-block-start: 4%;
-  block-size: 16%;
+  block-size: 18%;
   inset-inline: 4%;
   border: 1px dashed rgba(253, 224, 71, 0.52);
   border-radius: 4px;
@@ -2825,9 +2825,70 @@ details.weather-card:not([open])::details-content {
   padding: 0.42rem 0.6rem;
 }
 
+.webcam-ghost-overlay {
+  position: absolute;
+  inset: 0;
+  inline-size: 100%;
+  block-size: 100%;
+  object-fit: cover;
+  opacity: 0.38;
+  mix-blend-mode: normal;
+  pointer-events: none;
+  z-index: 3;
+  transition: opacity 140ms ease;
+}
+
+.webcam-ghost-overlay[hidden] {
+  display: none;
+}
+
+.webcam-ghost-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.48rem;
+  margin-block-start: 0.42rem;
+  padding: 0.32rem 0.48rem;
+  border-radius: 8px;
+  background: var(--surface-tile);
+  border: 1px solid var(--border-subtle);
+}
+
+.webcam-ghost-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.32rem;
+  font-size: 0.66rem;
+  font-weight: 700;
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.webcam-ghost-toggle input {
+  accent-color: var(--accent-amber);
+  cursor: pointer;
+}
+
+.webcam-ghost-slider {
+  flex: 1 1 auto;
+  min-inline-size: 60px;
+  accent-color: var(--accent-amber);
+  cursor: pointer;
+}
+
+.webcam-ghost-pct {
+  font-size: 0.64rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent-gold);
+  min-inline-size: 2.1rem;
+  text-align: end;
+}
+
 .webcam-snap-note {
   margin: 0.35rem 0 0;
   font-size: 0.63rem;
   line-height: 1.35;
   color: var(--text-muted);
 }
+

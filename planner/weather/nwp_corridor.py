@@ -168,8 +168,9 @@ def extract_hour_sounding(
     Extracts a rich physical sounding + altitude-resolved `CloudLayerBand`s for `hour_idx` (`0..23`).
     """
     h = point_doc.get("hourly") or {}
-    elev_m = float(point_doc.get("elevation") or (0.0 if is_coastal else 1200.0))
-    if is_coastal and dist_km >= 10.0 and lon < -122.52:
+    raw_elev = point_doc.get("elevation")
+    elev_m = float(raw_elev) if raw_elev is not None else (0.0 if is_coastal else 1200.0)
+    if (is_coastal and dist_km >= 8.0 and lon < -122.45) or (31.5 <= lat <= 42.5 and lon < -124.45):
         elev_m = 0.0
 
     t2m_c = _safe_arr_val(h, "temperature_2m", hour_idx, 14.0 - 0.006 * elev_m)
@@ -270,14 +271,17 @@ def extract_hour_sounding(
         elif t925 > t950 or t850 > t950 or (rh975 - rh950) >= 12.0:
             # Very shallow heat-wave marine inversion capped below 975 hPa (~320 m ASL)
             marine_lid_asl_m = max(185.0, min(360.0, 320.0 * (max(25.0, rh975) / 50.0)))
+        elif cc_low < 10.0 and max(rh975, rh950) < 66.0:
+            # Clear sub-saturated marine airmass: shallow dry MBL rather than 1.1 km cloud lid
+            marine_lid_asl_m = max(240.0, min(520.0, 260.0 + pbl_agl_m * 0.42))
         else:
-            marine_lid_asl_m = max(360.0, min(1350.0, z925_eff + pbl_agl_m * 0.75))
+            marine_lid_asl_m = max(340.0, min(980.0, 380.0 + pbl_agl_m * 0.65))
 
         if elev_m >= 320.0 and rh2m >= 88.0:
             # Summit station itself is saturated inside fog
             marine_lid_asl_m = max(marine_lid_asl_m, elev_m + min(260.0, max(55.0, pbl_agl_m * 0.85)))
-        elif elev_m < 220.0 and rh975 >= 75.0 and pbl_agl_m > 80.0:
-            marine_lid_asl_m = 0.72 * marine_lid_asl_m + 0.28 * (elev_m + pbl_agl_m + 180.0)
+        elif elev_m < 220.0 and rh975 >= 78.0 and pbl_agl_m > 80.0:
+            marine_lid_asl_m = 0.76 * marine_lid_asl_m + 0.24 * (elev_m + pbl_agl_m + 140.0)
 
         inv_top_asl_m = max(185.0, min(1550.0, marine_lid_asl_m))
         inv_base_asl_m = max(70.0, inv_top_asl_m - 210.0)
@@ -297,8 +301,8 @@ def extract_hour_sounding(
 
     # Effective low/mid/high cloud percentages incorporating pressure-level saturation
     eff_low_pct = max(cc_low, c925 * 0.9, c850 * 0.82)
-    if (is_coastal or elev_m < 450.0) and max(rh975, rh950) >= 85.0:
-        eff_low_pct = max(eff_low_pct, min(98.0, (max(rh975, rh950) - 70.0) * 3.2))
+    if (is_coastal or elev_m < 450.0) and max(rh975, rh950) >= 92.5:
+        eff_low_pct = max(eff_low_pct, min(96.0, (max(rh975, rh950) - 87.0) * 5.2))
     eff_mid_pct = max(cc_mid, c700 * 0.92, c500 * 0.85)
     eff_high_pct = max(cc_high, c300 * 0.95)
 
@@ -309,10 +313,10 @@ def extract_hour_sounding(
     is_low_marine_or_valley = (
         is_coastal
         and elev_m < 1350.0
-        and ((inv_jump_k >= 0.6 and eff_low_pct >= 8.0) or rh975 >= 78.0 or rh2m >= 88.0)
+        and ((inv_jump_k >= 0.6 and eff_low_pct >= 5.0) or eff_low_pct >= 8.0 or rh975 >= 92.0 or rh2m >= 92.0)
     ) or (
         elev_m < 950.0
-        and ((inv_jump_k >= 0.8 and eff_low_pct >= 12.0) or rh2m >= 91.0 or rh975 >= 89.0)
+        and ((inv_jump_k >= 0.8 and eff_low_pct >= 8.0) or rh2m >= 93.0 or rh975 >= 92.5)
     )
     if is_low_marine_or_valley:
         if is_coastal and elev_m < 1350.0:

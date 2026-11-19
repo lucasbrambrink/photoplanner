@@ -235,6 +235,72 @@ const TERRAIN_DOWNSAMPLE_FRAGMENT_GLSL3 = /* glsl */ `
   }
 `;
 
+// Shared 64x64 (112 km, 1.75 km/texel) Multi-Layer Spatial Cloud & Altitude Field Sampler
+// Performs 4-layer wind-sheared Lagrangian back-trajectory advection + coastal ridge blocking during time scrubbing!
+const SPATIAL_CLOUD_FIELD_SAMPLER_GLSL3 = /* glsl */ `
+  uniform sampler2D uMesoscaleCloudTex;
+  uniform sampler2D uMesoscaleAltTex;
+  uniform float uMesoscaleSpanM;
+  uniform float uHasMesoscaleGrid;
+  uniform float uHasMesoscaleAlt;
+  uniform float uUseSpatialInCore;
+  uniform float uScrubDeltaSec;
+  uniform vec4 uScrubLayerScale;
+  uniform vec4 uScrubLayerAdd;
+  uniform vec2 uMesoWindSfc;
+  uniform vec2 uMesoWind850;
+  uniform vec2 uMesoWind500;
+  uniform vec2 uMesoWind250;
+  uniform float uScrubRelaxBoost;
+
+  void sampleSpatialCloudField(vec2 enMeters, out vec4 covOut, out vec4 altOut) {
+    float spanM = max(20000.0, uMesoscaleSpanM);
+    vec2 baseUv = clamp(enMeters / spanM + 0.5, 0.012, 0.988);
+    vec4 altLocal = (uHasMesoscaleAlt > 0.5)
+      ? texture(uMesoscaleAltTex, baseUv)
+      : vec4(0.20, 0.05, 0.05, 0.25);
+
+    // Clamp Lagrangian back-trajectory window to +/- 2.75 hours inside the 112 km spatial domain
+    float dtAdv = clamp(uScrubDeltaSec, -9900.0, 9900.0);
+
+    // Topographic marine-ridge pinning: fog banked against coastal slopes advects slower than free-tropospheric clouds
+    float localSfcElevM = altLocal.b * 4200.0;
+    float localFogTopM  = max(110.0, altLocal.r * 2550.0);
+    float ridgePin = clamp((localFogTopM - localSfcElevM + 160.0) / 420.0, 0.24, 1.0);
+
+    vec2 uvFog  = clamp((enMeters - uMesoWindSfc * (dtAdv * ridgePin)) / spanM + 0.5, 0.012, 0.988);
+    vec2 uvLow  = clamp((enMeters - uMesoWind850 * dtAdv) / spanM + 0.5, 0.012, 0.988);
+    vec2 uvMid  = clamp((enMeters - uMesoWind500 * dtAdv) / spanM + 0.5, 0.012, 0.988);
+    vec2 uvHigh = clamp((enMeters - uMesoWind250 * dtAdv) / spanM + 0.5, 0.012, 0.988);
+
+    float rawFog  = texture(uMesoscaleCloudTex, uvFog).a;
+    float rawLow  = texture(uMesoscaleCloudTex, uvLow).r;
+    float rawMid  = texture(uMesoscaleCloudTex, uvMid).g;
+    float rawHigh = texture(uMesoscaleCloudTex, uvHigh).b;
+
+    vec4 advAltFog = (uHasMesoscaleAlt > 0.5) ? texture(uMesoscaleAltTex, uvFog) : altLocal;
+    float advFogTopM  = max(110.0, mix(localFogTopM, advAltFog.r * 2550.0, 0.65));
+    float advFogBaseM = clamp(mix(altLocal.g * 2550.0, advAltFog.g * 2550.0, 0.65), 20.0, advFogTopM - 65.0);
+
+    // Topographic ridge blocking: advected marine stratus cannot climb over ridges taller than its inversion lid!
+    float ridgeBlock = (uHasMesoscaleAlt > 0.5)
+      ? smoothstep(advFogTopM + 95.0, advFogTopM - 85.0, localSfcElevM)
+      : 1.0;
+
+    float lowCf  = clamp(rawLow  * uScrubLayerScale.x + uScrubLayerAdd.x, 0.0, 1.0);
+    float midCf  = clamp(rawMid  * uScrubLayerScale.y + uScrubLayerAdd.y, 0.0, 1.0);
+    float highCf = clamp(rawHigh * uScrubLayerScale.z + uScrubLayerAdd.z, 0.0, 1.0);
+    float fogCf  = clamp(rawFog  * uScrubLayerScale.w + uScrubLayerAdd.w, 0.0, 1.0) * ridgeBlock;
+
+    if (uHasMesoscaleAlt > 0.5 && rawFog > 0.35 && advFogTopM < localSfcElevM - 110.0) {
+      lowCf *= 0.22 + 0.78 * ridgeBlock;
+    }
+
+    covOut = vec4(lowCf, midCf, highCf, fogCf);
+    altOut = vec4(advFogTopM / 2550.0, advFogBaseM / 2550.0, altLocal.b, altLocal.a);
+  }
+`;
+
 // Shared GLSL3 helper header for all 128x128x48 3D Moist Navier-Stokes GPU passes
 const FLUID_COMMON_HEADER_GLSL3 = /* glsl */ `
   precision highp float;
@@ -804,12 +870,10 @@ const FLUID_PROJECT_ADVECT_VEL_FRAGMENT_GLSL3 = /* glsl */ `
 // GPU Fluid Pass 4b: Clamped 2nd-Order MacCormack Scalar & Sheared Ice Advection + Microphysics
 const FLUID_ADVECT_MICROPHYSICS_FRAGMENT_GLSL3 = /* glsl */ `
   ${FLUID_COMMON_HEADER_GLSL3}
+  ${SPATIAL_CLOUD_FIELD_SAMPLER_GLSL3}
   uniform sampler2D uVelTex;
   uniform sampler2D uThermoTex;
   uniform sampler2D uTerrainGridTex;
-  uniform sampler2D uMesoscaleCloudTex;
-  uniform float uMesoscaleSpanM;
-  uniform float uHasMesoscaleGrid;
   out vec4 fragColor;
 
   void main() {
@@ -845,11 +909,12 @@ const FLUID_ADVECT_MICROPHYSICS_FRAGMENT_GLSL3 = /* glsl */ `
     float qc = max(0.0, advParcel.z);
     float qi = max(0.0, qiAdv);
 
-    // 3. 1:1 Lagrangian synoptic 4-layer moisture & summit-anchored cloud root maintenance
+    // 3. 1:1 Lagrangian synoptic 4-layer moisture + 64x64 advected HRRR/GOES spatial relaxation
     vec2 uv = (vec2(vox.xy) + 0.5) / 128.0;
     float invDomain = 1.0 / max(1000.0, uDomainXyM);
-    vec2 driftSfcUv = fract(uv - uWindSfc * (uSimTime * invDomain));
-    vec2 drift850Uv = fract(uv - uWind850 * (uSimTime * invDomain));
+    float scrubPhaseS = clamp(uScrubDeltaSec, -9900.0, 9900.0) * 0.35;
+    vec2 driftSfcUv = fract(uv - uWindSfc * ((uSimTime + scrubPhaseS) * invDomain));
+    vec2 drift850Uv = fract(uv - uWind850 * ((uSimTime + scrubPhaseS) * invDomain));
     float fogMacro = sculptedCloudMacro2D(driftSfcUv * 0.75 + vec2(0.19, 0.41));
     float cellWave = sculptedCloudMacro2D(drift850Uv);
 
@@ -857,24 +922,30 @@ const FLUID_ADVECT_MICROPHYSICS_FRAGMENT_GLSL3 = /* glsl */ `
     float cuCov = clamp(uLowCloudPct / 100.0, 0.0, 1.0);
     float midCov = clamp(uMidCloudPct / 100.0, 0.0, 1.0);
     float highCov = clamp(uHighCloudPct / 100.0, 0.0, 1.0);
+    float fogBaseEnv = uFogBaseAslM;
+    float fogTopEnv = uFogTopAslM;
 
-    // Lateral mesoscale boundary relaxation: nudge outer edges of the 18km box toward the 160km NWP/GOES grid
     if (uHasMesoscaleGrid > 0.5) {
       vec2 enLocal = (uv - 0.5) * uDomainXyM;
-      vec2 mesoUv = clamp(enLocal / max(20000.0, uMesoscaleSpanM) + 0.5, 0.03, 0.97);
-      vec4 mesoCov = texture(uMesoscaleCloudTex, mesoUv);
-      float edgeBlend = smoothstep(0.30, 0.49, max(abs(uv.x - 0.5), abs(uv.y - 0.5)));
-      if (uFogCloudPct > 1.5 || mesoCov.a > 0.20) {
-        fogCov = mix(fogCov, mesoCov.a, edgeBlend * 0.72);
+      vec4 spCov, spAlt;
+      sampleSpatialCloudField(enLocal, spCov, spAlt);
+      float edgeBlend = smoothstep(0.28, 0.49, max(abs(uv.x - 0.5), abs(uv.y - 0.5)));
+      float coreWeight = (uUseSpatialInCore > 0.5) ? mix(0.84, 0.94, edgeBlend) : (edgeBlend * 0.72);
+      if (uFogCloudPct > 1.0 || spCov.w > 0.12) {
+        fogCov = mix(fogCov, spCov.w, coreWeight);
       }
-      cuCov = mix(cuCov, max(0.0, mesoCov.r - fogCov * 0.55), edgeBlend * 0.72);
-      midCov = mix(midCov, mesoCov.g, edgeBlend * 0.72);
-      highCov = mix(highCov, mesoCov.b, edgeBlend * 0.72);
+      cuCov = mix(cuCov, max(0.0, spCov.x - fogCov * 0.55), coreWeight);
+      midCov = mix(midCov, spCov.y, coreWeight);
+      highCov = mix(highCov, spCov.z, coreWeight);
+      if (uUseSpatialInCore > 0.5 && uHasMesoscaleAlt > 0.5) {
+        fogBaseEnv = mix(fogBaseEnv, spAlt.g * 2550.0, 0.72);
+        fogTopEnv  = mix(fogTopEnv,  spAlt.r * 2550.0, 0.72);
+      }
     }
 
-    // Layer 1: Sub-inversion marine stratus / valley fog ([uFogBaseAslM, uFogTopAslM])
-    float fogBase = max(elevM + 12.0, uFogBaseAslM);
-    float fogTop = max(fogBase + 75.0, uFogTopAslM);
+    // Layer 1: Sub-inversion marine stratus / valley fog ([fogBaseEnv, fogTopEnv])
+    float fogBase = max(elevM + 12.0, fogBaseEnv);
+    float fogTop = max(fogBase + 75.0, fogTopEnv);
     float fogBand = smoothstep(fogBase - 45.0, fogBase + 35.0, zAsl)
                   * (1.0 - smoothstep(fogTop - 25.0, fogTop + 85.0, zAsl));
     float fogThresh = 1.0 - fogCov * 0.82 - 0.05;
@@ -907,7 +978,7 @@ const FLUID_ADVECT_MICROPHYSICS_FRAGMENT_GLSL3 = /* glsl */ `
       targetRh = max(targetRh, mix(0.70, 1.085, cuSupport));
     }
     if (midCov > 0.03 && zAsl >= uMidBaseAslM - 450.0 && zAsl <= uMidTopAslM + 550.0) {
-      vec2 driftMidUv = fract(uv - uWind500 * (uSimTime * invDomain));
+      vec2 driftMidUv = fract(uv - uWind500 * ((uSimTime + scrubPhaseS) * invDomain));
       float midCell = 0.65 * valueNoisePeriodic2D(driftMidUv + vec2(0.31, 0.67), 4.0)
                     + 0.35 * valueNoisePeriodic2D(driftMidUv + vec2(0.12, 0.83), 8.0);
       float leeCrest = clamp(promM / 320.0, 0.0, 1.0) * clamp((uOrographicWaveGain - 0.85) * 0.55, 0.0, 0.55);
@@ -925,17 +996,19 @@ const FLUID_ADVECT_MICROPHYSICS_FRAGMENT_GLSL3 = /* glsl */ `
     }
 
     float qvTarget = qsatLiq * targetRh;
-    qv = mix(qv, qvTarget, clamp(0.042 * dt, 0.0, 0.24));
+    float qvRelax = mix(clamp(0.042 * dt, 0.0, 0.24), 0.44, clamp(uScrubRelaxBoost, 0.0, 1.0));
+    qv = mix(qv, qvTarget, qvRelax);
 
     // 4. Clausius-Clapeyron Saturation Adjustment (qv <-> qc + latent heat release!)
     float superSat = qv - qsatLiq;
+    float evapBoost = mix(0.52, 0.82, clamp(uScrubRelaxBoost, 0.0, 1.0));
     if (superSat > 0.0 && tempK > 238.0) {
-      float cond = superSat * 0.64;
+      float cond = superSat * mix(0.64, 0.80, clamp(uScrubRelaxBoost, 0.0, 1.0));
       qv -= cond;
       qc += cond;
       thetaPrime += cond * 840.0; // Latent heat fuels persistent 3D cumulus towers
     } else if (superSat < 0.0 && qc > 0.0) {
-      float evap = min(qc, -superSat * 0.52);
+      float evap = min(qc, -superSat * evapBoost);
       qc -= evap;
       qv += evap;
       thetaPrime -= evap * 540.0;
@@ -945,7 +1018,7 @@ const FLUID_ADVECT_MICROPHYSICS_FRAGMENT_GLSL3 = /* glsl */ `
     // 5. Koop Upper-Tropospheric Cirrus Ice Nucleation & Wind-Sheared Fallstreak Sublimation ([uHighBaseAslM, uHighTopAslM])
     vec2 jetDir = normalize(uWind250 + vec2(1e-3));
     vec2 crossDir = vec2(-jetDir.y, jetDir.x);
-    vec2 jetUv = fract(uv - uWind250 * (uSimTime * invDomain));
+    vec2 jetUv = fract(uv - uWind250 * ((uSimTime + scrubPhaseS) * invDomain));
     vec2 jetProj = vec2(dot(jetUv, jetDir), dot(jetUv, crossDir));
     float ciStreak = 0.62 * valueNoisePeriodic2D(vec2(jetProj.x * 0.5, jetProj.y * 2.0), 4.0)
                    + 0.38 * valueNoisePeriodic2D(vec2(jetProj.x * 1.0, jetProj.y * 3.0) + vec2(0.37, 0.19), 8.0);
@@ -960,7 +1033,8 @@ const FLUID_ADVECT_MICROPHYSICS_FRAGMENT_GLSL3 = /* glsl */ `
                    * (1.0 + 0.28 * clamp(vel.z, -0.8, 1.6));
 
     if (zAsl >= hiBase - 750.0) {
-      qi = mix(qi, qiTarget, clamp(0.052 * dt, 0.0, 0.28));
+      float qiRelax = mix(clamp(0.052 * dt, 0.0, 0.28), 0.46, clamp(uScrubRelaxBoost, 0.0, 1.0));
+      qi = mix(qi, qiTarget, qiRelax);
       // Bergeron glaciation from supercooled mid/high liquid
       if (tempK < 253.0 && qc > 1e-5) {
         float freeze = qc * 0.16 * clamp(dt, 0.08, 2.0);
@@ -1331,9 +1405,7 @@ const SAMPLE_FLUID_VOLUME_HELPER_GLSL3 = /* glsl */ `
   uniform sampler2D uCloudAtlas2D;
   uniform sampler3D uCloudVolume3D;
   uniform float uUseGpuAtlas;
-  uniform sampler2D uMesoscaleCloudTex;
-  uniform float uMesoscaleSpanM;
-  uniform float uHasMesoscaleGrid;
+  ${SPATIAL_CLOUD_FIELD_SAMPLER_GLSL3}
   uniform float uZBaseM;
   uniform float uZTopM;
   uniform float uFogCloudPct;
@@ -1390,11 +1462,13 @@ const SAMPLE_FLUID_VOLUME_HELPER_GLSL3 = /* glsl */ `
     vec2 uvPrimary = en / max(1000.0, domainXyM) + 0.5;
     vec4 nearFl = sampleFluidMacro(uvPrimary, s);
 
-    // Keep central landmark domain 100% faithful to local DEM fluid physics;
-    // smoothly blend an incommensurately rotated (36.87 deg) 2.37x macro octave + 160 km mesoscale grid in the far vista!
     float radialDist = length(en);
     float farBlend = smoothstep(domainXyM * 0.43, domainXyM * 0.96, radialDist);
-    if (farBlend <= 0.002) {
+    float scrubLiveBlend = (uHasMesoscaleGrid > 0.5 && uUseSpatialInCore > 0.5)
+      ? 0.34 * smoothstep(25.0, 900.0, abs(uScrubDeltaSec))
+      : 0.0;
+
+    if (farBlend <= 0.002 && scrubLiveBlend <= 0.002) {
       return nearFl;
     }
 
@@ -1411,14 +1485,16 @@ const SAMPLE_FLUID_VOLUME_HELPER_GLSL3 = /* glsl */ `
     float outRh = mix(nearFl.a, farFl.a, farBlend * 0.55);
 
     if (uHasMesoscaleGrid > 0.5) {
-      float mesoBlend = smoothstep(domainXyM * 0.48, domainXyM * 1.45, radialDist);
+      float mesoBlend = max(scrubLiveBlend, smoothstep(domainXyM * 0.44, domainXyM * 1.25, radialDist));
       if (mesoBlend > 0.005) {
         float zAsl = sToAltitudeM(s);
-        vec2 mesoUv = clamp(en / max(20000.0, uMesoscaleSpanM) + 0.5, 0.02, 0.98);
-        vec4 meso = texture(uMesoscaleCloudTex, mesoUv); // R=low, G=mid, B=high, A=fog/inv
+        vec4 meso, mesoAlt;
+        sampleSpatialCloudField(en, meso, mesoAlt); // R=low, G=mid, B=high, A=fog/inv
 
-        float fogTop = max(uFogBaseAslM + 80.0, uFogTopAslM);
-        float fogVert = smoothstep(uFogBaseAslM - 55.0, uFogBaseAslM + 35.0, zAsl)
+        float fogBaseLoc = (uHasMesoscaleAlt > 0.5) ? mix(uFogBaseAslM, mesoAlt.g * 2550.0, 0.75) : uFogBaseAslM;
+        float fogTopLoc  = (uHasMesoscaleAlt > 0.5) ? mix(uFogTopAslM,  mesoAlt.r * 2550.0, 0.75) : uFogTopAslM;
+        float fogTop = max(fogBaseLoc + 75.0, fogTopLoc);
+        float fogVert = smoothstep(fogBaseLoc - 55.0, fogBaseLoc + 35.0, zAsl)
                       * (1.0 - smoothstep(fogTop - 30.0, fogTop + 95.0, zAsl));
         float cuTop = max(uLowBaseAslM + 320.0, uLowTopAslM);
         float lowVert = smoothstep(uLowBaseAslM - 75.0, uLowBaseAslM + 95.0, zAsl)
@@ -1431,14 +1507,14 @@ const SAMPLE_FLUID_VOLUME_HELPER_GLSL3 = /* glsl */ `
         float highVert = smoothstep(hiBase - 450.0, hiBase + 650.0, zAsl)
                        * (1.0 - smoothstep(hiTop - 250.0, hiTop + 750.0, zAsl));
 
-        float cellMod = clamp(0.45 + 0.95 * max(farFl.r, nearFl.r * 0.75), 0.35, 1.30);
-        float iceMod  = clamp(0.45 + 0.95 * max(farFl.g, nearFl.g * 0.75), 0.35, 1.30);
-        float fogActive = (uFogCloudPct > 1.5 || meso.a > 0.18) ? (meso.a * fogVert) : 0.0;
+        float cellMod = clamp(0.48 + 0.92 * max(farFl.r, nearFl.r * 0.78), 0.38, 1.32);
+        float iceMod  = clamp(0.48 + 0.92 * max(farFl.g, nearFl.g * 0.78), 0.38, 1.32);
+        float fogActive = (uFogCloudPct > 1.0 || meso.a > 0.12) ? (meso.a * fogVert) : 0.0;
         float cuActive = max(0.0, meso.r - fogActive * 0.55) * lowVert;
         float mesoLiq = sqrt(clamp((max(fogActive, cuActive) + meso.g * midVert) * cellMod, 0.0, 1.0));
         float mesoIce = sqrt(clamp(meso.b * highVert * iceMod, 0.0, 1.0));
-        combinedCloud.x = mix(combinedCloud.x, mesoLiq, mesoBlend * 0.85);
-        combinedCloud.y = mix(combinedCloud.y, mesoIce, mesoBlend * 0.85);
+        combinedCloud.x = mix(combinedCloud.x, mesoLiq, mesoBlend * 0.88);
+        combinedCloud.y = mix(combinedCloud.y, mesoIce, mesoBlend * 0.88);
         outRh = mix(outRh, clamp(0.25 + 0.70 * max(meso.r, meso.a), 0.0, 1.0), mesoBlend * 0.65);
       }
     }
@@ -3451,11 +3527,14 @@ export class VolumetricAtmosphereEngine {
   setMesoscaleCloudGrid(gridPayload) {
     if (!gridPayload) {
       this._hasLoadedMesoscaleGrid = false;
+      this._hasLoadedMesoscaleAlt = false;
       this.mesoscaleUniforms.uHasMesoscaleGrid.value = 0.0;
+      this.mesoscaleUniforms.uHasMesoscaleAlt.value = 0.0;
+      this.mesoscaleUniforms.uUseSpatialInCore.value = 0.0;
       return;
     }
 
-    const n = Math.max(4, Math.round(gridPayload.grid_size || 16));
+    const n = Math.max(4, Math.round(gridPayload.grid_size || 64));
     const expectedPixels = n * n;
     let bytes = null;
 
@@ -3494,9 +3573,103 @@ export class VolumetricAtmosphereEngine {
       this.mesoscaleCloudTex.image.data.set(bytes);
     }
     this.mesoscaleCloudTex.needsUpdate = true;
-    this.mesoscaleUniforms.uMesoscaleSpanM.value = gridPayload.span_m || 160000.0;
+
+    let altBytes = null;
+    if (typeof gridPayload.alt_rgba8_b64 === 'string' && gridPayload.alt_rgba8_b64.length > 0) {
+      const altStr = atob(gridPayload.alt_rgba8_b64);
+      if (altStr.length === expectedPixels * 4) {
+        altBytes = new Uint8Array(expectedPixels * 4);
+        for (let i = 0; i < expectedPixels * 4; i++) {
+          altBytes[i] = altStr.charCodeAt(i);
+        }
+      }
+    }
+    if (altBytes) {
+      if (this.mesoscaleAltTex.image.width !== n || this.mesoscaleAltTex.image.height !== n) {
+        this.mesoscaleAltTex.dispose();
+        this.mesoscaleAltTex = new THREE.DataTexture(altBytes, n, n, THREE.RGBAFormat, THREE.UnsignedByteType);
+        this.mesoscaleAltTex.minFilter = THREE.LinearFilter;
+        this.mesoscaleAltTex.magFilter = THREE.LinearFilter;
+        this.mesoscaleAltTex.wrapS = THREE.ClampToEdgeWrapping;
+        this.mesoscaleAltTex.wrapT = THREE.ClampToEdgeWrapping;
+        this.mesoscaleAltTex.flipY = false;
+        this.mesoscaleAltTex.unpackAlignment = 1;
+        this.mesoscaleUniforms.uMesoscaleAltTex.value = this.mesoscaleAltTex;
+      } else {
+        this.mesoscaleAltTex.image.data.set(altBytes);
+      }
+      this.mesoscaleAltTex.needsUpdate = true;
+      this._hasLoadedMesoscaleAlt = true;
+      this.mesoscaleUniforms.uHasMesoscaleAlt.value = 1.0;
+    } else {
+      this._hasLoadedMesoscaleAlt = false;
+      this.mesoscaleUniforms.uHasMesoscaleAlt.value = 0.0;
+    }
+
+    const mu = this.mesoscaleUniforms;
+    mu.uMesoscaleSpanM.value = gridPayload.span_m || 112000.0;
+    mu.uScrubDeltaSec.value = 0.0;
+    mu.uScrubLayerScale.value.set(1.0, 1.0, 1.0, 1.0);
+    mu.uScrubLayerAdd.value.set(0.0, 0.0, 0.0, 0.0);
+    mu.uScrubRelaxBoost.value = 0.0;
+
+    const wv = gridPayload.wind_vectors_ms;
+    if (wv) {
+      if (Array.isArray(wv.sfc) && wv.sfc.length >= 2) mu.uMesoWindSfc.value.set(wv.sfc[0], wv.sfc[1]);
+      if (Array.isArray(wv.h850) && wv.h850.length >= 2) mu.uMesoWind850.value.set(wv.h850[0], wv.h850[1]);
+      if (Array.isArray(wv.h500) && wv.h500.length >= 2) mu.uMesoWind500.value.set(wv.h500[0], wv.h500[1]);
+      if (Array.isArray(wv.h250) && wv.h250.length >= 2) mu.uMesoWind250.value.set(wv.h250[0], wv.h250[1]);
+    }
+
+    this._mesoscaleMeta = {
+      anchorMinutesLocal:
+        typeof gridPayload.anchor_minutes_local === 'number' ? gridPayload.anchor_minutes_local : 1038.0,
+      anchorLayerPct: gridPayload.anchor_layer_pct || { low: 25, mid: 20, high: 45, fog: 20 },
+    };
+
     this._hasLoadedMesoscaleGrid = true;
-    this.mesoscaleUniforms.uHasMesoscaleGrid.value = 1.0;
+    mu.uHasMesoscaleGrid.value = 1.0;
+    mu.uUseSpatialInCore.value = this.activePreset === 'live' ? 1.0 : 0.0;
+    this._needsShadowBake = true;
+  }
+
+  /**
+   * Updates 4-layer Lagrangian wind-sheared advection & diurnal coverage scaling
+   * continuously as the user drags `#time-scrubber` or runs `Animate`!
+   */
+  setScrubberKinematics({ minutesLocal, lowPct, midPct, highPct, fogPct, isScrubbing = false }) {
+    if (!this._hasLoadedMesoscaleGrid) return;
+    const mu = this.mesoscaleUniforms;
+    const anchorMin = this._mesoscaleMeta?.anchorMinutesLocal ?? 1038.0;
+    const deltaSec = (minutesLocal - anchorMin) * 60.0;
+    const prevDelta = mu.uScrubDeltaSec.value;
+    mu.uScrubDeltaSec.value = deltaSec;
+
+    const anc = this._mesoscaleMeta?.anchorLayerPct || { low: 25, mid: 20, high: 45, fog: 20 };
+    const computeMod = (curPct, basePct) => {
+      if (typeof curPct !== 'number') return [1.0, 0.0];
+      const c = Math.max(0.0, Math.min(100.0, curPct)) / 100.0;
+      const b = Math.max(0.0, Math.min(100.0, basePct ?? curPct)) / 100.0;
+      if (b >= 0.08) {
+        const scale = Math.max(0.08, Math.min(2.15, c / b));
+        const add = Math.max(0.0, c - b * scale) * 0.55;
+        return [scale, add];
+      }
+      return [1.0, Math.max(0.0, c - b) * 0.80];
+    };
+
+    const [sL, aL] = computeMod(lowPct, anc.low);
+    const [sM, aM] = computeMod(midPct, anc.mid);
+    const [sH, aH] = computeMod(highPct, anc.high);
+    const [sF, aF] = computeMod(fogPct, anc.fog);
+    mu.uScrubLayerScale.value.set(sL, sM, sH, sF);
+    mu.uScrubLayerAdd.value.set(aL, aM, aH, aF);
+
+    if (Math.abs(deltaSec - prevDelta) >= 8.0) {
+      mu.uScrubRelaxBoost.value = isScrubbing ? 0.85 : 0.45;
+      this._pendingScrubFluidStep = true;
+      this._needsShadowBake = true;
+    }
   }
 
   setQualityMode(mode) {
@@ -4130,24 +4303,36 @@ export class VolumetricAtmosphereEngine {
     }
     this._pollAsyncCloudProbe();
 
-    if (this.evolveFluid && showAtmosphere && !document.hidden) {
-      // Majestic, physically grounded 1.6x real-time cloud evolution in 1:1 Lagrangian lockstep!
-      const dtSim = clampedDt * 1.6 * this.evolutionSpeed;
-      this.simClockS += dtSim;
+    if (showAtmosphere && !document.hidden && (this.evolveFluid || this._pendingScrubFluidStep)) {
+      const dtSim = this.evolveFluid ? clampedDt * 1.6 * this.evolutionSpeed : 0.35;
+      if (this.evolveFluid) {
+        this.simClockS += dtSim;
+      }
 
       if (this.useGpuFluidSolver) {
         this._gpuSimAccumS = (this._gpuSimAccumS || 0) + dtSim;
+        const nowWall = performance.now();
+        const scrubReady = this._pendingScrubFluidStep && nowWall - this._lastScrubStepWallMs >= 68.0;
         const targetCadenceS = Math.max(0.14, Math.min(0.45, 0.18 * this.evolutionSpeed));
-        if (this._gpuSimAccumS >= targetCadenceS) {
-          const t0 = performance.now();
-          const simStepDt = Math.min(2.2, this._gpuSimAccumS);
+        if (scrubReady || (this.evolveFluid && this._gpuSimAccumS >= targetCadenceS)) {
+          const t0 = nowWall;
+          const simStepDt = scrubReady ? 1.15 : Math.min(2.2, this._gpuSimAccumS);
           this._gpuSimAccumS = 0.0;
+          this._lastScrubStepWallMs = nowWall;
           this._stepGpuFluidInternal(simStepDt);
           const stepElapsed = performance.now() - t0;
           this.telemetry.stepMs = this.telemetry.stepMs * 0.85 + stepElapsed * 0.15;
           this._updateGpuTelemetry(false);
+          const curBoost = this.mesoscaleUniforms.uScrubRelaxBoost.value;
+          if (curBoost > 0.04) {
+            this.mesoscaleUniforms.uScrubRelaxBoost.value = curBoost * 0.56;
+            this._pendingScrubFluidStep = this.mesoscaleUniforms.uScrubRelaxBoost.value > 0.06;
+          } else {
+            this.mesoscaleUniforms.uScrubRelaxBoost.value = 0.0;
+            this._pendingScrubFluidStep = false;
+          }
         }
-      } else {
+      } else if (this.evolveFluid) {
         const nowMs = performance.now();
         if (
           this.worker &&
