@@ -2892,3 +2892,196 @@ details.weather-card:not([open])::details-content {
   color: var(--text-muted);
 }
 
+/* ==========================================================================
+   Task 3.4: Lightweight 3D Terrain, Camera Focal-Length Viewfinder & Fog-Sea Band
+   ========================================================================== */
+
+.btn-field-card {
+  border-color: color-mix(in oklch, var(--accent-amber) 42%, var(--border-subtle));
+  color: var(--accent-gold);
+}
+
+.btn-field-card:hover {
+  background: color-mix(in oklch, var(--accent-amber) 14%, transparent);
+  border-color: color-mix(in oklch, var(--accent-amber) 68%, transparent);
+}
+
+.btn-enter-vf-quick {
+  border-color: rgba(251, 191, 36, 0.42);
+  color: #fde68a;
+}
+
+.btn-enter-vf-quick:hover {
+  border-color: rgba(251, 191, 36, 0.78);
+  background: rgba(245, 158, 11, 0.16);
+}
+
+.viewport-stage.is-viewfinder .btn-enter-vf-quick {
+  display: none;
+}
+
+.fog-band-hud {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.14rem;
+  padding: 0.14rem 0.24rem;
+}
+
+.fog-band-hud-label {
+  padding-inline: 0.38rem 0.24rem;
+  font-size: 0.66rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: #bae6fd;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.fog-band-hud .mode-btn {
+  padding: 0.2rem 0.42rem;
+  font-size: 0.65rem;
+}
+
+.gpu-telemetry-pill.is-fluid-active {
+  background: rgba(14, 116, 144, 0.28);
+  border-color: rgba(56, 189, 248, 0.62);
+  color: #e0f2fe;
+}
+
+/* Interactive Full-Frame Camera Lens Selector inside Viewfinder Overlay */
+.vf-top-lens-bar {
+  position: absolute;
+  inset-block-start: 0.55rem;
+  inset-inline-start: 50%;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 0.22rem;
+  max-inline-size: calc(100% - 1.2rem);
+  padding: 0.24rem 0.36rem;
+  border-radius: 999px;
+  background: rgba(9, 13, 22, 0.86);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(251, 191, 36, 0.36);
+  pointer-events: auto;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.vf-top-lens-bar::-webkit-scrollbar {
+  display: none;
+}
+
+.vf-lens-label {
+  padding-inline: 0.36rem 0.22rem;
+  font-size: 0.63rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #94a3b8;
+  white-space: nowrap;
+}
+
+.vf-lens-btn {
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: #e2e8f0;
+  padding: 0.22rem 0.52rem;
+  border-radius: 999px;
+  font-size: 0.69rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.vf-lens-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #ffffff;
+}
+
+.vf-lens-btn.is-active {
+  background: rgba(245, 158, 11, 0.24);
+  border-color: rgba(251, 191, 36, 0.72);
+  color: #fef08a;
+}
+
+.vf-fov-pill {
+  padding: 0.16rem 0.44rem;
+  border-radius: 999px;
+  background: rgba(30, 41, 59, 0.85);
+  border: 1px solid rgba(148, 163, 184, 0.26);
+  color: #cbd5e1;
+  font-size: 0.64rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.vf-fieldcard-btn {
+  border-color: rgba(56, 189, 248, 0.35);
+  color: #bae6fd;
+  margin-inline-start: 0.12rem;
+}
+
+.vf-fieldcard-btn:hover {
+  background: rgba(14, 165, 233, 0.2);
+  border-color: rgba(56, 189, 248, 0.65);
+}
+
+@media (max-width: 768px) {
+  .viewport-toolbar {
+    flex-wrap: wrap;
+    gap: 0.35rem;
+  }
+
+  .hud-cluster-left,
+  .hud-cluster-right {
+    flex-wrap: wrap;
+    gap: 0.28rem;
+  }
+
+  .fog-band-hud-label {
+    display: none;
+  }
+
+  .vf-lens-label,
+  .vf-fov-pill {
+    display: none;
+  }
+
+  .vf-top-lens-bar {
+    inset-block-start: 0.35rem;
+    padding: 0.2rem 0.28rem;
+  }
+
+  .vf-lens-btn {
+    padding: 0.2rem 0.42rem;
+    font-size: 0.65rem;
+  }
+
+  .vf-bottom-hud {
+    font-size: 0.64rem;
+    padding: 0.22rem 0.56rem;
+  }
+
+  .scrubber-header-row {
+    flex-wrap: wrap;
+    gap: 0.35rem;
+  }
+
+  .preset-buttons {
+    flex-wrap: wrap;
+    gap: 0.24rem;
+  }
+
+  .btn-preset {
+    font-size: 0.66rem;
+    padding: 0.22rem 0.45rem;
+  }
+}
+
+

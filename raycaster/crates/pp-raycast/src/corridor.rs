@@ -587,9 +587,12 @@ pub fn solar_disk_visibility_fraction(sun_center_el_deg: f64, horizon_deg: f64) 
     } else if delta >= r {
         1.0
     } else {
-        // Exact area fraction of a unit circle above signed offset u = -delta / r in [-1, 1]
+        // Exact area fraction of a unit circle above horizontal cut y = u = -delta / r in [-1, 1]:
+        // u = -1 (delta = +r, full disk above) -> acos(-1) = PI -> 1.0
+        // u =  0 (delta =  0, half disk above) -> acos(0)  = PI/2 -> 0.5
+        // u = +1 (delta = -r, disk below)      -> acos(1)  = 0 -> 0.0
         let u = (-delta / r).clamp(-1.0, 1.0);
-        let area_above = std::f64::consts::PI - u.acos() + u * (1.0 - u * u).max(0.0).sqrt();
+        let area_above = u.acos() - u * (1.0 - u * u).max(0.0).sqrt();
         (area_above / std::f64::consts::PI).clamp(0.0, 1.0)
     }
 }
@@ -753,7 +756,10 @@ fn integrate_atmospheric_corridor_range(
 
     let alpha0_rad = ray_elevation_deg.clamp(-5.0, 89.5).to_radians();
     let tan_alpha0 = alpha0_rad.tan();
-    let r_eff = EARTH_RADIUS_M / (1.0 - refraction_k.clamp(0.05, 0.55));
+    const K_STD: f64 = 0.135;
+    let k_sfc = refraction_k.clamp(0.05, 0.55);
+    let k_excess = (k_sfc - K_STD).max(0.0);
+    let r_eff_init = EARTH_RADIUS_M / (1.0 - k_sfc);
 
     let mut tau_mol_aer = [0.0_f64; 6];
     let mut tau_rayleigh_550 = 0.0_f64;
@@ -790,6 +796,9 @@ fn integrate_atmospheric_corridor_range(
     let abs_tan0 = tan_alpha0.abs().max(0.01);
 
     let mut s_m = start_dist_m.max(0.0);
+    let mut z_cur_m = origin_asl_m + s_m * tan_alpha0 + (s_m * s_m) / (2.0 * r_eff_init);
+    let mut slope_cur = tan_alpha0 + s_m / r_eff_init;
+
     while s_m < atmo_limit_m {
         let in_weather_corridor = s_m < max_dist_m;
         let base_ds_m: f64 = if !in_weather_corridor {
@@ -818,9 +827,21 @@ fn integrate_atmospheric_corridor_range(
             break;
         }
 
-        // Exact curved-Earth + refracted ray altitude and local slope dz/ds at s_mid_m
-        let drop_mid = (s_mid_m * s_mid_m) / (2.0 * r_eff);
-        let z_ray_m = origin_asl_m + s_mid_m * tan_alpha0 + drop_mid;
+        // Height-dependent curved-Earth + refracted ray kinematics:
+        // Boundary-layer inversion ducting (`k_excess`) decays above 1.2 km ASL (1.0 km scale),
+        // and standard molecular refraction decays barometrically with air density aloft so the
+        // stratosphere uses straight-line geometry rather than `k = 0.45` ducting.
+        let k_local = (K_STD * (-z_cur_m.max(0.0) / 8_434.0).exp()
+            + k_excess * (-(z_cur_m - 1_200.0).max(0.0) / 1_000.0).exp())
+        .clamp(0.0, 0.55);
+        let inv_r_eff = (1.0 - k_local) / EARTH_RADIUS_M;
+        let z_ray_m = z_cur_m
+            + 0.5 * step_horiz_m * slope_cur
+            + 0.125 * step_horiz_m * step_horiz_m * inv_r_eff;
+        let dz_ds = slope_cur + 0.5 * step_horiz_m * inv_r_eff;
+        z_cur_m += step_horiz_m * slope_cur + 0.5 * step_horiz_m * step_horiz_m * inv_r_eff;
+        slope_cur += step_horiz_m * inv_r_eff;
+
         if z_ray_m > 45_000.0 {
             // Above stratospheric ozone layer; negligible remaining optical depth
             break;
@@ -830,7 +851,6 @@ fn integrate_atmospheric_corridor_range(
             break;
         }
 
-        let dz_ds = tan_alpha0 + s_mid_m / r_eff;
         let dz_step_m = (step_horiz_m * dz_ds).abs();
         let ds_path_m = (step_horiz_m * step_horiz_m + dz_step_m * dz_step_m).sqrt();
 
@@ -838,11 +858,16 @@ fn integrate_atmospheric_corridor_range(
         corridor.station_weights(s_km.min(max_dist_m * 0.001), ray_azimuth_deg, &mut weights);
         let st = corridor.interpolate_continuous(&weights);
 
-        // 1. Rayleigh molecular scattering (barometric density profile)
+        // 1. Rayleigh molecular scattering (barometric AGL density profile — avoids double-counting
+        //    station elevation already embedded in `st.surface_pressure_hpa`)
         let h_rayleigh = 8_434.0;
-        let rho_rel = (st.surface_pressure_hpa / 1013.25)
-            * (-z_ray_m.max(0.0) / h_rayleigh).exp()
-            * (288.15 / (st.surface_temp_k - st.lapse_rate_k_km * 0.001 * (z_ray_m - st.surface_elevation_m).max(0.0)).max(212.0));
+        let agl_signed_m = z_ray_m - st.surface_elevation_m;
+        let agl_m = agl_signed_m.max(0.0);
+        let p_local_rel = ((st.surface_pressure_hpa / 1013.25)
+            * (-agl_signed_m / h_rayleigh).exp())
+        .clamp(0.0, 1.06);
+        let rho_rel = p_local_rel
+            * (288.15 / (st.surface_temp_k - st.lapse_rate_k_km * 0.001 * agl_m).max(212.0));
         let d_rayleigh_base = (ds_path_m / h_rayleigh) * rho_rel.max(0.0);
 
         // 2. Stratospheric Chappuis ozone absorption (12-36 km Gaussian centered at 22.5 km)
@@ -852,21 +877,33 @@ fn integrate_atmospheric_corridor_range(
             / (2.50662827 * oz_sigma);
         let d_ozone_scale = ds_path_m * oz_gauss * (st.ozone_du / 300.0);
 
-        // 3. CAMS / Boundary-Layer Mie aerosol extinction (trapped below inversion / PBL)
-        let agl_m = (z_ray_m - st.surface_elevation_m).max(0.0);
-        let mut inv_trap = 1.0;
-        if st.inversion_strength_k > 0.5 && st.inversion_top_asl_m > st.surface_elevation_m {
-            if z_ray_m <= st.inversion_top_asl_m {
-                inv_trap = 1.0 + (0.22 * st.inversion_strength_k).min(1.4);
-            } else {
-                inv_trap = 0.22; // Pristine free alpine troposphere above inversion lid
-            }
-        } else if z_ray_m > st.boundary_layer_top_asl_m + 600.0 {
-            inv_trap = 0.35;
-        }
-        let beta_aer_550 = (st.aod_550nm / st.aerosol_scale_height_m)
-            * (-agl_m / st.aerosol_scale_height_m).exp()
-            * inv_trap;
+        // 3. CAMS / Boundary-Layer Mie aerosol extinction (trapped below inversion / PBL,
+        //    analytically renormalized so vertical column integral ALWAYS equals `st.aod_550nm`)
+        let h_aer = st.aerosol_scale_height_m;
+        let z_step_lo = z_ray_m - 0.5 * dz_step_m;
+        let (lid_asl, w_below, w_above) = if st.inversion_strength_k > 0.5
+            && st.inversion_top_asl_m > st.surface_elevation_m
+        {
+            (
+                st.inversion_top_asl_m,
+                1.0 + (0.22 * st.inversion_strength_k).min(1.4),
+                0.22,
+            )
+        } else {
+            (st.boundary_layer_top_asl_m + 600.0, 1.0, 0.35)
+        };
+        let lid_agl = (lid_asl - st.surface_elevation_m).max(0.0);
+        let f_above = (-lid_agl / h_aer).exp();
+        let norm = (w_below * (1.0 - f_above) + w_above * f_above).max(0.05);
+        let f_step_below = if dz_step_m > 1e-3 {
+            ((lid_asl - z_step_lo) / dz_step_m).clamp(0.0, 1.0)
+        } else if z_ray_m <= lid_asl {
+            1.0
+        } else {
+            0.0
+        };
+        let inv_trap = (f_step_below * w_below + (1.0 - f_step_below) * w_above) / norm;
+        let beta_aer_550 = (st.aod_550nm / h_aer) * (-agl_m / h_aer).exp() * inv_trap;
         let d_aer_550 = ds_path_m * beta_aer_550;
 
         tau_rayleigh_550 += TAU_RAYLEIGH_VERTICAL[2] * d_rayleigh_base;
@@ -919,12 +956,12 @@ fn integrate_atmospheric_corridor_range(
                     let d_lambda = w_st * (du_vert * du_vert + du_grazing * du_grazing).sqrt();
 
                     // Delta-Eddington + circumsolar forward-scattering (< 3° aureole) & Cahalan 3D
-                    // filament channeling: hexagonal ice cirrus (`COD ~ 0.5-1.2`) transmits strong
-                    // forward golden-hour light whereas opaque anvil/stratus (`COD ~ 8-25`) extinguishes it.
+                    // filament channeling: hexagonal ice cirrus (`g ≈ 0.85`, `COD ~ 0.5-1.2`)
+                    // transmits strong forward golden-hour light whereas opaque anvil/stratus extinguishes it.
                     let delta_eddington_factor =
-                        0.30 * (1.0 - band.ice_fraction) + 0.20 * band.ice_fraction;
+                        0.26 * (1.0 - band.ice_fraction) + 0.14 * band.ice_fraction;
                     let max_slant_airmass =
-                        7.5 * (1.0 - band.ice_fraction) + 4.2 * band.ice_fraction;
+                        6.5 * (1.0 - band.ice_fraction) + 3.2 * band.ice_fraction;
                     let local_slant = (ds_path_m / dz_step_m.max(1e-3)).min(max_slant_airmass);
                     let eff_band_frac = (dz_step_m / h_band) * local_slant;
                     let tau_core_vert = band.in_cloud_vertical_tau();
@@ -1239,7 +1276,7 @@ pub fn evaluate_overhead_cloud_canvas(
                 };
                 if matches {
                     frac_sum += w * b.cloud_fraction.clamp(0.0, 1.0);
-                    base_sum += w * (b.base_asl_m + 0.20 * (b.top_asl_m - b.base_asl_m).max(100.0));
+                    base_sum += w * b.base_asl_m;
                     w_sum += w;
                 }
             }
@@ -1255,13 +1292,16 @@ pub fn evaluate_overhead_cloud_canvas(
         } else {
             default_base_m
         };
+        // Illuminate the cloud deck's underside from just below `base_asl_m` so the ray
+        // does not march horizontally through the target deck's own interior above the viewer.
+        let underside_ray_z = (deck_z - 40.0).max(ground_z + 30.0);
 
         let ray = evaluate_corridor_ray(
             terrain,
             corridor,
             origin_lat,
             origin_lon,
-            deck_z,
+            underside_ray_z,
             sun_azimuth_deg,
             sun_elevation_deg,
         );
@@ -1669,5 +1709,170 @@ mod tests {
         let (rgb_high, h_high) = lut.sample(252.0, 9_000.0);
         assert!(rgb_high[0] >= rgb_low[0], "Higher altitude has less Rayleigh/aerosol attenuation");
         assert!(h_high < h_low, "Higher altitude has lower (more negative) sea-horizon depression angle");
+    }
+
+    #[test]
+    fn test_rayleigh_high_elevation_no_double_counting() {
+        let terrain = flat_sea_terrain();
+        let elev_m = 3_000.0;
+        let p_sfc_hpa = 1013.25 * (-elev_m / 8_434.0_f64).exp();
+        let state = AtmosphericCorridorState {
+            azimuth_center_deg: 270.0,
+            max_corridor_km: 50.0,
+            stations: vec![CorridorStationProfile {
+                distance_km: 0.0,
+                azimuth_deg: Some(270.0),
+                lat: 37.7,
+                lon: -119.5,
+                surface_elevation_m: elev_m,
+                surface_temp_c: 15.0,
+                surface_pressure_hpa: p_sfc_hpa,
+                lapse_rate_k_km: 0.0,
+                inversion_base_asl_m: 0.0,
+                inversion_top_asl_m: 0.0,
+                inversion_strength_k: 0.0,
+                boundary_layer_top_asl_m: 5_000.0,
+                aod_550nm: 0.005,
+                angstrom_exponent: 1.2,
+                aerosol_scale_height_m: 1_600.0,
+                ozone_du: 300.0,
+                cloud_bands: vec![],
+            }],
+        };
+
+        let res = evaluate_corridor_ray(&terrain, &state, 37.7, -119.5, elev_m, 270.0, 89.0);
+        let expected_rayleigh_550 = TAU_RAYLEIGH_VERTICAL[2] * (p_sfc_hpa / 1013.25);
+        let rel_err = (res.total_rayleigh_od_550 - expected_rayleigh_550).abs() / expected_rayleigh_550;
+        assert!(
+            rel_err < 0.05,
+            "High-elevation Rayleigh OD double-counted: got {:.4}, expected {:.4} (rel_err={:.3})",
+            res.total_rayleigh_od_550,
+            expected_rayleigh_550,
+            rel_err
+        );
+    }
+
+    #[test]
+    fn test_conservative_aerosol_inversion_column_integral() {
+        let terrain = flat_sea_terrain();
+        let aod_target = 0.28;
+        let state = AtmosphericCorridorState {
+            azimuth_center_deg: 270.0,
+            max_corridor_km: 50.0,
+            stations: vec![CorridorStationProfile {
+                distance_km: 0.0,
+                azimuth_deg: Some(270.0),
+                lat: 37.8,
+                lon: -122.5,
+                surface_elevation_m: 0.0,
+                surface_temp_c: 15.0,
+                surface_pressure_hpa: 1013.25,
+                lapse_rate_k_km: 6.5,
+                inversion_base_asl_m: 250.0,
+                inversion_top_asl_m: 550.0,
+                inversion_strength_k: 6.5,
+                boundary_layer_top_asl_m: 550.0,
+                aod_550nm: aod_target,
+                angstrom_exponent: 1.2,
+                aerosol_scale_height_m: 1_500.0,
+                ozone_du: 300.0,
+                cloud_bands: vec![],
+            }],
+        };
+
+        let res = evaluate_corridor_ray(&terrain, &state, 37.8, -122.5, 0.0, 270.0, 89.0);
+        let rel_err = (res.total_aerosol_od_550 - aod_target).abs() / aod_target;
+        assert!(
+            rel_err < 0.06,
+            "Inversion-trapped aerosol column integral must conserve AOD: got {:.4}, expected {:.4}",
+            res.total_aerosol_od_550,
+            aod_target
+        );
+    }
+
+    #[test]
+    fn test_stratospheric_refraction_decays_aloft() {
+        let terrain = flat_sea_terrain();
+        let st_std = AtmosphericCorridorState::clear_standard(37.8, -122.5, 100.0, 270.0);
+        let mut st_inv = st_std.clone();
+        // Strong marine thermal inversion driving surface refraction_k ~ 0.45
+        st_inv.stations[0].inversion_base_asl_m = 100.0;
+        st_inv.stations[0].inversion_top_asl_m = 450.0;
+        st_inv.stations[0].inversion_strength_k = 8.5;
+
+        let r_std = evaluate_corridor_ray(&terrain, &st_std, 37.8, -122.5, 100.0, 270.0, 1.5);
+        let r_inv = evaluate_corridor_ray(&terrain, &st_inv, 37.8, -122.5, 100.0, 270.0, 1.5);
+        let oz_rel_diff =
+            (r_inv.total_ozone_od_590 - r_std.total_ozone_od_590).abs() / r_std.total_ozone_od_590.max(1e-6);
+        assert!(
+            oz_rel_diff < 0.08,
+            "Surface inversion ducting should not distort stratospheric ozone OD: std={:.4} vs inv={:.4} (diff={:.3})",
+            r_std.total_ozone_od_590,
+            r_inv.total_ozone_od_590,
+            oz_rel_diff
+        );
+    }
+
+    #[test]
+    fn test_overhead_cloud_canvas_does_not_self_attenuate() {
+        let terrain = flat_sea_terrain();
+        let mut state = AtmosphericCorridorState::clear_standard(37.75, -119.53, 1200.0, 270.0);
+        state.stations[0].cloud_bands.push(CloudLayerBand {
+            label: "mid".to_string(),
+            base_asl_m: 4_500.0,
+            top_asl_m: 5_800.0,
+            cloud_fraction: 0.70,
+            optical_depth_vertical: 14.0,
+            aspect_ratio_h_over_d: 0.15,
+            characteristic_cell_km: 12.0,
+            ice_fraction: 0.3,
+        });
+        let mut far_clear = AtmosphericCorridorState::clear_standard(37.75, -120.8, 200.0, 270.0)
+            .stations
+            .pop()
+            .unwrap();
+        far_clear.distance_km = 120.0;
+        state.stations.push(far_clear);
+
+        let canvas = evaluate_overhead_cloud_canvas(&terrain, &state, 37.75, -119.53, 270.0, -0.2);
+        let mid_deck = canvas.decks.iter().find(|d| d.band == "mid").unwrap();
+        let inside_deck_ray =
+            evaluate_corridor_ray(&terrain, &state, 37.75, -119.53, 4_500.0 + 0.20 * 1_300.0, 270.0, -0.2);
+        assert!(
+            mid_deck.corridor_direct_prob > inside_deck_ray.direct_beam_probability * 2.0
+                && mid_deck.corridor_direct_prob > 0.40
+                && mid_deck.canvas_glow_score > 45.0,
+            "Mid cloud deck underside should not self-attenuate vs inside-deck ray ({:.3}): {:?}",
+            inside_deck_ray.direct_beam_probability,
+            mid_deck
+        );
+    }
+
+    #[test]
+    fn test_solar_disk_visibility_fraction_monotonic_and_exact() {
+        let h = 1.09;
+        assert_eq!(solar_disk_visibility_fraction(h - 0.50, h), 0.0);
+        assert_eq!(solar_disk_visibility_fraction(h + 0.50, h), 1.0);
+        assert!((solar_disk_visibility_fraction(h, h) - 0.5).abs() < 1e-9);
+
+        // Sun center +0.15 deg ABOVE horizon (Desert Rock Jan 18 sunrise geometry) must be ~84% visible, NOT ~16%!
+        let vis_above = solar_disk_visibility_fraction(1.24, 1.09);
+        assert!(
+            vis_above > 0.80 && vis_above < 0.88,
+            "Sun +0.15 deg above horizon should be ~84% visible, got {:.4}",
+            vis_above
+        );
+        // Symmetric check: -0.15 deg below horizon must sum to 1.0 with +0.15 deg above
+        let vis_below = solar_disk_visibility_fraction(0.94, 1.09);
+        assert!((vis_above + vis_below - 1.0).abs() < 1e-9);
+
+        // Strictly monotonic increasing across [-0.30, +0.30]
+        let mut prev = -1.0;
+        for step in -30..=30 {
+            let el = h + (step as f64) * 0.01;
+            let v = solar_disk_visibility_fraction(el, h);
+            assert!(v >= prev - 1e-12, "Visibility decreased at el={}: {} < {}", el, v, prev);
+            prev = v;
+        }
     }
 }

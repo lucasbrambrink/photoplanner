@@ -4,8 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="color-scheme" content="light dark" />
-  <title>PhotoPlanner 3D — GPU Volumetric Cloud, 3D Cirrus &amp; Topographic Ray Engine</title>
-  <link rel="stylesheet" href="/styles.css?v=20261117c" />
+  <title>PhotoPlanner 3D — Raycasted Terrain, Lens Viewfinder &amp; Calibrated Light Engine</title>
+  <link rel="stylesheet" href="/styles.css?v=20261120a" />
   <script type="importmap">
     {
       "imports": {
@@ -22,7 +22,7 @@
       <span class="brand-badge" aria-hidden="true">☀️</span>
       <div class="brand-text-wrap">
         <h1 class="brand-title">PhotoPlanner</h1>
-        <span class="brand-tag">3D 1m Engine</span>
+        <span class="brand-tag">3D Viewfinder</span>
       </div>
     </div>
 
@@ -67,11 +67,15 @@
     </form>
 
     <div class="topbar-actions">
+      <button type="button" class="btn-ghost btn-field-card" id="btn-export-field-card" title="Export self-contained offline backcountry Field Card (HTML/Print)">
+        <span aria-hidden="true">📋</span>
+        <span class="action-btn-label">Field Card</span>
+      </button>
       <button type="button" class="btn-ghost" id="btn-open-calendar" popovertarget="annual-calendar-popover" title="Scan 365-day solar keyhole alignments">
         <span aria-hidden="true">📅</span>
         <span class="action-btn-label">Best Dates</span>
       </button>
-      <button type="button" class="btn-ghost" popovertarget="engine-methodology-popover" title="WebGL2 4-Layer Volumetric Atmosphere &amp; Ray Engine Architecture">
+      <button type="button" class="btn-ghost" popovertarget="engine-methodology-popover" title="Raycasted Terrain, Calibrated Corridor Physics &amp; Optional GPU Fluid Lab">
         <span aria-hidden="true">ℹ️</span>
         <span class="action-btn-label">Engine</span>
       </button>
@@ -162,12 +166,22 @@
     </div>
 
     <div class="layers-section">
+      <div class="section-caption">Fog-Sea Elevation Slice (Probabilistic Band)</div>
+      <div class="surface-segment-group" id="layers-fog-band-group" role="group" aria-label="Fog-Sea Elevation Band">
+        <button type="button" class="mode-btn" data-fog-band="p10" title="Optimistic P10 fog-sea lid height">P10 Low</button>
+        <button type="button" class="mode-btn is-active" data-fog-band="p50" title="Expected P50 fog-sea lid height">P50 Lid</button>
+        <button type="button" class="mode-btn" data-fog-band="p90" title="Conservative P90 fog-sea lid height">P90 High</button>
+        <button type="button" class="mode-btn" data-fog-band="off" title="Hide 3D fog-sea elevation plane">Off</button>
+      </div>
+    </div>
+
+    <div class="layers-section">
       <div class="section-caption">3D Layers &amp; Color Key</div>
       <div class="layer-check-list">
         <label class="layer-check-row">
-          <input type="checkbox" id="toggle-atmosphere" checked />
+          <input type="checkbox" id="toggle-atmosphere" />
           <i class="swatch swatch-vp1" aria-hidden="true"></i>
-          <span><strong>3D Fluid Clouds &amp; Cirrus</strong> (1m Volumetric + God-Rays)</span>
+          <span><strong>GPU Fluid Lab (Opt-In)</strong> (Heavy WebGL2 3D Navier-Stokes)</span>
         </label>
         <label class="layer-check-row">
           <input type="checkbox" id="toggle-sightlines" checked />
@@ -184,7 +198,7 @@
           <span><strong>Live Viewshed Heatmap</strong> (Unobstructed LOS)</span>
         </label>
         <label class="layer-check-row">
-          <input type="checkbox" id="toggle-alpenglow-zone" />
+          <input type="checkbox" id="toggle-alpenglow-zone" checked />
           <i class="swatch swatch-alpenglow" aria-hidden="true"></i>
           <span><strong>Alpenglow Landing Zone</strong> (Lit Cliff Highlight)</span>
         </label>
@@ -279,18 +293,18 @@
         </p>
       </section>
 
-      <!-- Unified 4-Layer Physical Atmosphere, Data Provenance & Per-Layer Confidence (Open by default) -->
-      <details class="card weather-card fluid-card" id="fluid-physics-disclosure" open>
+      <!-- Optional GPU Fluid Lab & 4-Layer Atmospheric Column (Collapsed by default; opt-in for heavy GPU sim) -->
+      <details class="card weather-card fluid-card" id="fluid-physics-disclosure">
         <summary class="weather-summary">
           <div class="weather-summary-main">
-            <span class="eyebrow fluid-eyebrow">UNIFIED 4-LAYER ATMOSPHERE • HOVER CLOUDS</span>
+            <span class="eyebrow fluid-eyebrow">ATMOSPHERIC COLUMN • OPT-IN GPU FLUID LAB</span>
             <span class="weather-verdict" id="fluid-regime-title">Multi-Layer Cloud Profile &amp; Provenance</span>
             <span class="weather-summary-sub" id="fluid-summary-sub">
-              0–12.2 km Physical Column • Hover any 3D cloud for confidence
+              Fast Terrain Mode Active • Click GPU Fluid Lab to enable 3D volumetric sim
             </span>
           </div>
           <div class="weather-summary-right">
-            <span class="alpenglow-score-badge fluid-perf-badge" id="fluid-perf-badge">60 FPS</span>
+            <span class="alpenglow-score-badge fluid-perf-badge" id="fluid-perf-badge">Fast Mode</span>
             <span class="disclosure-chevron" aria-hidden="true">▾</span>
           </div>
         </summary>
@@ -326,7 +340,7 @@
               <span class="conf-pill conf-moderate" id="atmo-overall-conf-pill">--% Conf</span>
             </div>
             <p class="atmo-sim-disclosure" id="atmo-sim-disclosure">
-              Layer altitudes, coverage &amp; wind shear come from satellite, METAR &amp; NWP soundings; fine 1m 3D billows &amp; cirrus wisps are physically simulated on GPU.
+              Layer altitudes, coverage &amp; wind shear come from satellite, METAR &amp; NWP soundings; optional WebGL2 Fluid Lab renders fine 3D billows on desktop GPUs.
             </p>
           </div>
 
@@ -335,8 +349,8 @@
             <div class="webcam-sidebar-meta">
               <span class="webcam-swatch-dot" id="webcam-sidebar-swatch" aria-hidden="true"></span>
               <div class="webcam-sidebar-text">
-                <strong id="webcam-sidebar-title">Matching Mountain Webcam…</strong>
-                <span id="webcam-sidebar-sub">PhenoCam / ALERTCalifornia RGB sky chromaticity</span>
+                <strong id="webcam-sidebar-title">Matching Scientific Camera…</strong>
+                <span id="webcam-sidebar-sub">PhenoCam / NEON Scientific Sky Chromaticity</span>
               </div>
             </div>
             <button type="button" class="btn-ghost btn-sm webcam-open-btn" id="btn-sidebar-open-webcam">
@@ -424,11 +438,11 @@
             <div class="sim-tuning-body">
               <div class="fluid-quality-row">
                 <div class="surface-segment-group fluid-quality-group" role="group" aria-label="GPU Raymarch Quality">
-                  <button type="button" class="mode-btn is-active" data-fluid-quality="ultra">Ultra 1m</button>
-                  <button type="button" class="mode-btn" data-fluid-quality="balanced">Balanced</button>
+                  <button type="button" class="mode-btn" data-fluid-quality="ultra">Ultra 1m</button>
+                  <button type="button" class="mode-btn is-active" data-fluid-quality="balanced">Balanced</button>
                   <button type="button" class="mode-btn" data-fluid-quality="performance">Fast</button>
                 </div>
-                <button type="button" class="btn-ghost btn-sm fluid-pause-btn" id="btn-toggle-fluid-evolve">⏸ Pause</button>
+                <button type="button" class="btn-ghost btn-sm fluid-pause-btn" id="btn-toggle-fluid-evolve">▶ Resume</button>
                 <button type="button" class="btn-ghost btn-sm fluid-reset-btn" id="btn-reset-fluid-tuning" title="Reset manual cloud gain multipliers to physical 1:1">↺ Reset</button>
               </div>
 
@@ -470,8 +484,8 @@
         </div>
       </details>
 
-      <!-- On-Demand Disclosure: 380 km Curved-Earth Solar Ray-Path & Alpenglow Forecast -->
-      <details class="card weather-card" id="weather-disclosure">
+      <!-- Open by default: Calibrated 380 km Curved-Earth Solar Ray-Path & Alpenglow Forecast -->
+      <details class="card weather-card" id="weather-disclosure" open>
         <summary class="weather-summary">
           <div class="weather-summary-main">
             <span class="eyebrow" id="weather-corridor-eyebrow">380 KM SOLAR RAY &amp; ALPENGLOW FORECAST</span>
@@ -727,6 +741,15 @@
               ← 3D Orbit <kbd class="hud-kbd">Esc</kbd>
             </button>
 
+            <button
+              type="button"
+              class="toolbar-pill-btn btn-enter-vf-quick"
+              id="btn-enter-vp-vf"
+              title="Enter first-person camera lens viewfinder from active viewpoint (16–200 mm)"
+            >
+              📷 Viewfinder
+            </button>
+
             <div class="mode-group" id="hud-click-mode-group" aria-label="Terrain Click Action">
               <button
                 type="button"
@@ -771,18 +794,26 @@
               class="toolbar-pill-btn webcam-toolbar-pill"
               id="btn-toggle-webcam-drawer"
               aria-expanded="false"
-              title="Side-by-side mountain/coastal webcam ground truth &amp; 3D camera snap"
+              title="Side-by-side scientific webcam ground truth &amp; 3D camera snap"
             >
-              📷 Webcam
+              🔭 Camera
             </button>
           </div>
 
           <div class="hud-cluster-right">
+            <div class="mode-group fog-band-hud" id="hud-fog-band-group" role="group" aria-label="Fog-Sea Elevation Slice Band">
+              <span class="fog-band-hud-label" id="hud-fog-alt-readout" title="Probabilistic 3D fog-sea elevation slice (ft ASL)">Fog P50</span>
+              <button type="button" class="mode-btn" data-fog-band="p10" title="Optimistic P10 fog-sea lid">P10</button>
+              <button type="button" class="mode-btn is-active" data-fog-band="p50" title="Expected P50 fog-sea lid">P50</button>
+              <button type="button" class="mode-btn" data-fog-band="p90" title="Conservative P90 fog-sea lid">P90</button>
+              <button type="button" class="mode-btn" data-fog-band="off" title="Hide 3D fog-sea slice">Off</button>
+            </div>
+
             <button
               type="button"
               class="toolbar-pill-btn hud-weather-pill"
               id="viewport-weather-pill"
-              title="Inspect 380 km Solar Ray Corridor &amp; Multi-Model Weather Telemetry"
+              title="Inspect 380 km Solar Ray Corridor &amp; Calibrated Light Odds"
             >
               🌤️ Loading Sounding…
             </button>
@@ -791,16 +822,17 @@
               type="button"
               class="toolbar-pill-btn gpu-telemetry-pill"
               id="viewport-gpu-pill"
-              title="Inspect Unified 4-Layer Atmospheric Stack &amp; Confidence"
+              aria-pressed="false"
+              title="Toggle optional heavy WebGL2 3D Navier-Stokes Fluid Lab (off by default for fast mobile &amp; desktop terrain)"
             >
-              ⚡ 60 FPS • GPU
+              🧪 Fluid Lab: Off
             </button>
           </div>
         </div>
 
-        <!-- Row 2: Elastic Middle Framing Stage (Viewfinder Reticle, Sightline Inspector, Webcam Split-View, Coords) -->
+        <!-- Row 2: Elastic Middle Framing Stage (Viewfinder Reticle, Lens Bar, Sightline Inspector, Webcam Split-View, Coords) -->
         <div class="viewport-hud-middle">
-          <!-- First-Person Camera Viewfinder Reticle Overlay -->
+          <!-- First-Person Camera Viewfinder Reticle Overlay + Full-Frame Focal-Length Switcher -->
           <div class="viewfinder-overlay" id="viewfinder-overlay" hidden>
             <div class="vf-corner vf-tl"></div>
             <div class="vf-corner vf-tr"></div>
@@ -813,8 +845,19 @@
               <div class="vf-line vf-h2"></div>
               <div class="vf-center-cross"></div>
             </div>
+            <div class="vf-top-lens-bar" id="vf-lens-bar" role="group" aria-label="Full-Frame Camera Focal Length">
+              <span class="vf-lens-label">35mm FF</span>
+              <button type="button" class="vf-lens-btn" data-focal-mm="16">16mm</button>
+              <button type="button" class="vf-lens-btn" data-focal-mm="24">24mm</button>
+              <button type="button" class="vf-lens-btn is-active" data-focal-mm="35">35mm</button>
+              <button type="button" class="vf-lens-btn" data-focal-mm="50">50mm</button>
+              <button type="button" class="vf-lens-btn" data-focal-mm="70">70mm</button>
+              <button type="button" class="vf-lens-btn" data-focal-mm="200">200mm</button>
+              <span class="vf-fov-pill" id="vf-fov-readout">54° × 38°</span>
+              <button type="button" class="vf-lens-btn vf-fieldcard-btn" id="btn-vf-export-field-card" title="Export Offline Backcountry Field Card">📋 Card</button>
+            </div>
             <div class="vf-bottom-hud" id="vf-hud-readout">
-              VP1 VIEWFINDER • 24–50mm • Bearing 117.9° (ESE) • 1.66 mi to Half Dome
+              VP1 VIEWFINDER • 35mm FF • Bearing 117.9° (ESE) • 1.66 mi
             </div>
           </div>
 
@@ -899,7 +942,7 @@
             </div>
 
             <p class="webcam-snap-note" id="webcam-snap-note">
-              Matches Three.js horizontal FOV &amp; compass azimuth so you can compare simulated clouds &amp; Chappuis glow side-by-side or via 3D Ghost Overlay.
+              Matches Three.js horizontal FOV &amp; compass azimuth so you can compare simulated terrain, fog &amp; Chappuis glow side-by-side or via 3D Ghost Overlay.
             </p>
           </aside>
 
@@ -946,11 +989,11 @@
           </div>
         </div>
 
-        <!-- Row 3: Studio 2-Tier Bottom Solar Ephemeris & Timeline Transport Dock -->
+        <!-- Row 3: Studio 2-Tier Bottom Solar & Astro 24-Hour Timeline Transport Dock -->
         <div class="scrubber-dock">
           <div class="scrubber-header-row">
             <div class="scrubber-time-cluster">
-              <label class="slider-label" for="time-scrubber">Solar</label>
+              <label class="slider-label" for="time-scrubber">24h Sky</label>
               <output class="slider-output" id="time-scrubber-output" for="time-scrubber">
                 17:18 • Sunset Golden Hour
               </output>
@@ -966,14 +1009,20 @@
             </div>
 
             <div class="preset-buttons">
+              <button type="button" class="btn-preset" id="btn-jump-dawn-astro" title="Pre-dawn Astro / Milky Way (02:00)">
+                ✨ 02:00
+              </button>
               <button type="button" class="btn-preset" id="btn-jump-sunrise">
                 🌅 Sunrise
               </button>
               <button type="button" class="btn-preset is-active" id="btn-jump-sunset">
                 🌇 Sunset
               </button>
+              <button type="button" class="btn-preset" id="btn-jump-bluehour" title="Evening Blue Hour / Belt of Venus">
+                🌆 Blue Hr
+              </button>
               <button type="button" class="btn-preset" id="btn-jump-night">
-                🌌 Night
+                🌌 Astro
               </button>
               <button type="button" class="btn-preset btn-preset-play" id="btn-play-sun">
                 ▶ Animate
@@ -986,20 +1035,20 @@
               class="slider-input"
               id="time-scrubber"
               type="range"
-              min="330"
-              max="1410"
+              min="0"
+              max="1440"
               value="1038"
               step="1"
-              aria-label="Solar Time Timeline Scrubber"
+              aria-label="Full 24-Hour Solar and Astro Timeline Scrubber"
             />
             <div class="scrubber-ticks" aria-hidden="true">
-              <span>05:30</span>
-              <span>09:00</span>
+              <span>00:00</span>
+              <span>04:00</span>
+              <span>08:00</span>
               <span>12:00</span>
-              <span>15:00</span>
-              <span>18:00</span>
-              <span>21:00</span>
-              <span>23:30</span>
+              <span>16:00</span>
+              <span>20:00</span>
+              <span>24:00</span>
             </div>
           </div>
         </div>
@@ -1007,6 +1056,6 @@
     </section>
   </main>
 
-  <script type="module" src="/app.js?v=20261117c"></script>
+  <script type="module" src="/app.js?v=20261120a"></script>
 </body>
 </html>

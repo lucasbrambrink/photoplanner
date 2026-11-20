@@ -88,6 +88,32 @@ pub struct LightNotch {
     pub alignments: Vec<SolarAlignmentWindow>,
 }
 
+/// Computes the exact 2D DDA ray distance from `(rx, ry)` along unit direction `(dx, dy)`
+/// to exit the current `block_size x block_size` mipmap cell, plus a small `0.05 m` epsilon
+/// so the next step enters the immediately adjacent cell without overshooting narrow ridges.
+#[inline]
+pub(crate) fn block_exit_step(rx: f64, ry: f64, dx: f64, dy: f64, block_size: f64) -> f64 {
+    let tx = if dx > 1e-9 {
+        let next_x = ((rx / block_size).floor() + 1.0) * block_size;
+        (next_x - rx) / dx
+    } else if dx < -1e-9 {
+        let next_x = (rx / block_size).floor() * block_size;
+        (rx - next_x) / (-dx)
+    } else {
+        f64::INFINITY
+    };
+    let ty = if dy > 1e-9 {
+        let next_y = ((ry / block_size).floor() + 1.0) * block_size;
+        (next_y - ry) / dy
+    } else if dy < -1e-9 {
+        let next_y = (ry / block_size).floor() * block_size;
+        (ry - next_y) / (-dy)
+    } else {
+        f64::INFINITY
+    };
+    (tx.min(ty) + 0.05).max(1.0)
+}
+
 /// Casts a single horizon ray from `(origin_lat, origin_lon, z0)` along `azimuth_deg`
 /// using the Hierarchical Max-Mipmap in the 1m near-field and SRTM in the far-field.
 pub fn cast_horizon_ray(
@@ -129,26 +155,27 @@ pub fn cast_horizon_ray(
                 continue;
             }
 
-            // Check Level 4 (16m block) in the Max-Mipmap pyramid
+            // Check Level 4 (16m block) in the Max-Mipmap pyramid with exact DDA cell exit
             let l4 = &grid.levels[4]; // 16m blocks
             let cx16 = ((rx as usize) >> 4).min(l4.width - 1);
             let cy16 = ((ry as usize) >> 4).min(l4.height - 1);
             let block16_max_z = l4.max_z[cy16 * l4.width + cx16] as f64;
-
-            if (block16_max_z - drop - z0) <= max_slope * d {
-                // Skip across the 16m block
-                d += 14.0;
+            let step16 = block_exit_step(rx, ry, dir_east, dir_north, 16.0);
+            let d16_ref = if max_slope >= 0.0 { d } else { d + step16 };
+            if max_slope.is_finite() && (block16_max_z - drop - z0) <= max_slope * d16_ref {
+                d += step16;
                 continue;
             }
 
-            // Check Level 2 (4m block)
+            // Check Level 2 (4m block) with exact DDA cell exit
             let l2 = &grid.levels[2]; // 4m blocks
             let cx4 = ((rx as usize) >> 2).min(l2.width - 1);
             let cy4 = ((ry as usize) >> 2).min(l2.height - 1);
             let block4_max_z = l2.max_z[cy4 * l2.width + cx4] as f64;
-
-            if (block4_max_z - drop - z0) <= max_slope * d {
-                d += 3.5;
+            let step4 = block_exit_step(rx, ry, dir_east, dir_north, 4.0);
+            let d4_ref = if max_slope >= 0.0 { d } else { d + step4 };
+            if max_slope.is_finite() && (block4_max_z - drop - z0) <= max_slope * d4_ref {
+                d += step4;
                 continue;
             }
 
@@ -1817,7 +1844,7 @@ mod tests {
         let center_lon = -119.5332;
         let samples = 120usize;
         let side = samples + 1;
-        let mut srtm_data = vec![1200.0_f32; side * side];
+        let mut srtm_data = vec![1200_i16; side * side];
         for r in 0..side {
             let lat = 38.0 - (r as f64) / (samples as f64);
             for c in 0..side {
@@ -1827,7 +1854,7 @@ mod tests {
                 let dist = (dx * dx + dy * dy).sqrt();
                 let dome = 1400.0 * (-dist * dist / (2.0 * 900.0 * 900.0)).exp();
                 let ridge = 450.0 * (-(dy - 2200.0).powi(2) / (2.0 * 400.0 * 400.0)).exp();
-                srtm_data[r * side + c] = (1150.0 + dome + ridge) as f32;
+                srtm_data[r * side + c] = (1150.0 + dome + ridge).round() as i16;
             }
         }
 
@@ -1943,6 +1970,42 @@ mod tests {
             max_z_diff <= 0.25,
             "Terrain patch GPU vs CPU max elevation diff: {}",
             max_z_diff
+        );
+    }
+
+    #[test]
+    fn test_max_mipmap_narrow_ridge_and_negative_slope() {
+        // Construct a 128x128 1m near-field grid where the observer sits at (64, 64) on a 500 m peak,
+        // surrounded by a 100 m valley, with a narrow 2 m-wide 490 m spire at x = 97..98 (33 m East).
+        // Because all slopes are negative (looking down from 500 m), an unguarded or overshooting
+        // Max-Mipmap skip would jump right past the 2 m spire!
+        let w = 128usize;
+        let h = 128usize;
+        let mut elev = vec![100.0_f32; w * h];
+        elev[64 * w + 64] = 500.0;
+        for y in 62..=66 {
+            elev[y * w + 97] = 490.0;
+            elev[y * w + 98] = 490.0;
+        }
+        let origin_lat = 37.75;
+        let origin_lon = -119.55;
+        let near = MaxMipmapGrid1m::from_1m_elevations(origin_lat, origin_lon, w, h, elev);
+        let (obs_lat, obs_lon) = near.local_m_to_latlon(64.0, 64.0);
+        let terrain = HybridTerrain::new(Some(near), SrtmCache::new(vec![]));
+
+        let sample = cast_horizon_ray(&terrain, obs_lat, obs_lon, 502.0, 90.0, 60.0);
+        // Spire at ~33 m East is 12 m below eye (502 m), slope ~ -12/33 = -0.3636 -> ~ -20 deg.
+        // Without hitting the spire, valley at 100 m gives slope ~ -402/60 = -6.7 -> ~ -81 deg!
+        assert!(
+            sample.horizon_elevation_deg > -25.0,
+            "Max-Mipmap skipped narrow 2m ridge under negative slope! got angle={:.2} deg at d={:.1} m",
+            sample.horizon_elevation_deg,
+            sample.occluder_distance_m
+        );
+        assert!(
+            (sample.occluder_distance_m - 33.0).abs() <= 2.5,
+            "Expected spire hit near 33 m, got {:.1} m",
+            sample.occluder_distance_m
         );
     }
 }

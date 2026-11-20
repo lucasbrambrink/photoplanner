@@ -27,6 +27,7 @@ import hashlib
 import io
 import json
 import math
+import os
 import re
 import threading
 import time
@@ -55,7 +56,7 @@ from .corridor_solver import (
     _is_coastal_california,
     _solar_ephemeris_local,
 )
-from .nwp_corridor import offset_lat_lon_km
+from .nwp_corridor import local_tz_for_lon, offset_lat_lon_km
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 WEBCAM_CACHE_DIR = ROOT_DIR / "data" / "weather_cache" / "webcams"
@@ -330,11 +331,20 @@ def _fetch_url_bytes(url: str, timeout: float = 12.0) -> bytes:
         return resp.read()
 
 
+def is_alertca_proxy_enabled() -> bool:
+    """
+    Commercial-safe default: ALERTCalifornia image/catalog proxying is DISABLED unless explicitly
+    opted in via `PHOTOPLANNER_ENABLE_ALERTCA_PROXY=1` for personal non-commercial testing.
+    """
+    flag = os.environ.get("PHOTOPLANNER_ENABLE_ALERTCA_PROXY", "").strip().lower()
+    return flag in ("1", "true", "yes", "on")
+
+
 def fetch_cached_webcam_jpeg(source: str, identifier: str) -> bytes:
     """
     Safely fetches and caches a JPEG frame from an allowlisted webcam provider:
-      - `source == "phenocam"`: `identifier` is `/data/archive/{site}/{YYYY}/{MM}/{file}.jpg`
-      - `source == "alertca"`: `identifier` is `{camera_id}` (e.g. `mttam-cam01`)
+      - `source == "phenocam"`: `identifier` is `/data/archive/{site}/{YYYY}/{MM}/{file}.jpg` (public scientific archive)
+      - `source == "alertca"`: disabled by default in commercial-safe mode (`PHOTOPLANNER_ENABLE_ALERTCA_PROXY=1` opt-in)
     """
     WEBCAM_FRAMES_DIR.mkdir(parents=True, exist_ok=True)
     if source == "phenocam":
@@ -351,6 +361,11 @@ def fetch_cached_webcam_jpeg(source: str, identifier: str) -> bytes:
         return raw
 
     if source == "alertca":
+        if not is_alertca_proxy_enabled():
+            raise PermissionError(
+                "ALERTCalifornia webcam proxying is disabled in commercial-safe mode. "
+                "Use public PhenoCam/NEON scientific archives or set PHOTOPLANNER_ENABLE_ALERTCA_PROXY=1 for local non-commercial use."
+            )
         cam_id = identifier.strip()
         if not re.match(r"^[A-Za-z0-9_-]{3,64}$", cam_id):
             raise ValueError("Invalid ALERTCalifornia camera ID")
@@ -518,12 +533,14 @@ def _match_phenocam_archive_camera(
     sun_az_deg: float,
     is_today: bool,
     analyze_pixels: bool = True,
+    phase: str = "sunset",
 ) -> dict[str, Any] | None:
     catalog = _get_phenocam_catalog()
     if not catalog:
         return None
 
     date_str = req_date.isoformat()
+    is_sunrise = phase.lower() == "sunrise"
     is_coastal_target = _is_coastal_california(lat, lon)
     is_sierra = elev_m >= 1350.0 and not is_coastal_target
     candidates: list[tuple[float, dict[str, Any], float]] = []
@@ -594,16 +611,25 @@ def _match_phenocam_archive_camera(
     candidates.sort(key=lambda t: t[0])
     target_epoch = int(target_utc.timestamp())
 
+    # Golden-hour + civil-twilight window:
+    #   Sunset:  [-110m, +25m] around sunset  (core [-38m, +14m], ideal -12m)
+    #   Sunrise: [-25m, +110m] around sunrise (core [-14m, +38m], ideal +12m)
+    win_lo_s, win_hi_s = (-1500, 6600) if is_sunrise else (-6600, 1500)
+    core_lo_s, core_hi_s = (-840, 2280) if is_sunrise else (-2280, 840)
+    ideal_offset_s = 720 if is_sunrise else -720
+    core_anchor_s = 480 if is_sunrise else -480
+    peak_center_min = 10.0 if is_sunrise else -10.0
+    peak_lo_min, peak_hi_min = (-14.0, 38.0) if is_sunrise else (-38.0, 14.0)
+
     for _, cam, dist_km in candidates[:8]:
         site = str(cam["Sitename"])
         frames = _list_phenocam_daily_frames(site, req_date, is_today=is_today)
         if not frames:
             continue
 
-        # Select golden-hour + civil-twilight window [-110m, +25m] around target_utc
         win_frames = [
             f for f in frames
-            if -6600 <= (f["epoch_s"] - target_epoch) <= 1500
+            if win_lo_s <= (f["epoch_s"] - target_epoch) <= win_hi_s
         ]
         if not win_frames:
             # Fallback to closest 4 frames to target_utc within 3 hours
@@ -612,17 +638,17 @@ def _match_phenocam_archive_camera(
             if not win_frames or abs(win_frames[0]["epoch_s"] - target_epoch) > 12600:
                 continue
 
-        # Subsample up to 6 timeline frames spanning golden hour through twilight afterglow
+        # Subsample up to 6 timeline frames spanning golden hour through twilight glow
         if len(win_frames) > 6:
             idxs = np.linspace(0, len(win_frames) - 1, 6).round().astype(int)
             timeline = [win_frames[int(i)] for i in sorted(set(idxs))]
         else:
             timeline = list(win_frames)
 
-        # Ensure frames inside the core golden/afterglow window [-38m .. +14m] are included
+        # Ensure frames inside the core golden/twilight window are included
         core_glow_frames = [
             f for f in win_frames
-            if -2280 <= (f["epoch_s"] - target_epoch) <= 840
+            if core_lo_s <= (f["epoch_s"] - target_epoch) <= core_hi_s
         ]
         for cf in core_glow_frames:
             if cf not in timeline:
@@ -631,14 +657,23 @@ def _match_phenocam_archive_camera(
         if len(timeline) > 7:
             # Keep earliest context + core window + latest twilight
             keep_set = {timeline[0]["archive_path"], timeline[-1]["archive_path"]}
-            for cf in sorted(timeline, key=lambda f: abs(f["epoch_s"] - (target_epoch - 480)))[:5]:
+            for cf in sorted(timeline, key=lambda f: abs(f["epoch_s"] - (target_epoch + core_anchor_s)))[:5]:
                 keep_set.add(cf["archive_path"])
             timeline = [f for f in timeline if f["archive_path"] in keep_set]
 
-        ideal_epoch = target_epoch - 720  # -12 min before sunset
+        ideal_epoch = target_epoch + ideal_offset_s
         ordered_fallback = sorted(
             timeline,
-            key=lambda f: abs(f["epoch_s"] - ideal_epoch) + (1200 if f["epoch_s"] > target_epoch + 360 else 0),
+            key=lambda f: abs(f["epoch_s"] - ideal_epoch)
+            + (
+                1200
+                if (
+                    (f["epoch_s"] < target_epoch - 360)
+                    if is_sunrise
+                    else (f["epoch_s"] > target_epoch + 360)
+                )
+                else 0
+            ),
         )
         primary_frame = ordered_fallback[0]
         primary_chroma: dict[str, Any] = {"available": False}
@@ -661,12 +696,12 @@ def _match_phenocam_archive_camera(
                 cand_f["sky_chromaticity"] = ch
                 if ch.get("available") and not ch.get("is_ir_night_mode"):
                     d_min_f = (cand_f["epoch_s"] - target_epoch) / 60.0
-                    in_peak_win = -38.0 <= d_min_f <= 14.0
+                    in_peak_win = peak_lo_min <= d_min_f <= peak_hi_min
                     emp_sc = float(ch.get("empirical_alpenglow_score") or 0.0)
                     rank_val = (
-                        emp_sc - 0.14 * abs(d_min_f + 10.0)
+                        emp_sc - 0.14 * abs(d_min_f - peak_center_min)
                         if in_peak_win
-                        else (emp_sc - 18.0 - 0.30 * abs(d_min_f + 10.0))
+                        else (emp_sc - 18.0 - 0.30 * abs(d_min_f - peak_center_min))
                     )
                     if rank_val > best_peak_val:
                         best_peak_val = rank_val
@@ -678,6 +713,7 @@ def _match_phenocam_archive_camera(
         for f in timeline:
             delta_min = int(round((f["epoch_s"] - target_epoch) / 60.0))
             f["offset_vs_sunset_min"] = delta_min
+            f["offset_vs_event_min"] = delta_min
             f["is_primary"] = f["archive_path"] == primary_frame["archive_path"]
             f["chip_label"] = (
                 f"Peak ({delta_min:+d}m)"
@@ -919,8 +955,8 @@ def fetch_webcam_ground_truth(
     target_utc = target_loc.astimezone(dt.timezone.utc)
 
     cameras: list[dict[str, Any]] = []
-    if not is_past:
-        # Live ridge cameras from ALERTCalifornia (current atmospheric conditions on mountain!)
+    if (not is_past) and is_alertca_proxy_enabled():
+        # Live ridge cameras from ALERTCalifornia (explicitly opted-in non-commercial mode only)
         alert_cams = _match_alertca_live_cameras(
             lat, lon, elev_m, eff_sun_az, analyze_pixels=analyze_pixels
         )
@@ -941,6 +977,7 @@ def fetch_webcam_ground_truth(
         eff_sun_az,
         is_today=(not is_past),
         analyze_pixels=analyze_pixels and (is_past or not cameras),
+        phase="sunset" if is_sunset else "sunrise",
     )
     if pheno_cam is not None:
         cameras.append(pheno_cam)
@@ -948,6 +985,7 @@ def fetch_webcam_ground_truth(
     primary = cameras[0] if cameras else None
     return {
         "available": primary is not None,
+        "commercial_safe_mode": not is_alertca_proxy_enabled(),
         "date": date_str,
         "phase": "sunset" if is_sunset else "sunrise",
         "temporal_mode": "historical_archive" if is_past else ("live_today" if is_today else "live_nowcast_for_future_date"),
@@ -969,11 +1007,13 @@ class _S3RangeFile(io.RawIOBase):
     """Seekable `1 MB` block-cached HTTP `Range:` stream for NREL NSRDB HDF5 files on AWS S3."""
 
     def __init__(self, url: str, size: int, block_size: int = 1048576) -> None:
+        from collections import OrderedDict
+
         self.url = url
         self.size = size
         self.pos = 0
         self.bs = block_size
-        self.cache: dict[int, bytes] = {}
+        self.cache: OrderedDict[int, bytes] = OrderedDict()
 
     def readable(self) -> bool:
         return True
@@ -1001,18 +1041,23 @@ class _S3RangeFile(io.RawIOBase):
         cur, end = self.pos, self.pos + n
         while cur < end:
             blk = cur // self.bs
-            if blk not in self.cache:
+            if blk in self.cache:
+                self.cache.move_to_end(blk)
+            else:
                 b0 = blk * self.bs
                 b1 = min(self.size - 1, b0 + self.bs - 1)
                 req = urllib.request.Request(
                     self.url,
                     headers={"Range": f"bytes={b0}-{b1}", "User-Agent": USER_AGENT},
                 )
-                with urllib.request.urlopen(req, timeout=16.0) as resp:
+                with urllib.request.urlopen(req, timeout=20.0) as resp:
                     self.cache[blk] = resp.read()
-                if len(self.cache) > 48:
-                    oldest = next(iter(self.cache))
-                    self.cache.pop(oldest, None)
+                if len(self.cache) > 160:
+                    # Evict least-recently-used non-header block (keep blk <= 2 superblock/B-tree roots)
+                    for k_ev in list(self.cache.keys()):
+                        if k_ev > 2:
+                            self.cache.pop(k_ev, None)
+                            break
             data = self.cache[blk]
             off = cur - blk * self.bs
             take = min(end - cur, len(data) - off)
@@ -1029,7 +1074,7 @@ def _head_content_length(url: str) -> int:
         return int(resp.headers["Content-Length"])
 
 
-def _get_nsrdb_handles_and_ca_coords(year: int) -> tuple[dict[str, Any], np.ndarray, np.ndarray, np.ndarray] | None:
+def _get_nsrdb_handles_and_conus_coords(year: int) -> tuple[dict[str, Any], np.ndarray, np.ndarray, np.ndarray] | None:
     if h5py is None:
         return None
     with _NSRDB_LOCK:
@@ -1056,26 +1101,63 @@ def _get_nsrdb_handles_and_ca_coords(year: int) -> tuple[dict[str, Any], np.ndar
         hnd = _NSRDB_HANDLES[year]
         if year not in _NSRDB_CA_COORDS:
             NSRDB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            npz_path = NSRDB_CACHE_DIR / f"ca_coords_{year}.npz"
+            npz_path = NSRDB_CACHE_DIR / f"conus_coords_{year}.npz"
             if npz_path.exists():
                 z = np.load(npz_path)
                 _NSRDB_CA_COORDS[year] = (z["gids"], z["lats"], z["lons"])
             else:
-                coords = hnd["hf_irr"]["coordinates"][:]
-                mask = (
-                    (coords[:, 0] >= 32.0)
-                    & (coords[:, 0] <= 42.5)
-                    & (coords[:, 1] >= -125.5)
-                    & (coords[:, 1] <= -114.0)
-                )
-                gids = np.nonzero(mask)[0].astype(np.int32)
-                lats = coords[gids, 0].astype(np.float32)
-                lons = coords[gids, 1].astype(np.float32)
-                np.savez_compressed(npz_path, gids=gids, lats=lats, lons=lons)
-                _NSRDB_CA_COORDS[year] = (gids, lats, lons)
+                hf_irr = hnd["hf_irr"]
+                ref_npz = NSRDB_CACHE_DIR / "conus_coords_2025.npz"
+                reused = False
+                if ref_npz.exists() and "meta" in hf_irr:
+                    z_ref = np.load(ref_npz)
+                    g_ref, la_ref, lo_ref = z_ref["gids"], z_ref["lats"], z_ref["lons"]
+                    n_total = int(hf_irr["meta"].shape[0])
+                    if g_ref.size > 0 and int(g_ref.max()) < n_total:
+                        # Spot-check 3 widely separated grid points to confirm identical v4.0.0 CONUS grid
+                        checks = [0, g_ref.size // 2, g_ref.size - 1]
+                        matches = True
+                        for ci in checks:
+                            gid_c = int(g_ref[ci])
+                            row = hf_irr["meta"][gid_c]
+                            if (
+                                abs(float(row["latitude"]) - float(la_ref[ci])) > 1e-3
+                                or abs(float(row["longitude"]) - float(lo_ref[ci])) > 1e-3
+                            ):
+                                matches = False
+                                break
+                        if matches:
+                            np.savez_compressed(npz_path, gids=g_ref, lats=la_ref, lons=lo_ref)
+                            _NSRDB_CA_COORDS[year] = (g_ref, la_ref, lo_ref)
+                            reused = True
+                if not reused:
+                    if "coordinates" in hf_irr:
+                        coords = hf_irr["coordinates"][:]
+                        lat_all = coords[:, 0]
+                        lon_all = coords[:, 1]
+                    else:
+                        meta = hf_irr["meta"][:]
+                        lat_all = meta["latitude"]
+                        lon_all = meta["longitude"]
+                    mask = (
+                        (lat_all >= 24.0)
+                        & (lat_all <= 50.0)
+                        & (lon_all >= -126.0)
+                        & (lon_all <= -66.0)
+                    )
+                    gids = np.nonzero(mask)[0].astype(np.int32)
+                    lats = lat_all[gids].astype(np.float32)
+                    lons = lon_all[gids].astype(np.float32)
+                    np.savez_compressed(npz_path, gids=gids, lats=lats, lons=lons)
+                    _NSRDB_CA_COORDS[year] = (gids, lats, lons)
 
         gids, lats, lons = _NSRDB_CA_COORDS[year]
         return hnd, gids, lats, lons
+
+
+def _get_nsrdb_handles_and_ca_coords(year: int) -> tuple[dict[str, Any], np.ndarray, np.ndarray, np.ndarray] | None:
+    """Backward-compatible alias returning CONUS NSRDB coordinate lookup."""
+    return _get_nsrdb_handles_and_conus_coords(year)
 
 
 def _read_nsrdb_uint16_series(url: str, ds: Any, i0: int, i1: int, gid: int) -> np.ndarray:
@@ -1086,16 +1168,43 @@ def _read_nsrdb_uint16_series(url: str, ds: Any, i0: int, i1: int, gid: int) -> 
     return np.asarray(ds[i0 : i1 + 1, gid], dtype=np.uint16)
 
 
+def _nearest_nsrdb_gid(
+    gids: np.ndarray, lats: np.ndarray, lons: np.ndarray, target_lat: float, target_lon: float
+) -> tuple[int, float, float] | None:
+    """Fast local bounding-box nearest-pixel lookup across CONUS 2 km grid."""
+    sub = (
+        (lats >= target_lat - 0.35)
+        & (lats <= target_lat + 0.35)
+        & (lons >= target_lon - 0.45)
+        & (lons <= target_lon + 0.45)
+    )
+    if np.any(sub):
+        sub_gids = gids[sub]
+        sub_lats = lats[sub]
+        sub_lons = lons[sub]
+    else:
+        sub_gids, sub_lats, sub_lons = gids, lats, lons
+    cos_lat = math.cos(math.radians(target_lat))
+    idx = int(np.argmin((sub_lats - target_lat) ** 2 + ((sub_lons - target_lon) * cos_lat) ** 2))
+    glat, glon = float(sub_lats[idx]), float(sub_lons[idx])
+    if _haversine_km(target_lat, target_lon, glat, glon) > 25.0:
+        return None
+    return int(sub_gids[idx]), glat, glon
+
+
 def fetch_nsrdb_2km_golden_hour_dni(
     lat: float,
     lon: float,
     elev_m: float,
     date_str: str,
     sun_az_deg: float | None = None,
+    phase: str = "sunset",
 ) -> dict[str, Any] | None:
     """
-    Fetches `2 km`, `5-minute` GOES-18 satellite-derived Direct Normal Irradiance (`dni` vs
-    `clearsky_dni`) from `NREL NSRDB CONUS v4.0.0` for the 2-hour pre-sunset golden-hour window.
+    Fetches `2 km`, `5-minute` GOES satellite-derived Direct Normal Irradiance (`dni` vs
+    `clearsky_dni`) from `NREL NSRDB CONUS v4.0.0` for the 2-hour sunrise or sunset
+    golden-hour window across all of CONUS.
+
     For coastal sunsets, samples both the `0 km` headland/summit `2 km` cell and an `8 km`
     offshore slant-corridor cell along `sun_az_deg` so marine stratus decks and coastal gaps
     are resolved without `31 km` `ERA5` land/ocean blurring.
@@ -1106,9 +1215,11 @@ def fetch_nsrdb_2km_golden_hour_dni(
     year = req_d.year
     if year < 2022 or year > 2025:
         return None
+    is_sunrise = phase.lower() == "sunrise"
+    phase_tag = "sunrise" if is_sunrise else "sunset"
 
     NSRDB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cfile = NSRDB_CACHE_DIR / f"nsrdb_gh_v42_{lat:.3f}_{lon:.3f}_{date_str}.json"
+    cfile = NSRDB_CACHE_DIR / f"nsrdb_gh_v45_{phase_tag}_{lat:.3f}_{lon:.3f}_{date_str}.json"
     if cfile.exists():
         try:
             return json.loads(cfile.read_text(encoding="utf-8"))
@@ -1116,39 +1227,45 @@ def fetch_nsrdb_2km_golden_hour_dni(
             pass
 
     try:
-        res_h = _get_nsrdb_handles_and_ca_coords(year)
+        res_h = _get_nsrdb_handles_and_conus_coords(year)
         if res_h is None:
             return None
         hnd, gids, lats, lons = res_h
 
-        tz_pac = ZoneInfo("America/Los_Angeles")
-        noon_loc = dt.datetime(req_d.year, req_d.month, req_d.day, 12, 0, tzinfo=tz_pac)
+        tz_loc, _ = local_tz_for_lon(lon)
+        noon_loc = dt.datetime(req_d.year, req_d.month, req_d.day, 12, 0, tzinfo=tz_loc)
         tz_off_hr = noon_loc.utcoffset().total_seconds() / 3600.0  # type: ignore[union-attr]
-        _, ss_info = _find_sunrise_sunset_golden_hours(lat, lon, req_d, tz_off_hr)
-        ss_mins = int(ss_info[0])
-        calc_az, _ = _solar_ephemeris_local(lat, lon, req_d, float(ss_mins), tz_off_hr)
+        sr_info, ss_info = _find_sunrise_sunset_golden_hours(lat, lon, req_d, tz_off_hr)
+        ev_mins = int(sr_info[0] if is_sunrise else ss_info[0])
+        calc_az, _ = _solar_ephemeris_local(lat, lon, req_d, float(ev_mins), tz_off_hr)
         eff_az = float(sun_az_deg) if sun_az_deg is not None else float(calc_az)
 
-        ss_loc = dt.datetime(req_d.year, req_d.month, req_d.day, ss_mins // 60, ss_mins % 60, tzinfo=tz_pac)
-        ss_utc = ss_loc.astimezone(dt.timezone.utc).replace(tzinfo=None)
+        ev_loc = dt.datetime(req_d.year, req_d.month, req_d.day, ev_mins // 60, ev_mins % 60, tzinfo=tz_loc)
+        ev_utc = ev_loc.astimezone(dt.timezone.utc).replace(tzinfo=None)
         jan1_utc = dt.datetime(year, 1, 1, 0, 0, 0)
 
-        # 5-minute steps spanning [sunset - 115 min, sunset - 15 min] (sun el ~ 3 deg .. 22 deg)
-        i1 = int((ss_utc - dt.timedelta(minutes=15) - jan1_utc).total_seconds() // 300)
-        i0 = max(0, i1 - 20)
-        if i1 <= i0:
+        ds_len = int(hnd["hf_irr"]["dni"].shape[0])
+        if is_sunrise:
+            # 5-minute steps spanning [sunrise + 15 min, sunrise + 115 min] (sun el ~ 3..22 deg)
+            i0 = max(0, int((ev_utc + dt.timedelta(minutes=15) - jan1_utc).total_seconds() // 300))
+            i1 = min(ds_len - 1, i0 + 20)
+        else:
+            # 5-minute steps spanning [sunset - 115 min, sunset - 15 min] (sun el ~ 3..22 deg)
+            i1 = min(ds_len - 1, int((ev_utc - dt.timedelta(minutes=15) - jan1_utc).total_seconds() // 300))
+            i0 = max(0, i1 - 20)
+        if i1 <= i0 or i0 >= ds_len:
             return None
 
-        cos_lat = math.cos(math.radians(lat))
-        idx0 = int(np.argmin((lats - lat) ** 2 + ((lons - lon) * cos_lat) ** 2))
-        gid0 = int(gids[idx0])
-        grid_lat0, grid_lon0 = float(lats[idx0]), float(lons[idx0])
+        match0 = _nearest_nsrdb_gid(gids, lats, lons, lat, lon)
+        if match0 is None:
+            return None
+        gid0, grid_lat0, grid_lon0 = match0
 
         is_coastal = _is_coastal_california(lat, lon)
         az_rad = math.radians(eff_az)
         off_lat, off_lon = offset_lat_lon_km(lat, lon, 8.0 * math.sin(az_rad), 8.0 * math.cos(az_rad))
-        idx_cor = int(np.argmin((lats - off_lat) ** 2 + ((lons - off_lon) * cos_lat) ** 2))
-        gid_cor = int(gids[idx_cor])
+        match_cor = _nearest_nsrdb_gid(gids, lats, lons, off_lat, off_lon)
+        gid_cor = match_cor[0] if match_cor is not None else gid0
 
         def _eval_gid(gid_val: int) -> tuple[float, float, float]:
             with _NSRDB_LOCK:
@@ -1157,8 +1274,12 @@ def fetch_nsrdb_2km_golden_hour_dni(
             mask = cv >= 75.0
             if not np.any(mask):
                 return 0.0, 0.0, 0.0
-            # Weight later golden-hour steps (closer to low-angle sunset) higher: 0.55 -> 1.45
-            w = np.linspace(0.55, 1.45, int(np.sum(mask)))
+            # Weight steps closest to the horizon (low golden-hour angles) higher
+            w = (
+                np.linspace(1.45, 0.55, int(np.sum(mask)))
+                if is_sunrise
+                else np.linspace(0.55, 1.45, int(np.sum(mask)))
+            )
             ratios = np.clip((dv[mask] / cv[mask]) * 100.0, 0.0, 100.0)
             return (
                 float(np.average(ratios, weights=w)),
@@ -1167,10 +1288,8 @@ def fetch_nsrdb_2km_golden_hour_dni(
             )
 
         pct_0km, dni_m0, cdni_m0 = _eval_gid(gid0)
-        if is_coastal and gid_cor != gid0:
+        if is_coastal and (not is_sunrise) and gid_cor != gid0:
             pct_8km, _, _ = _eval_gid(gid_cor)
-            # For coastal summits above marine fog (elev_m >= 480 m), overhead/summit sun stays lit even when
-            # 8 km offshore sea-level pixel is capped under low stratus; for low bluffs, offshore stratus blocks low sun!
             w_offshore = 0.18 if elev_m >= 480.0 else 0.42
             golden_pct = round((1.0 - w_offshore) * pct_0km + w_offshore * pct_8km, 1)
         else:
@@ -1179,8 +1298,9 @@ def fetch_nsrdb_2km_golden_hour_dni(
 
         out = {
             "available": True,
-            "source": f"NREL NSRDB GOES-18 CONUS v4.0.0 (2 km, 5-min, {year})",
+            "source": f"NREL NSRDB GOES CONUS v4.0.0 (2 km, 5-min, {year})",
             "date": date_str,
+            "phase": phase_tag,
             "gid_0km": gid0,
             "grid_lat": round(grid_lat0, 4),
             "grid_lon": round(grid_lon0, 4),

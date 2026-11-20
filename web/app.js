@@ -48,9 +48,11 @@ const state = {
   isPlayingSun: false,
   showSunBeams: false,
   showLightField: false,
-  showAtmosphere: true,
+  showAtmosphere: false, // Opt-in heavy GPU Fluid Lab (off by default for fast mobile & desktop 3D terrain)
+  fogSliceBand: "p50", // "p10" | "p50" | "p90" | "off" (lightweight 3D fog-sea elevation slice)
+  focalLengthMm: 35, // 16 | 24 | 35 | 50 | 70 | 200 (full-frame 35mm camera lens viewfinder)
   showSightlines: true,
-  highlightLandingZone: false,
+  highlightLandingZone: true,
   webcamReport: null,
   selectedWebcamIdx: 0,
   selectedWebcamFrameIdx: -1,
@@ -175,9 +177,59 @@ overlayScene.add(lightFieldGroup);
 overlayScene.add(sunBeamsGroup);
 overlayScene.add(customPinGroup);
 
-// Initialize GPU WebGL2 Volumetric Atmosphere + Rust WASM 3D Navier-Stokes & 3D Cirrus Engine
+// Initialize optional GPU WebGL2 Volumetric Atmosphere (frozen by default; opt-in via Fluid Lab toggle)
 const volumetricEngine = new VolumetricAtmosphereEngine(renderer, camera);
-volumetricEngine.setQualityMode("ultra");
+volumetricEngine.setQualityMode("balanced");
+volumetricEngine.evolveFluid = false;
+
+// ============================================================================
+// Lightweight 3D Probabilistic Fog-Sea Elevation Slice (P10 / P50 / P90 Band)
+// Runs at 60 FPS on mobile & desktop WebGL with zero fluid solver overhead.
+// ============================================================================
+const fogSeaSliceGroup = new THREE.Group();
+const fogSeaSliceMat = new THREE.ShaderMaterial({
+  transparent: true,
+  depthWrite: false,
+  side: THREE.DoubleSide,
+  uniforms: {
+    uColor: { value: new THREE.Color(0xc8dcf0) },
+    uRimColor: { value: new THREE.Color(0xfbbf24) },
+    uOpacity: { value: 0.42 },
+    uBandTint: { value: 0.5 }, // 0.0 = P10, 0.5 = P50, 1.0 = P90
+  },
+  vertexShader: /* glsl */ `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: /* glsl */ `
+    precision mediump float;
+    varying vec2 vUv;
+    uniform vec3 uColor;
+    uniform vec3 uRimColor;
+    uniform float uOpacity;
+    uniform float uBandTint;
+
+    void main() {
+      vec2 centered = (vUv - 0.5) * 2.0;
+      float r = length(centered);
+      float edgeFade = 1.0 - smoothstep(0.68, 1.0, r);
+      float contourGrid = abs(fract(vUv.x * 16.0) - 0.5) < 0.015 || abs(fract(vUv.y * 16.0) - 0.5) < 0.015 ? 0.08 : 0.0;
+      vec3 col = mix(uColor, uRimColor, 0.14 + contourGrid);
+      float alpha = clamp((uOpacity + contourGrid * 0.45) * edgeFade, 0.0, 0.72);
+      if (alpha < 0.01) discard;
+      gl_FragColor = vec4(col, alpha);
+    }
+  `,
+});
+const fogSeaSliceMesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1, 1, 1), fogSeaSliceMat);
+fogSeaSliceMesh.rotation.x = -Math.PI / 2;
+fogSeaSliceMesh.renderOrder = 2;
+fogSeaSliceMesh.visible = false;
+fogSeaSliceGroup.add(fogSeaSliceMesh);
+atmosphereGroup.add(fogSeaSliceGroup);
 
 // ============================================================================
 // Physical Atmospheric Sky Dome (with Limb-Darkened Solar & Lunar Disks)
@@ -2342,22 +2394,34 @@ function updateValleyLightField(sunDirWorld, elevationDeg) {
 // Interpolate Solar Position & Update Volumetric Sun-Ray Shafts + Sky Glow
 // ============================================================================
 function getSolarAnglesAtMinutes(localMinutes) {
+  const mNorm = ((localMinutes % 1440) + 1440) % 1440;
   const track = state.shootReport?.daily_solar_track;
   if (!track || track.length === 0) {
     return { azimuthDeg: 259.1, elevationDeg: 0.1 };
   }
-  if (localMinutes <= track[0][0]) {
-    return { azimuthDeg: track[0][1], elevationDeg: track[0][2] };
-  }
+  const first = track[0];
   const last = track[track.length - 1];
-  if (localMinutes >= last[0]) {
-    return { azimuthDeg: last[1], elevationDeg: last[2] };
+  if (mNorm <= first[0] || mNorm >= last[0]) {
+    // Smooth nocturnal wrap across local midnight between track[last] and track[0]
+    const gapTotal = Math.max(1.0, (1440 - last[0]) + first[0]);
+    const elapsed = mNorm >= last[0] ? (mNorm - last[0]) : ((1440 - last[0]) + mNorm);
+    const t = Math.max(0, Math.min(1, elapsed / gapTotal));
+    let dAz = first[1] - last[1];
+    if (dAz < -180) dAz += 360;
+    if (dAz > 180) dAz -= 360;
+    const az = (((last[1] + t * dAz) % 360) + 360) % 360;
+    const baseEl = last[2] + t * (first[2] - last[2]);
+    const nightDip = Math.sin(t * Math.PI) * 26.0;
+    return {
+      azimuthDeg: az,
+      elevationDeg: Math.min(baseEl, -4.0) - nightDip,
+    };
   }
   for (let i = 0; i < track.length - 1; i++) {
     const [m0, az0, el0] = track[i];
     const [m1, az1, el1] = track[i + 1];
-    if (localMinutes >= m0 && localMinutes <= m1) {
-      const t = (localMinutes - m0) / Math.max(m1 - m0, 1e-5);
+    if (mNorm >= m0 && mNorm <= m1) {
+      const t = (mNorm - m0) / Math.max(m1 - m0, 1e-5);
       return {
         azimuthDeg: az0 + t * (az1 - az0),
         elevationDeg: el0 + t * (el1 - el0),
@@ -2663,19 +2727,56 @@ function updateSunRaysAndShader() {
 
   if (state.terrainPatch) {
     const minElevM = state.terrainPatch.min_elevation_m ?? 0.0;
-    const fogTopFt = hourlyMet?.fogTopFt ?? inv?.fog_top_ft ?? (wr?.lcl_cloud_base_ft ? wr.lcl_cloud_base_ft - 600 : 1250);
-    const fogBaseFt = inv?.fog_base_ft ?? Math.max(100, fogTopFt - 650);
-    const fogTopM = fogTopFt / 3.28084;
+    const p50Ft =
+      hourlyMet?.fogTopFt ??
+      inv?.fog_top_p50_ft ??
+      inv?.fog_top_ft ??
+      (wr?.lcl_cloud_base_ft ? wr.lcl_cloud_base_ft - 600 : 1250);
+    const p10Ft = inv?.fog_top_p10_ft ?? Math.max(120, p50Ft - 320);
+    const p90Ft = inv?.fog_top_p90_ft ?? (p50Ft + 320);
+    const band = state.fogSliceBand || "p50";
+    const activeFogTopFt = band === "p10" ? p10Ft : band === "p90" ? p90Ft : p50Ft;
+    const fogBaseFt = inv?.fog_base_ft ?? Math.max(80, activeFogTopFt - 650);
+    const fogTopM = activeFogTopFt / 3.28084;
     const fogBaseM = fogBaseFt / 3.28084;
 
     update3DPositionalClouds(sunDirWorld, elevationDeg, minElevM, fogBaseM, fogTopM, mistCov);
+
+    // Lightweight translucent 3D Fog-Sea Elevation Slice (renders in Fast Mode & Fluid Lab Mode)
+    const fogSliceVisible = band !== "off" && activeFogTopFt > (minElevM * 3.28084 + 35);
+    const spanM = state.terrainPatch.span_m || 16000;
+    fogSeaSliceMesh.visible = fogSliceVisible;
+    if (fogSliceVisible) {
+      fogSeaSliceMesh.scale.set(spanM * 1.04, spanM * 1.04, 1);
+      fogSeaSliceMesh.position.set(0, Math.max(8.0, fogTopM - minElevM), 0);
+      const isNight = elevationDeg < -6.0;
+      const isGolden = elevationDeg >= -3.5 && elevationDeg <= 10.5;
+      fogSeaSliceMat.uniforms.uColor.value.setHex(
+        isNight ? 0x1e2d48 : isGolden ? 0xd8c6b8 : 0xc8dcf0
+      );
+      fogSeaSliceMat.uniforms.uRimColor.value.setHex(
+        band === "p90" ? 0xf87171 : band === "p10" ? 0x38bdf8 : isGolden ? 0xfbbf24 : 0x93c5fd
+      );
+      fogSeaSliceMat.uniforms.uBandTint.value = band === "p10" ? 0.0 : band === "p90" ? 1.0 : 0.5;
+      fogSeaSliceMat.uniforms.uOpacity.value = state.showAtmosphere
+        ? 0.16
+        : Math.max(0.22, Math.min(0.56, mistCov * 0.72));
+    }
+
+    const hudFogLabel = document.getElementById("hud-fog-alt-readout");
+    if (hudFogLabel) {
+      const bandLabel = band === "off" ? "Fog Off" : `Fog ${band.toUpperCase()} · ${Math.round(activeFogTopFt).toLocaleString()} ft`;
+      setTextIfChanged(hudFogLabel, "hudFogAlt", bandLabel);
+    }
 
     if (terrainShaderMaterial) {
       terrainShaderMaterial.uniforms.uFogBaseM.value = fogBaseM;
       terrainShaderMaterial.uniforms.uFogTopM.value = fogTopM;
       terrainShaderMaterial.uniforms.uFogStrength.value = state.showAtmosphere
         ? Math.min(0.92, mistCov * 1.1)
-        : 0.0;
+        : band !== "off"
+          ? Math.min(0.62, mistCov * 0.78)
+          : 0.0;
     }
   }
 
@@ -3087,6 +3188,83 @@ function syncWebcamGhostOverlay() {
 }
 
 // ============================================================================
+// Full-Frame 35mm Camera Lens Optics (16 / 24 / 35 / 50 / 70 / 200 mm)
+// ============================================================================
+const FULL_FRAME_FOCAL_LENGTHS = [16, 24, 35, 50, 70, 200];
+
+function focalLengthToFov(focalMm) {
+  const f = Math.max(12, Math.min(400, Number(focalMm) || 35));
+  const vfovDeg = (2.0 * Math.atan(24.0 / (2.0 * f)) * 180.0) / Math.PI;
+  const hfovDeg = (2.0 * Math.atan(36.0 / (2.0 * f)) * 180.0) / Math.PI;
+  return { focalMm: f, vfovDeg, hfovDeg };
+}
+
+function pickRecommendedPrimeMm(focalText) {
+  const m = String(focalText || "").match(/(\d{2,3})/);
+  if (!m) return 35;
+  const raw = parseInt(m[1], 10);
+  let best = 35;
+  let bestDiff = Infinity;
+  for (const prime of FULL_FRAME_FOCAL_LENGTHS) {
+    const diff = Math.abs(prime - raw);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = prime;
+    }
+  }
+  return best;
+}
+
+function updateViewfinderReadout() {
+  if (!vfHudReadout || state.cameraMode === "orbit" || state.cameraMode === "webcam-snap") return;
+  const { focalMm, vfovDeg, hfovDeg } = focalLengthToFov(state.focalLengthMm);
+  const fovReadoutEl = document.getElementById("vf-fov-readout");
+  if (fovReadoutEl) {
+    fovReadoutEl.textContent = `${Math.round(hfovDeg)}° × ${Math.round(vfovDeg)}°`;
+  }
+  const wr = state.weatherReport;
+  const cal = wr?.calibrated_probabilities;
+  const p50 = Math.round(cal?.transmittance_p50_pct ?? wr?.transmittance_p50_pct ?? wr?.ray_transmittance_pct ?? 0);
+  const p10 = Math.round(cal?.transmittance_p10_pct ?? wr?.transmittance_p10_pct ?? 0);
+  const p90 = Math.round(cal?.transmittance_p90_pct ?? wr?.transmittance_p90_pct ?? p50);
+  const lightTag = wr ? `Light ${p10}–${p90}% (P50 ${p50}%)` : "Calibrating Light…";
+
+  if (state.cameraMode === "custom-tripod" && state.customTripodReport) {
+    const rep = state.customTripodReport;
+    vfHudReadout.textContent =
+      `TRIPOD · ${focalMm}mm FF (${Math.round(hfovDeg)}°×${Math.round(vfovDeg)}°) · ${rep.sightline.bearing_to_landmark_deg}° ${rep.sightline.compass_direction} · ${rep.sightline.distance_to_landmark_miles} mi · ${lightTag}`;
+    return;
+  }
+
+  const vpIdx = parseInt(String(state.cameraMode).replace("vp-", ""), 10);
+  const vp = state.shootReport?.top_viewpoints?.[Number.isFinite(vpIdx) ? vpIdx : 0];
+  if (vp) {
+    const vpShort = (vp.viewpoint_label || "").split("(")[0].trim();
+    vfHudReadout.textContent =
+      `VP${vp.viewpoint_rank} ${vpShort} · ${focalMm}mm FF · ${vp.sightline.bearing_to_landmark_deg}° ${vp.sightline.compass_direction} · ${vp.sightline.distance_to_landmark_miles} mi · ${lightTag}`;
+  }
+}
+
+function applyViewfinderFocalLength(focalMm, refreshReadout = true) {
+  const { focalMm: f, vfovDeg, hfovDeg } = focalLengthToFov(focalMm);
+  state.focalLengthMm = f;
+  document.querySelectorAll("#vf-lens-bar [data-focal-mm]").forEach((btn) => {
+    btn.classList.toggle("is-active", Number(btn.dataset.focalMm) === f);
+  });
+  const fovReadoutEl = document.getElementById("vf-fov-readout");
+  if (fovReadoutEl) {
+    fovReadoutEl.textContent = `${Math.round(hfovDeg)}° × ${Math.round(vfovDeg)}°`;
+  }
+  if (state.cameraMode !== "orbit" && state.cameraMode !== "webcam-snap") {
+    camera.fov = Math.max(6.0, Math.min(82.0, vfovDeg));
+    camera.updateProjectionMatrix();
+    volumetricEngine.invalidateTemporalHistory();
+    if (refreshReadout) updateViewfinderReadout();
+    wakeRenderLoop(true);
+  }
+}
+
+// ============================================================================
 // Camera Mode Switching (3D Valley Orbit vs. VP1..VP3 or Custom Tripod Viewfinder)
 // ============================================================================
 function setCameraMode(mode) {
@@ -3190,7 +3368,7 @@ function setCameraMode(mode) {
       (state.selectedWebcamFrameIdx >= 0 && frames[state.selectedWebcamFrameIdx]) ||
       cam.primary_frame;
     if (isPastShootDate(state.date) && activeFrame?.minutes_local != null) {
-      state.currentMinutes = Math.max(330, Math.min(1410, Number(activeFrame.minutes_local)));
+      state.currentMinutes = Math.max(0, Math.min(1440, Number(activeFrame.minutes_local)));
       timeScrubber.value = String(Math.round(state.currentMinutes));
       syncSliderValue(timeScrubber);
     }
@@ -3210,15 +3388,12 @@ function setCameraMode(mode) {
     vpWorld.y = Math.max(vpWorld.y, meshY) + 14;
 
     const targetWorld = latLonElevToWorld(lm.upper_face_lat, lm.upper_face_lon, lm.upper_face_z_m);
-    camera.fov = 34;
-    camera.updateProjectionMatrix();
     camera.position.copy(vpWorld);
     controls.target.copy(targetWorld);
     controls.update();
 
-    const focalShort = (rep.sightline.recommended_focal_length_mm || "").split("(")[0].trim();
     vfOverlay.hidden = false;
-    vfHudReadout.textContent = `CUSTOM TRIPOD · ${focalShort} · ${rep.sightline.bearing_to_landmark_deg}° ${rep.sightline.compass_direction} · ${rep.sightline.distance_to_landmark_miles} mi`;
+    applyViewfinderFocalLength(pickRecommendedPrimeMm(rep.sightline.recommended_focal_length_mm), true);
     return;
   }
 
@@ -3244,16 +3419,12 @@ function setCameraMode(mode) {
     lm.upper_face_z_m
   );
 
-  camera.fov = 34;
-  camera.updateProjectionMatrix();
   camera.position.copy(vpWorld);
   controls.target.copy(targetWorld);
   controls.update();
 
-  const vpShort = (vp.viewpoint_label || "").split("(")[0].trim();
-  const focalShort = (vp.sightline.recommended_focal_length_mm || "").split("(")[0].trim();
   vfOverlay.hidden = false;
-  vfHudReadout.textContent = `VP${vp.viewpoint_rank} · ${vpShort} · ${focalShort} · ${vp.sightline.bearing_to_landmark_deg}° ${vp.sightline.compass_direction} · ${vp.sightline.distance_to_landmark_miles} mi`;
+  applyViewfinderFocalLength(pickRecommendedPrimeMm(vp.sightline.recommended_focal_length_mm), true);
   buildTrailsAndSightlines();
 }
 
@@ -3600,6 +3771,7 @@ function renderWeatherCard(w) {
   renderUnifiedAtmosphereStack(state.activeAtmosphericLayers);
   renderHistoricalReplayPanel(w);
   renderAstroCard(w, state.shootReport);
+  updateViewfinderReadout();
 }
 
 function formatSignedInt(val, suffix = "") {
@@ -5114,12 +5286,72 @@ document.getElementById("toggle-light-field")?.addEventListener("change", (e) =>
   updateSunRaysAndShader();
 });
 
-document.getElementById("toggle-atmosphere")?.addEventListener("change", (e) => {
-  state.showAtmosphere = e.target.checked;
+function syncFluidLabButtons() {
+  const chk = document.getElementById("toggle-atmosphere");
+  if (chk) chk.checked = state.showAtmosphere;
+  const pill = document.getElementById("viewport-gpu-pill");
+  if (pill) {
+    pill.setAttribute("aria-pressed", String(state.showAtmosphere));
+    pill.classList.toggle("is-fluid-active", state.showAtmosphere);
+    if (!state.showAtmosphere) {
+      pill.textContent = "🧪 Fluid Lab: Off";
+    }
+  }
+  const badge = document.getElementById("fluid-perf-badge");
+  if (badge && !state.showAtmosphere) {
+    badge.textContent = "Fast Mode";
+  }
+  const evolveBtn = document.getElementById("btn-toggle-fluid-evolve");
+  if (evolveBtn) {
+    evolveBtn.classList.toggle("is-active", volumetricEngine.evolveFluid);
+    evolveBtn.textContent = volumetricEngine.evolveFluid ? "⏸ Pause" : "▶ Resume";
+  }
+}
+
+function setFluidLabEnabled(enabled) {
+  state.showAtmosphere = Boolean(enabled);
+  volumetricEngine.evolveFluid = state.showAtmosphere;
   if (!state.showAtmosphere) {
     hideCloudHoverTooltip(true);
   }
+  syncFluidLabButtons();
   updateSunRaysAndShader();
+  wakeRenderLoop(true);
+}
+
+function setFogSliceBand(band) {
+  const valid = ["p10", "p50", "p90", "off"].includes(band) ? band : "p50";
+  state.fogSliceBand = valid;
+  document.querySelectorAll("[data-fog-band]").forEach((btn) => {
+    btn.classList.toggle("is-active", btn.dataset.fogBand === valid);
+  });
+  updateSunRaysAndShader();
+  wakeRenderLoop(true);
+}
+
+document.getElementById("toggle-atmosphere")?.addEventListener("change", (e) => {
+  setFluidLabEnabled(e.target.checked);
+});
+
+document.querySelectorAll("[data-fog-band]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    setFogSliceBand(btn.dataset.fogBand);
+  });
+});
+
+document.querySelectorAll("#vf-lens-bar [data-focal-mm]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    applyViewfinderFocalLength(Number(btn.dataset.focalMm), true);
+  });
+});
+
+document.getElementById("btn-enter-vp-vf")?.addEventListener("click", () => {
+  const idx = state.selectedVpIndex >= 0 ? state.selectedVpIndex : 0;
+  if (state.shootReport?.top_viewpoints?.[idx]) {
+    setCameraMode(`vp-${idx}`);
+  } else if (state.customTripodReport) {
+    setCameraMode("custom-tripod");
+  }
 });
 
 document.getElementById("toggle-sightlines").addEventListener("change", (e) => {
@@ -5148,14 +5380,198 @@ document.getElementById("btn-close-inspector").addEventListener("click", () => {
   }
 });
 
+// ============================================================================
+// One-Click Offline Backcountry Field Card Generator (Self-Contained HTML/Print)
+// ============================================================================
+function escapeFieldCardHtml(val) {
+  return String(val ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function buildOfflineFieldCardHtml() {
+  const sr = state.shootReport;
+  const wr = state.weatherReport;
+  const lm = sr?.target_landmark || { name: state.landmark, summit_elevation_ft: 0, vertical_relief_ft: 0, summit_lat: 0, summit_lon: 0 };
+  const cal = wr?.calibrated_probabilities || {};
+  const inv = wr?.inversion_model || {};
+  const mirror = wr?.lake_mirror_reflection || null;
+  const astro = sr?.astro_night_summary || {};
+  const { focalMm, hfovDeg, vfovDeg } = focalLengthToFov(state.focalLengthMm);
+
+  const p10 = Math.round(cal.transmittance_p10_pct ?? wr?.transmittance_p10_pct ?? 0);
+  const p50 = Math.round(cal.transmittance_p50_pct ?? wr?.transmittance_p50_pct ?? wr?.ray_transmittance_pct ?? 0);
+  const p90 = Math.round(cal.transmittance_p90_pct ?? wr?.transmittance_p90_pct ?? p50);
+  const fogP50 = Math.round(inv.fog_top_p50_ft ?? inv.fog_top_ft ?? 0);
+  const fogP10 = Math.round(inv.fog_top_p10_ft ?? Math.max(0, fogP50 - 320));
+  const fogP90 = Math.round(inv.fog_top_p90_ft ?? (fogP50 + 320));
+  const fogVerdict = inv.breakout_verdict || (lm.summit_elevation_ft > fogP50 ? "Above Fog Sea" : "Check Fog Lid");
+
+  const vps = sr?.top_viewpoints || [];
+  const vpRowsHtml = vps.length
+    ? vps
+        .map((vp) => {
+          const sched = vp.schedules?.[0] || {};
+          const hrs = Math.floor((vp.hike_duration_to_vp_minutes || 0) / 60);
+          const mins = (vp.hike_duration_to_vp_minutes || 0) % 60;
+          const dur = hrs > 0 ? `${hrs}h ${mins}m` : `${mins}m`;
+          return `
+            <tr>
+              <td><strong>VP${escapeFieldCardHtml(vp.viewpoint_rank)}</strong> ${escapeFieldCardHtml(vp.viewpoint_label)}</td>
+              <td>${escapeFieldCardHtml(vp.trailhead_name)}<br><small>${vp.hike_distance_to_vp_miles} mi · +${Math.round(vp.elevation_gain_to_vp_feet || 0).toLocaleString()} ft · ${dur}</small></td>
+              <td>${vp.sightline?.bearing_to_landmark_deg ?? "--"}° ${escapeFieldCardHtml(vp.sightline?.compass_direction || "")}<br><small>${vp.sightline?.distance_to_landmark_miles ?? "--"} mi · ${escapeFieldCardHtml(vp.sightline?.recommended_focal_length_mm || "")}</small></td>
+              <td>Depart <strong>${escapeFieldCardHtml(sched.recommended_trailhead_departure_local || "--:--")}</strong><br>Peak <strong>${escapeFieldCardHtml(sched.peak_light_local || "--:--")}</strong> (${escapeFieldCardHtml(sched.shooting_window_local || "--")})</td>
+            </tr>`;
+        })
+        .join("")
+    : `<tr><td colspan="4">No viewpoint trails loaded yet.</td></tr>`;
+
+  const customTripodSection = state.customTripodReport
+    ? `<section class="card">
+         <h2>Active Custom Tripod Sightline</h2>
+         <p><strong>GPS:</strong> ${state.customTripodReport.tripod_lat.toFixed(5)}, ${state.customTripodReport.tripod_lon.toFixed(5)} · <strong>Elev:</strong> ${Math.round(state.customTripodReport.tripod_elevation_ft).toLocaleString()} ft ASL · <strong>Bearing:</strong> ${state.customTripodReport.sightline?.bearing_to_landmark_deg}° ${escapeFieldCardHtml(state.customTripodReport.sightline?.compass_direction)} · <strong>Distance:</strong> ${state.customTripodReport.sightline?.distance_to_landmark_miles} mi · <strong>Lens:</strong> ${escapeFieldCardHtml(state.customTripodReport.sightline?.recommended_focal_length_mm)}</p>
+       </section>`
+    : "";
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>PhotoPlanner Field Card — ${escapeFieldCardHtml(lm.name)} (${escapeFieldCardHtml(state.date)})</title>
+<style>
+  :root { color-scheme: dark light; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: #0b101b; color: #e2e8f0; line-height: 1.45; }
+  .sheet { max-width: 860px; margin: 0 auto; display: grid; gap: 16px; }
+  header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; border-bottom: 1px solid #263248; padding-bottom: 14px; }
+  h1 { margin: 0; font-size: 1.45rem; color: #f8fafc; }
+  .meta { font-size: 0.85rem; color: #94a3b8; margin-top: 4px; }
+  .badge { padding: 6px 12px; border-radius: 999px; background: #1e293b; border: 1px solid #f59e0b; color: #fde68a; font-weight: 700; font-size: 0.85rem; white-space: nowrap; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
+  .card { background: #121a2b; border: 1px solid #233047; border-radius: 10px; padding: 14px; }
+  h2 { margin: 0 0 8px; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.08em; color: #94a3b8; }
+  .big { font-size: 1.25rem; font-weight: 800; color: #f8fafc; font-variant-numeric: tabular-nums; }
+  .sub { font-size: 0.82rem; color: #cbd5e1; margin-top: 4px; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #233047; vertical-align: top; }
+  th { color: #94a3b8; font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.06em; }
+  footer { font-size: 0.75rem; color: #64748b; display: flex; justify-content: space-between; border-top: 1px solid #233047; padding-top: 10px; }
+  @media print {
+    body { background: #ffffff; color: #0f172a; padding: 0; }
+    .card { background: #ffffff; border-color: #cbd5e1; }
+    h1, .big { color: #0f172a; }
+    .badge { background: #fef3c7; color: #92400e; }
+    th, td { border-color: #cbd5e1; }
+  }
+</style>
+</head>
+<body>
+  <div class="sheet">
+    <header>
+      <div>
+        <h1>${escapeFieldCardHtml(lm.name)} — Backcountry Field Card</h1>
+        <div class="meta">Date: <strong>${escapeFieldCardHtml(state.date)}</strong> · Phase: <strong>${escapeFieldCardHtml(wr?.phase || "Sunset")}</strong> · GPS: ${Number(lm.summit_lat || 0).toFixed(5)}, ${Number(lm.summit_lon || 0).toFixed(5)} · Summit: ${Math.round(lm.summit_elevation_ft || 0).toLocaleString()} ft ASL</div>
+      </div>
+      <div class="badge">Alpenglow ${wr?.alpenglow_score ?? "--"}/100 · ${focalMm}mm FF</div>
+    </header>
+
+    <div class="grid">
+      <section class="card">
+        <h2>Calibrated Light Odds (380 km)</h2>
+        <div class="big">P50 ${p50}% <small style="font-weight:600;color:#94a3b8;">(P10 ${p10}% – P90 ${p90}%)</small></div>
+        <div class="sub">${escapeFieldCardHtml(wr?.verdict || "Evaluating")} · ${wr?.color_temperature_kelvin ?? 2400} K · Gate: ${escapeFieldCardHtml(wr?.corridor_raycast?.dominant_blocker_label || "Clear")}</div>
+      </section>
+      <section class="card">
+        <h2>Probabilistic Fog-Sea Lid</h2>
+        <div class="big">${fogP50.toLocaleString()} ft <small style="font-weight:600;color:#94a3b8;">(${fogP10.toLocaleString()}–${fogP90.toLocaleString()} ft)</small></div>
+        <div class="sub">${escapeFieldCardHtml(fogVerdict)} · Cloud-Sea ${inv.cloud_sea_score ?? "--"}/100 · Under-Deck ${inv.under_deck_score ?? "--"}/100</div>
+      </section>
+      <section class="card">
+        <h2>Active Lens &amp; Sky Setup</h2>
+        <div class="big">${focalMm}mm Full-Frame</div>
+        <div class="sub">FOV ${Math.round(hfovDeg)}° H × ${Math.round(vfovDeg)}° V · Sun Az ${wr?.sun_azimuth_deg ?? "--"}° ${escapeFieldCardHtml(wr?.corridor_direction || "")} · Temp ${wr?.temp_sunset_f ?? "--"}°F</div>
+      </section>
+      <section class="card">
+        <h2>Astro &amp; Reflection Window</h2>
+        <div class="big">${escapeFieldCardHtml(astro.dark_sky_window_local || "Check Night Tab")}</div>
+        <div class="sub">Moon: ${escapeFieldCardHtml(astro.moon_phase_label || "--")} (${astro.moon_illumination_pct ?? "--"}%) · Terrain Moonset: ${escapeFieldCardHtml(astro.terrain_moonset_local || "--")}${mirror ? ` · Mirror Index ${Math.round(mirror.mirror_index || 0)}/100` : ""}</div>
+      </section>
+    </div>
+
+    ${customTripodSection}
+
+    <section class="card">
+      <h2>Top Viewpoints &amp; Trailhead Schedule</h2>
+      <table>
+        <thead>
+          <tr><th>Viewpoint</th><th>Trailhead &amp; Hike</th><th>Bearing &amp; Optics</th><th>Timing</th></tr>
+        </thead>
+        <tbody>${vpRowsHtml}</tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>Atmospheric Briefing</h2>
+      <p style="margin:0;font-size:0.86rem;">${escapeFieldCardHtml(wr?.recommendation || "No forecast recommendation loaded.")}</p>
+    </section>
+
+    <footer>
+      <span>Generated offline by PhotoPlanner 3D (Calibrated Corridor + Raycast Engine)</span>
+      <span>Snapshot: ${new Date().toISOString().slice(0, 16).replace("T", " ")} UTC · Ready for Airplane Mode / Print</span>
+    </footer>
+  </div>
+</body>
+</html>`;
+}
+
+function exportOfflineFieldCard() {
+  const html = buildOfflineFieldCardHtml();
+  const slug = String(state.landmark || "shoot")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_|_$/g, "");
+  const filename = `PhotoPlanner_FieldCard_${slug}_${state.date || "today"}.html`;
+  const blob = new Blob([html], { type: "text/html;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+document.getElementById("btn-export-field-card")?.addEventListener("click", exportOfflineFieldCard);
+document.getElementById("btn-vf-export-field-card")?.addEventListener("click", exportOfflineFieldCard);
+
+const btnDawnAstro = document.getElementById("btn-jump-dawn-astro");
 const btnSunrise = document.getElementById("btn-jump-sunrise");
 const btnSunset = document.getElementById("btn-jump-sunset");
+const btnBlueHour = document.getElementById("btn-jump-bluehour");
 const btnNight = document.getElementById("btn-jump-night");
+const timePresetBtns = [btnDawnAstro, btnSunrise, btnSunset, btnBlueHour, btnNight].filter(Boolean);
+
+function markActiveTimePreset(activeBtn) {
+  timePresetBtns.forEach((b) => b.classList.toggle("is-active", b === activeBtn));
+}
+
+btnDawnAstro?.addEventListener("click", () => {
+  markActiveTimePreset(btnDawnAstro);
+  const mins = 2 * 60; // 02:00 pre-dawn Milky Way / Astro
+  state.currentMinutes = mins;
+  timeScrubber.value = String(mins);
+  syncSliderValue(timeScrubber);
+  const astroDetails = document.getElementById("astro-disclosure");
+  if (astroDetails) astroDetails.open = true;
+  updateSunRaysAndShader();
+});
 
 btnSunrise.addEventListener("click", () => {
-  btnSunrise.classList.add("is-active");
-  btnSunset.classList.remove("is-active");
-  btnNight?.classList.remove("is-active");
+  markActiveTimePreset(btnSunrise);
   const sunriseWin = state.shootReport?.golden_hour_windows?.find((w) =>
     w.phase.toLowerCase().includes("sunrise")
   );
@@ -5168,9 +5584,7 @@ btnSunrise.addEventListener("click", () => {
 });
 
 btnSunset.addEventListener("click", () => {
-  btnSunset.classList.add("is-active");
-  btnSunrise.classList.remove("is-active");
-  btnNight?.classList.remove("is-active");
+  markActiveTimePreset(btnSunset);
   const sunsetWin = state.shootReport?.golden_hour_windows?.find((w) =>
     w.phase.toLowerCase().includes("sunset")
   );
@@ -5182,20 +5596,30 @@ btnSunset.addEventListener("click", () => {
   updateSunRaysAndShader();
 });
 
+btnBlueHour?.addEventListener("click", () => {
+  markActiveTimePreset(btnBlueHour);
+  const sunsetWin = state.shootReport?.golden_hour_windows?.find((w) =>
+    w.phase.toLowerCase().includes("sunset")
+  );
+  const sunsetMins = sunsetWin ? parseHHMMToMinutes(sunsetWin.peak_time_local) : 17 * 60 + 18;
+  const mins = Math.min(1435, sunsetMins + 24);
+  state.currentMinutes = mins;
+  timeScrubber.value = String(mins);
+  syncSliderValue(timeScrubber);
+  updateSunRaysAndShader();
+});
+
 btnNight?.addEventListener("click", () => {
-  btnNight.classList.add("is-active");
-  btnSunrise.classList.remove("is-active");
-  btnSunset.classList.remove("is-active");
+  markActiveTimePreset(btnNight);
   const astro = state.shootReport?.astro_night_summary;
   const peakStr =
     astro?.galactic_core_peak_local ||
     astro?.lunar_alpenglow_window?.peak_time_local ||
     astro?.terrain_moonset_local ||
     "21:45";
-  let mins = parseHHMMToMinutes(peakStr);
-  if (mins < 720) mins = 22 * 60 + 15;
-  state.currentMinutes = mins;
-  timeScrubber.value = String(mins);
+  const mins = parseHHMMToMinutes(peakStr);
+  state.currentMinutes = Math.max(0, Math.min(1440, mins));
+  timeScrubber.value = String(Math.round(state.currentMinutes));
   syncSliderValue(timeScrubber);
   const astroDetails = document.getElementById("astro-disclosure");
   if (astroDetails) astroDetails.open = true;
@@ -5424,9 +5848,9 @@ const viewportGpuPill = document.getElementById("viewport-gpu-pill");
 });
 
 viewportGpuPill?.addEventListener("click", () => {
-  if (fluidDisclosure) {
+  setFluidLabEnabled(!state.showAtmosphere);
+  if (state.showAtmosphere && fluidDisclosure) {
     fluidDisclosure.open = true;
-    fluidDisclosure.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
 });
 
@@ -5550,19 +5974,21 @@ volumetricEngine.onTelemetryCallback = (tel) => {
 
   const stepStr = (tel.stepMs || 0.28).toFixed(2);
   const solverTag = tel.gpuFluidActive ? "GPU 128×128×48 Fluid" : "WASM Fluid (Worker)";
-  if (!isRenderLoopSleeping) {
+  if (!isRenderLoopSleeping && state.showAtmosphere) {
     if (fluidPerfBadge) {
       fluidPerfBadge.textContent = `${Math.round(rollingFps)} FPS`;
       fluidPerfBadge.title = `${solverTag} Step: ${stepStr} ms`;
     }
     if (viewportGpuPill) {
-      viewportGpuPill.textContent = `⚡ ${Math.round(rollingFps)} FPS · ${stepStr}ms`;
+      viewportGpuPill.textContent = `🧪 Fluid Lab: ${Math.round(rollingFps)} FPS`;
     }
   }
   if (fluidSummarySub) {
     const overallConf = state.activeAtmosphericLayers?.overall_confidence_pct;
     const confTag = typeof overallConf === "number" ? `${Math.round(overallConf)}% Conf` : "Hover clouds";
-    fluidSummarySub.textContent = `0–${topKm} km Column • Low ${lowPct}% / High ${highPct}% • ${confTag}`;
+    fluidSummarySub.textContent = state.showAtmosphere
+      ? `0–${topKm} km Column • Low ${lowPct}% / High ${highPct}% • ${confTag}`
+      : `Fast Terrain Mode Active • Low ${lowPct}% / High ${highPct}% • ${confTag}`;
   }
 };
 
@@ -5705,10 +6131,10 @@ function animate(nowMs = performance.now()) {
     fpsAccumFrames = 0;
     fpsAccumMs = 0;
     if (fluidPerfBadge) {
-      fluidPerfBadge.textContent = "Idle (0W)";
+      fluidPerfBadge.textContent = state.showAtmosphere ? "Idle (0W)" : "Fast Mode";
     }
     if (viewportGpuPill) {
-      viewportGpuPill.textContent = "⚡ Idle · 0 GPU";
+      viewportGpuPill.textContent = state.showAtmosphere ? "🧪 Fluid Lab: Idle" : "🧪 Fluid Lab: Off";
     }
     return;
   }
@@ -5738,11 +6164,17 @@ function animate(nowMs = performance.now()) {
       : "WASM Fluid (Worker)";
     const tierSuffix = isHighRateActive ? "" : " (Eco)";
     if (fluidPerfBadge) {
-      fluidPerfBadge.textContent = `${Math.round(rollingFps)} FPS${tierSuffix}`;
-      fluidPerfBadge.title = `${solverTag} Step: ${stepStr} ms`;
+      fluidPerfBadge.textContent = state.showAtmosphere
+        ? `${Math.round(rollingFps)} FPS${tierSuffix}`
+        : `Fast ${Math.round(rollingFps)} FPS`;
+      fluidPerfBadge.title = state.showAtmosphere
+        ? `${solverTag} Step: ${stepStr} ms`
+        : "Lightweight Raycasted 3D Terrain & Fog-Sea Mode";
     }
     if (viewportGpuPill) {
-      viewportGpuPill.textContent = `⚡ ${Math.round(rollingFps)} FPS · ${stepStr}ms`;
+      viewportGpuPill.textContent = state.showAtmosphere
+        ? `🧪 Fluid Lab: ${Math.round(rollingFps)} FPS`
+        : "🧪 Fluid Lab: Off";
     }
   }
 
@@ -5755,9 +6187,9 @@ function animate(nowMs = performance.now()) {
   }
 
   if (state.isPlayingSun) {
-    state.currentMinutes += 0.65;
-    if (state.currentMinutes > 1410) {
-      state.currentMinutes = 330;
+    state.currentMinutes += 0.8;
+    if (state.currentMinutes >= 1440) {
+      state.currentMinutes = 0;
     }
     timeScrubber.value = String(Math.round(state.currentMinutes));
     syncSliderValue(timeScrubber);
@@ -5777,5 +6209,6 @@ function animate(nowMs = performance.now()) {
   volumetricEngine.renderPipeline(worldScene, overlayScene, dtRealS, state.showAtmosphere);
 }
 
+syncFluidLabButtons();
 ensureRenderLoopRunning();
 loadLandmarkScenario();

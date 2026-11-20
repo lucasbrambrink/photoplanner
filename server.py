@@ -22,11 +22,19 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
+from planner.gpx_trail_analyzer import analyze_uploaded_trail
 from planner.weather import (
     BENCHMARK_REPORT_JSON_PATH,
+    EXPERIMENTS_DIR,
     SUMMARY_JSON_PATH,
+    VERIFICATION_HTML_PATH,
+    create_watchlist_rule,
+    delete_watchlist_rule,
+    evaluate_watchlist_rule_live,
     fetch_cached_webcam_jpeg,
     fetch_webcam_ground_truth,
+    hunt_regional_light,
+    list_watchlist_rules,
     run_full_backtest_suite,
     solve_weather_and_corridor,
 )
@@ -872,45 +880,54 @@ def build_sf_peninsula_tripod_los(
     return json.dumps(payload).encode("utf-8")
 
 
+def _should_use_rust_general_engine() -> bool:
+    """Returns True when the compiled Rust engine and recreation trail DB are available."""
+    return RUST_BIN.exists() and RECREATION_DB.exists()
+
+
 def run_shoot_landmark(landmark: str, date_str: str, max_miles: float, top_k: int) -> bytes:
     cache_key = f"shoot:{landmark}:{date_str}:{max_miles}:{top_k}"
     if cache_key in _CACHE:
         return _CACHE[cache_key]
 
+    if _should_use_rust_general_engine():
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            cmd = [
+                str(RUST_BIN),
+                "--elevation-dir",
+                str(ELEVATION_DIR),
+                "--recreation-db",
+                str(RECREATION_DB),
+                "shoot-landmark",
+                "--landmark",
+                landmark,
+                "--date",
+                date_str,
+                "--max-miles",
+                str(max_miles),
+                "--top-k",
+                str(top_k),
+                "--json-out",
+                str(tmp_path),
+            ]
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            data = tmp_path.read_bytes()
+            _CACHE[cache_key] = data
+            return data
+        except subprocess.CalledProcessError:
+            if landmark not in SF_PENINSULA_LANDMARKS:
+                raise
+        finally:
+            if tmp_path.exists():
+                os.remove(tmp_path)
+
     if landmark in SF_PENINSULA_LANDMARKS:
         data = build_sf_peninsula_shoot_report(landmark, date_str)
         _CACHE[cache_key] = data
         return data
-
-    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
-        tmp_path = Path(tmp.name)
-
-    try:
-        cmd = [
-            str(RUST_BIN),
-            "--elevation-dir",
-            str(ELEVATION_DIR),
-            "--recreation-db",
-            str(RECREATION_DB),
-            "shoot-landmark",
-            "--landmark",
-            landmark,
-            "--date",
-            date_str,
-            "--max-miles",
-            str(max_miles),
-            "--top-k",
-            str(top_k),
-            "--json-out",
-            str(tmp_path),
-        ]
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-        data = tmp_path.read_bytes()
-        _CACHE[cache_key] = data
-        return data
-    finally:
-        if tmp_path.exists():
-            os.remove(tmp_path)
+    raise RuntimeError(f"Landmark {landmark!r} requires recreation database at {RECREATION_DB}")
 
 
 def run_shoot_coordinate(
@@ -920,44 +937,48 @@ def run_shoot_coordinate(
     if cache_key in _CACHE:
         return _CACHE[cache_key]
 
+    if _should_use_rust_general_engine():
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            cmd = [
+                str(RUST_BIN),
+                "--elevation-dir",
+                str(ELEVATION_DIR),
+                "--recreation-db",
+                str(RECREATION_DB),
+                "shoot-coordinate",
+                "--lat",
+                f"{lat:.5f}",
+                "--lon",
+                f"{lon:.5f}",
+                "--name",
+                name,
+                "--date",
+                date_str,
+                "--max-miles",
+                str(max_miles),
+                "--top-k",
+                str(top_k),
+                "--json-out",
+                str(tmp_path),
+            ]
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            data = tmp_path.read_bytes()
+            _CACHE[cache_key] = data
+            return data
+        except subprocess.CalledProcessError:
+            if not is_sf_peninsula_coord(lat, lon):
+                raise
+        finally:
+            if tmp_path.exists():
+                os.remove(tmp_path)
+
     if is_sf_peninsula_coord(lat, lon):
         data = build_sf_peninsula_shoot_report(name, date_str, custom_lat=lat, custom_lon=lon)
         _CACHE[cache_key] = data
         return data
-
-    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
-        tmp_path = Path(tmp.name)
-
-    try:
-        cmd = [
-            str(RUST_BIN),
-            "--elevation-dir",
-            str(ELEVATION_DIR),
-            "--recreation-db",
-            str(RECREATION_DB),
-            "shoot-coordinate",
-            "--lat",
-            f"{lat:.5f}",
-            "--lon",
-            f"{lon:.5f}",
-            "--name",
-            name,
-            "--date",
-            date_str,
-            "--max-miles",
-            str(max_miles),
-            "--top-k",
-            str(top_k),
-            "--json-out",
-            str(tmp_path),
-        ]
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-        data = tmp_path.read_bytes()
-        _CACHE[cache_key] = data
-        return data
-    finally:
-        if tmp_path.exists():
-            os.remove(tmp_path)
+    raise RuntimeError(f"Coordinate shoot plan requires recreation database at {RECREATION_DB}")
 
 
 def run_tripod_los(
@@ -975,46 +996,50 @@ def run_tripod_los(
     if cache_key in _CACHE:
         return _CACHE[cache_key]
 
+    if _should_use_rust_general_engine():
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            cmd = [
+                str(RUST_BIN),
+                "--elevation-dir",
+                str(ELEVATION_DIR),
+                "--recreation-db",
+                str(RECREATION_DB),
+                "tripod-los",
+                "--tripod-lat",
+                f"{tripod_lat:.5f}",
+                "--tripod-lon",
+                f"{tripod_lon:.5f}",
+                "--target-lat",
+                f"{target_lat:.5f}",
+                "--target-lon",
+                f"{target_lon:.5f}",
+                "--target-name",
+                target_name,
+                "--date",
+                date_str,
+                "--json-out",
+                str(tmp_path),
+            ]
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            data = tmp_path.read_bytes()
+            _CACHE[cache_key] = data
+            return data
+        except subprocess.CalledProcessError:
+            if not (is_sf_peninsula_coord(tripod_lat, tripod_lon) or is_sf_peninsula_coord(target_lat, target_lon)):
+                raise
+        finally:
+            if tmp_path.exists():
+                os.remove(tmp_path)
+
     if is_sf_peninsula_coord(tripod_lat, tripod_lon) or is_sf_peninsula_coord(target_lat, target_lon):
         data = build_sf_peninsula_tripod_los(
             tripod_lat, tripod_lon, target_lat, target_lon, target_name, date_str
         )
         _CACHE[cache_key] = data
         return data
-
-    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
-        tmp_path = Path(tmp.name)
-
-    try:
-        cmd = [
-            str(RUST_BIN),
-            "--elevation-dir",
-            str(ELEVATION_DIR),
-            "--recreation-db",
-            str(RECREATION_DB),
-            "tripod-los",
-            "--tripod-lat",
-            f"{tripod_lat:.5f}",
-            "--tripod-lon",
-            f"{tripod_lon:.5f}",
-            "--target-lat",
-            f"{target_lat:.5f}",
-            "--target-lon",
-            f"{target_lon:.5f}",
-            "--target-name",
-            target_name,
-            "--date",
-            date_str,
-            "--json-out",
-            str(tmp_path),
-        ]
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-        data = tmp_path.read_bytes()
-        _CACHE[cache_key] = data
-        return data
-    finally:
-        if tmp_path.exists():
-            os.remove(tmp_path)
+    raise RuntimeError(f"Tripod LOS analysis requires recreation database at {RECREATION_DB}")
 
 
 def _sample_raster_numpy_2d(
@@ -1436,6 +1461,101 @@ class PhotoPlannerHandler(BaseHTTPRequestHandler):
                 self._send_json(data, cache_control="public, max-age=3600")
                 return
 
+            if path == "/api/regional-hunt":
+                date_str = qs.get("date", [default_date])[0]
+                phase = qs.get("phase", ["sunset"])[0]
+                region = qs.get("region", [None])[0]
+                lat_raw = qs.get("lat", [None])[0]
+                lon_raw = qs.get("lon", [None])[0]
+                radius_mi = float(qs.get("radius_miles", ["120.0"])[0])
+                max_spots = int(qs.get("max_spots", ["8"])[0])
+                replay_mode = qs.get("replay_mode", ["auto"])[0]
+                hunt_key = f"hunt:{date_str}:{phase}:{region}:{lat_raw}:{lon_raw}:{radius_mi}:{max_spots}:{replay_mode}"
+                now_m = time.monotonic()
+                cached_h = _WEATHER_TTL_CACHE.get(hunt_key)
+                if cached_h and (now_m - cached_h[0]) < 600.0:
+                    self._send_json(cached_h[1], cache_control="public, max-age=600")
+                    return
+                res_hunt = hunt_regional_light(
+                    date_str=date_str,
+                    phase=phase,
+                    region=region,
+                    center_lat=float(lat_raw) if lat_raw is not None else None,
+                    center_lon=float(lon_raw) if lon_raw is not None else None,
+                    radius_miles=radius_mi,
+                    max_spots=max_spots,
+                    replay_mode=replay_mode,
+                )
+                payload_h = json.dumps(res_hunt).encode("utf-8")
+                _WEATHER_TTL_CACHE[hunt_key] = (now_m, payload_h)
+                self._send_json(payload_h, cache_control="public, max-age=600")
+                return
+
+            if path == "/api/backtest-report":
+                if VERIFICATION_HTML_PATH.exists():
+                    html_bytes = VERIFICATION_HTML_PATH.read_bytes()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(html_bytes)))
+                    self.send_header("Cache-Control", "no-cache")
+                    self.end_headers()
+                    self.wfile.write(html_bytes)
+                    return
+                self._send_json(
+                    json.dumps({"error": "No verification_report.html generated yet. Run scripts/run_weather_backtest.py."}).encode("utf-8"),
+                    status=404,
+                )
+                return
+
+            if path == "/api/backtest-experiments":
+                exps = []
+                if EXPERIMENTS_DIR.exists():
+                    for p in sorted(EXPERIMENTS_DIR.glob("*.json"), reverse=True)[:25]:
+                        try:
+                            d = json.loads(p.read_text(encoding="utf-8"))
+                            exps.append(
+                                {
+                                    "run_id": d.get("run_id"),
+                                    "suite": d.get("suite"),
+                                    "git_sha": d.get("git_sha"),
+                                    "generated_at_utc": d.get("generated_at_utc"),
+                                    "n_events_scored": d.get("n_events_scored"),
+                                    "overall_independent_raw": d.get("overall_independent_raw"),
+                                }
+                            )
+                        except Exception:
+                            continue
+                self._send_json(json.dumps({"experiments": exps}).encode("utf-8"))
+                return
+
+            if path == "/api/watchlists":
+                self._send_json(json.dumps({"watchlists": list_watchlist_rules()}).encode("utf-8"))
+                return
+
+            if path == "/api/alerts/evaluate":
+                date_str = qs.get("date", [default_date])[0]
+                replay_mode = qs.get("replay_mode", ["auto"])[0]
+                rule_id = qs.get("rule_id", [None])[0]
+                rules = [r for r in list_watchlist_rules() if r["enabled"]]
+                if rule_id:
+                    rules = [r for r in rules if r["id"] == rule_id]
+                evals = []
+                for r in rules:
+                    evals.extend(evaluate_watchlist_rule_live(r, date_str=date_str, replay_mode=replay_mode))
+                self._send_json(
+                    json.dumps(
+                        {
+                            "date": date_str,
+                            "n_rules": len(rules),
+                            "triggered": [e for e in evals if e["decision"] == "TRIGGER"],
+                            "watching": [e for e in evals if e["decision"] == "WATCH"],
+                            "suppressed": [e for e in evals if e["decision"] == "SUPPRESS"],
+                            "evaluations": evals,
+                        }
+                    ).encode("utf-8")
+                )
+                return
+
             if path == "/api/webcam-truth":
                 lat = float(qs.get("lat", ["37.5945"])[0])
                 lon = float(qs.get("lon", ["-122.5028"])[0])
@@ -1470,6 +1590,10 @@ class PhotoPlannerHandler(BaseHTTPRequestHandler):
                 ident = qs.get("path", qs.get("id", [""]))[0]
                 try:
                     jpg = fetch_cached_webcam_jpeg(source, ident)
+                except PermissionError as p_err:
+                    err = json.dumps({"error": str(p_err)}).encode("utf-8")
+                    self._send_json(err, status=403)
+                    return
                 except ValueError as v_err:
                     err = json.dumps({"error": str(v_err)}).encode("utf-8")
                     self._send_json(err, status=400)
@@ -1516,6 +1640,105 @@ class PhotoPlannerHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             err = json.dumps({"error": str(exc)}).encode("utf-8")
             self._send_json(err, status=500)
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path
+        qs = parse_qs(parsed.query)
+
+        try:
+            if path == "/api/trail-upload":
+                content_len = int(self.headers.get("Content-Length", "0"))
+                if content_len <= 0 or content_len > 10 * 1024 * 1024:
+                    self._send_json(
+                        json.dumps({"error": "Body must be non-empty and <= 10 MB."}).encode("utf-8"),
+                        status=400,
+                    )
+                    return
+                raw_body = self.rfile.read(content_len).decode("utf-8", errors="replace")
+                ctype = (self.headers.get("Content-Type") or "").lower()
+                date_str = qs.get("date", [None])[0]
+                phase = qs.get("phase", ["sunset"])[0]
+                setup_buf = int(qs.get("setup_buffer_min", ["25"])[0])
+                replay_mode = qs.get("replay_mode", ["auto"])[0]
+                include_weather = qs.get("include_weather", ["1"])[0] != "0"
+
+                if "xml" in ctype or raw_body.lstrip().startswith("<"):
+                    res = analyze_uploaded_trail(
+                        gpx_xml=raw_body,
+                        date_str=date_str,
+                        phase=phase,
+                        setup_buffer_min=setup_buf,
+                        replay_mode=replay_mode,
+                        include_weather=include_weather,
+                    )
+                else:
+                    body_json = json.loads(raw_body)
+                    if not isinstance(body_json, dict):
+                        raise ValueError("JSON request body must be an object.")
+                    if "gpx_xml" in body_json or "geojson" in body_json:
+                        res = analyze_uploaded_trail(
+                            gpx_xml=body_json.get("gpx_xml"),
+                            geojson=body_json.get("geojson"),
+                            date_str=body_json.get("date", date_str),
+                            phase=body_json.get("phase", phase),
+                            setup_buffer_min=int(body_json.get("setup_buffer_min", setup_buf)),
+                            replay_mode=str(body_json.get("replay_mode", replay_mode)),
+                            include_weather=bool(body_json.get("include_weather", include_weather)),
+                        )
+                    else:
+                        # Treat raw GeoJSON object directly
+                        res = analyze_uploaded_trail(
+                            geojson=body_json,
+                            date_str=date_str,
+                            phase=phase,
+                            setup_buffer_min=setup_buf,
+                            replay_mode=replay_mode,
+                            include_weather=include_weather,
+                        )
+                self._send_json(json.dumps(res).encode("utf-8"))
+                return
+
+            if path == "/api/watchlists":
+                content_len = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(max(0, content_len)).decode("utf-8") or "{}")
+                created = create_watchlist_rule(
+                    name=str(body.get("name", "")),
+                    spot_id=body.get("spot_id"),
+                    region=body.get("region"),
+                    lat=float(body["lat"]) if body.get("lat") is not None else None,
+                    lon=float(body["lon"]) if body.get("lon") is not None else None,
+                    elev_m=float(body["elev_m"]) if body.get("elev_m") is not None else None,
+                    phase=str(body.get("phase", "sunset")),
+                    target_phenomena=body.get("target_phenomena"),
+                    min_calibrated_p50_pct=float(body.get("min_calibrated_p50_pct", 50.0)),
+                    min_above_fog_prob_pct=float(body.get("min_above_fog_prob_pct", 0.0)),
+                    min_mirror_index=float(body.get("min_mirror_index", 0.0)),
+                    min_opportunity_score=float(body.get("min_opportunity_score", 65.0)),
+                    lead_window=str(body.get("lead_window", "24h")),
+                )
+                self._send_json(json.dumps(created).encode("utf-8"), status=201)
+                return
+
+            if path == "/api/watchlists/delete":
+                content_len = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(max(0, content_len)).decode("utf-8") or "{}")
+                deleted = delete_watchlist_rule(str(body.get("id", "")))
+                self._send_json(json.dumps({"deleted": deleted}).encode("utf-8"))
+                return
+
+            self._send_json(json.dumps({"error": f"Unknown POST route: {path}"}).encode("utf-8"), status=404)
+        except ValueError as v_err:
+            self._send_json(json.dumps({"error": str(v_err)}).encode("utf-8"), status=400)
+        except Exception as exc:
+            self._send_json(json.dumps({"error": str(exc)}).encode("utf-8"), status=500)
 
 
 if __name__ == "__main__":

@@ -64,6 +64,9 @@ pub trait ElevationSurface: Send + Sync {
 }
 
 /// Represents a loaded binary SRTM `.hgt` / `.hgt.gz` tile (SRTM1 3601x3601, SRTM3 1201x1201, or compact ocean tile).
+///
+/// Elevations are stored as signed 16-bit integer meters (`i16`, range `-32768..32767 m`),
+/// matching native SRTM precision while cutting per-tile RAM usage by 50% (26 MB vs 52 MB for SRTM1).
 #[derive(Debug, Clone)]
 pub struct SrtmTile {
     pub tile_name: String,
@@ -71,12 +74,18 @@ pub struct SrtmTile {
     pub lon_floor: i32,
     /// Number of intervals per degree (1200 for SRTM3, 3600 for SRTM1, or 4 for open-ocean sea-level tile)
     pub samples: usize,
-    /// Row-major grid of `(samples + 1) * (samples + 1)` heights in meters
-    pub data: Vec<f32>,
+    /// Row-major grid of `(samples + 1) * (samples + 1)` heights in integer meters (`i16`)
+    pub data: Vec<i16>,
 }
 
 impl SrtmTile {
-    /// Compact sea-level (`0.0 m`) representation for open-ocean 1°x1° cells (works seamlessly on CPU and Metal GPU).
+    /// Returns true if this is a lightweight sea-level ocean tile (`samples <= 4`, ~50 bytes).
+    #[inline]
+    pub fn is_ocean_tile(&self) -> bool {
+        self.samples <= 4
+    }
+
+    /// Compact sea-level (`0 m`) representation for open-ocean 1°x1° cells (works seamlessly on CPU and Metal GPU).
     pub fn ocean_tile(lat_floor: i32, lon_floor: i32) -> Self {
         let samples = 4usize;
         let side = samples + 1;
@@ -85,7 +94,7 @@ impl SrtmTile {
             lat_floor,
             lon_floor,
             samples,
-            data: vec![0.0_f32; side * side],
+            data: vec![0_i16; side * side],
         }
     }
 
@@ -128,28 +137,23 @@ impl SrtmTile {
         };
 
         let side = samples + 1;
-        let mut raw = Vec::with_capacity(side * side);
+        let n_cells = side * side;
+        let mut data = Vec::with_capacity(n_cells);
         let mut cursor = Cursor::new(bytes);
-        for _ in 0..(side * side) {
-            raw.push(cursor.read_i16::<BigEndian>()?);
+        for _ in 0..n_cells {
+            data.push(cursor.read_i16::<BigEndian>()?);
         }
 
-        // Convert to f32 meters and repair SRTM void values (-32768) via iterative wavefront flood-fill
+        // Repair SRTM void values (-32768) in-place via iterative wavefront flood-fill
         // so large sheer-cliff radar shadow voids (e.g., Half Dome, El Capitan, Glacier Point) are smoothly
         // reconstructed from their surrounding rim elevations instead of becoming sinkholes.
-        let mut data = vec![0.0_f32; side * side];
-        let mut valid = vec![false; side * side];
         let mut void_indices = Vec::new();
         let mut valid_sum = 0.0_f64;
         let mut valid_count = 0usize;
 
-        for idx in 0..(side * side) {
-            let v = raw[idx];
+        for (idx, &v) in data.iter().enumerate() {
             if v != -32768 {
-                let vf = v as f32;
-                data[idx] = vf;
-                valid[idx] = true;
-                valid_sum += vf as f64;
+                valid_sum += v as f64;
                 valid_count += 1;
             } else {
                 void_indices.push(idx);
@@ -162,7 +166,7 @@ impl SrtmTile {
                 break;
             }
             let mut next_voids = Vec::new();
-            let mut newly_filled: Vec<(usize, f32)> = Vec::new();
+            let mut newly_filled: Vec<(usize, i16)> = Vec::new();
 
             for &idx in &void_indices {
                 let r = idx / side;
@@ -179,8 +183,9 @@ impl SrtmTile {
                         let nr = (r as isize + dr).clamp(0, (side - 1) as isize) as usize;
                         let nc = (c as isize + dc).clamp(0, (side - 1) as isize) as usize;
                         let nidx = nr * side + nc;
-                        if valid[nidx] {
-                            let nv = data[nidx];
+                        let nv_raw = data[nidx];
+                        if nv_raw != -32768 {
+                            let nv = nv_raw as f32;
                             sum += nv;
                             if nv > max_neighbor {
                                 max_neighbor = nv;
@@ -193,7 +198,10 @@ impl SrtmTile {
                 if count > 0 {
                     let avg = sum / (count as f32);
                     // Bias slightly toward upper rim in steep radar-shadow voids
-                    newly_filled.push((idx, 0.65 * avg + 0.35 * max_neighbor));
+                    let filled = (0.65 * avg + 0.35 * max_neighbor)
+                        .round()
+                        .clamp(-32767.0, 32767.0) as i16;
+                    newly_filled.push((idx, filled));
                 } else {
                     next_voids.push(idx);
                 }
@@ -204,22 +212,21 @@ impl SrtmTile {
             }
             for (idx, val) in newly_filled {
                 data[idx] = val;
-                valid[idx] = true;
             }
             void_indices = next_voids;
         }
 
         // Any disconnected void region (e.g. offshore ocean expanse or isolated void) defaults to
-        // sea level (0.0 m) unless the tile is predominantly high-elevation land.
-        let fallback_elev = if valid_count > 0 {
-            let mean_v = (valid_sum / valid_count as f64) as f32;
-            if mean_v > 250.0 && valid_count * 2 > side * side {
-                mean_v
+        // sea level (0 m) unless the tile is predominantly high-elevation land.
+        let fallback_elev: i16 = if valid_count > 0 {
+            let mean_v = valid_sum / valid_count as f64;
+            if mean_v > 250.0 && valid_count * 2 > n_cells {
+                mean_v.round().clamp(-32767.0, 32767.0) as i16
             } else {
-                0.0
+                0
             }
         } else {
-            0.0
+            0
         };
         for idx in void_indices {
             data[idx] = fallback_elev;
@@ -308,13 +315,18 @@ impl SrtmTile {
 }
 
 /// Manages a collection of SRTM `.hgt` / `.hgt.gz` tiles for Far-Field Horizon lookups (5–220 km),
-/// with optional on-demand fetching & local disk caching from AWS Terrain Tiles (`skadi` SRTM1).
+/// with optional on-demand fetching & local disk caching from AWS Terrain Tiles (`skadi` SRTM1)
+/// and optional bounded LRU eviction of full land tiles (`i16`, ~26 MB each) for persistent workers.
 #[derive(Debug, Default)]
 pub struct SrtmCache {
     pub search_dirs: Vec<PathBuf>,
     pub remote_cache_dir: Option<PathBuf>,
     pub allow_remote_fetch: bool,
     pub tiles: HashMap<(i32, i32), SrtmTile>,
+    /// Optional cap on full land tiles kept resident in RAM (lightweight 50-byte ocean tiles are exempt).
+    pub max_land_tiles: Option<usize>,
+    lru_clock: u64,
+    tile_last_used: HashMap<(i32, i32), u64>,
 }
 
 impl SrtmCache {
@@ -324,6 +336,9 @@ impl SrtmCache {
             remote_cache_dir: None,
             allow_remote_fetch: false,
             tiles: HashMap::new(),
+            max_land_tiles: None,
+            lru_clock: 0,
+            tile_last_used: HashMap::new(),
         }
     }
 
@@ -339,7 +354,64 @@ impl SrtmCache {
             remote_cache_dir: Some(remote_cache_dir),
             allow_remote_fetch: true,
             tiles: HashMap::new(),
+            max_land_tiles: None,
+            lru_clock: 0,
+            tile_last_used: HashMap::new(),
         }
+    }
+
+    /// Sets an LRU eviction cap on full (non-ocean) SRTM land tiles kept resident in memory.
+    pub fn with_max_land_tiles(mut self, max_tiles: usize) -> Self {
+        self.max_land_tiles = Some(max_tiles.max(1));
+        self
+    }
+
+    /// Number of full land tiles currently cached (excluding 50-byte sea-level ocean tiles).
+    pub fn land_tile_count(&self) -> usize {
+        self.tiles.values().filter(|t| !t.is_ocean_tile()).count()
+    }
+
+    /// Approximate RAM footprint in megabytes for all cached SRTM tile elevation buffers (`i16`).
+    pub fn resident_mb(&self) -> f64 {
+        let bytes: usize = self
+            .tiles
+            .values()
+            .map(|t| t.data.len() * std::mem::size_of::<i16>())
+            .sum();
+        (bytes as f64) / (1024.0 * 1024.0)
+    }
+
+    fn touch_tile(&mut self, key: (i32, i32)) {
+        self.lru_clock = self.lru_clock.wrapping_add(1);
+        self.tile_last_used.insert(key, self.lru_clock);
+    }
+
+    /// Evicts least-recently-used land tiles (never evicting `pinned` keys) until `land_tile_count <= max_land_tiles`.
+    /// Returns the number of evicted tiles.
+    pub fn evict_lru_except(&mut self, pinned: &HashSet<(i32, i32)>) -> usize {
+        let Some(limit) = self.max_land_tiles else {
+            return 0;
+        };
+        let current_land = self.land_tile_count();
+        if current_land <= limit {
+            return 0;
+        }
+        let excess = current_land - limit;
+        let mut candidates: Vec<((i32, i32), u64)> = self
+            .tiles
+            .iter()
+            .filter(|(k, t)| !t.is_ocean_tile() && !pinned.contains(k))
+            .map(|(k, _)| (*k, self.tile_last_used.get(k).copied().unwrap_or(0)))
+            .collect();
+        candidates.sort_by_key(|&(_, ts)| ts);
+
+        let mut evicted = 0usize;
+        for (key, _) in candidates.into_iter().take(excess) {
+            self.tiles.remove(&key);
+            self.tile_last_used.remove(&key);
+            evicted += 1;
+        }
+        evicted
     }
 
     pub fn tile_name(lat_floor: i32, lon_floor: i32) -> String {
@@ -444,7 +516,7 @@ impl SrtmCache {
                     resp.into_reader().read_to_end(&mut gz_bytes)?;
                     return save_and_parse(&gz_bytes);
                 }
-                Err(ureq::Error::Status(code, _)) if code == 404 || code == 403 => {
+                Err(ureq::Error::Status(code, _)) if code == 404 => {
                     return mark_ocean();
                 }
                 Err(_) => {}
@@ -483,7 +555,7 @@ impl SrtmCache {
                         return save_and_parse(&gz_bytes);
                     }
                 }
-            } else if status_code == 404 || status_code == 403 {
+            } else if status_code == 404 {
                 let _ = std::fs::remove_file(&tmp_dl);
                 return mark_ocean();
             }
@@ -493,7 +565,9 @@ impl SrtmCache {
     }
 
     pub fn preload_tile(&mut self, lat_floor: i32, lon_floor: i32) -> Result<bool> {
-        if self.tiles.contains_key(&(lat_floor, lon_floor)) {
+        let key = (lat_floor, lon_floor);
+        if self.tiles.contains_key(&key) {
+            self.touch_tile(key);
             return Ok(true);
         }
         if let Some(tile) = Self::load_or_fetch_single_tile(
@@ -503,20 +577,32 @@ impl SrtmCache {
             lat_floor,
             lon_floor,
         )? {
-            self.tiles.insert((lat_floor, lon_floor), tile);
+            self.tiles.insert(key, tile);
+            self.touch_tile(key);
+            let mut pinned = HashSet::with_capacity(1);
+            pinned.insert(key);
+            self.evict_lru_except(&pinned);
             return Ok(true);
         }
         Ok(false)
     }
 
-    pub fn preload_tiles_parallel(&mut self, coords: &[(i32, i32)]) {
-        let missing: Vec<(i32, i32)> = coords
-            .iter()
-            .copied()
-            .filter(|k| !self.tiles.contains_key(k))
-            .collect();
+    /// Preloads missing tiles in parallel, updates LRU timestamps for all requested tiles,
+    /// evicts stale land tiles beyond `max_land_tiles` (never evicting `coords`), and returns
+    /// `(newly_loaded, evicted)`.
+    pub fn preload_tiles_parallel_tracked(&mut self, coords: &[(i32, i32)]) -> (usize, usize) {
+        let mut missing = Vec::new();
+        let mut pinned = HashSet::with_capacity(coords.len());
+        for &k in coords {
+            pinned.insert(k);
+            if self.tiles.contains_key(&k) {
+                self.touch_tile(k);
+            } else {
+                missing.push(k);
+            }
+        }
         if missing.is_empty() {
-            return;
+            return (0, 0);
         }
         let search_dirs = self.search_dirs.clone();
         let remote_cache_dir = self.remote_cache_dir.clone();
@@ -538,12 +624,26 @@ impl SrtmCache {
             })
             .collect();
 
+        let n_loaded = loaded.len();
         for (k, tile) in loaded {
             self.tiles.insert(k, tile);
+            self.touch_tile(k);
         }
+        let n_evicted = self.evict_lru_except(&pinned);
+        (n_loaded, n_evicted)
     }
 
-    pub fn preload_bbox(&mut self, min_lat: f64, min_lon: f64, max_lat: f64, max_lon: f64) {
+    pub fn preload_tiles_parallel(&mut self, coords: &[(i32, i32)]) {
+        let _ = self.preload_tiles_parallel_tracked(coords);
+    }
+
+    pub fn preload_bbox_tracked(
+        &mut self,
+        min_lat: f64,
+        min_lon: f64,
+        max_lat: f64,
+        max_lon: f64,
+    ) -> (usize, usize) {
         let lat0 = min_lat.floor() as i32;
         let lat1 = max_lat.floor() as i32;
         let lon0 = min_lon.floor() as i32;
@@ -554,19 +654,22 @@ impl SrtmCache {
                 coords.push((lat, lon));
             }
         }
-        self.preload_tiles_parallel(&coords);
+        self.preload_tiles_parallel_tracked(&coords)
+    }
+
+    pub fn preload_bbox(&mut self, min_lat: f64, min_lon: f64, max_lat: f64, max_lon: f64) {
+        let _ = self.preload_bbox_tracked(min_lat, min_lon, max_lat, max_lon);
     }
 
     /// Preloads all 1°x1° SRTM tiles intersected along rays up to `max_distance_km` from `(origin_lat, origin_lon)`.
-    /// If `az_sector_deg` is `Some((az_center_deg, half_width_deg))`, restricts far-field tile preloading
-    /// beyond 45 km to that solar azimuth wedge while keeping a full 360° ring inside 45 km.
-    pub fn preload_corridor_wedge(
+    /// Returns `(newly_loaded, evicted)` for cache coherence tracking in persistent workers.
+    pub fn preload_corridor_wedge_tracked(
         &mut self,
         origin_lat: f64,
         origin_lon: f64,
         max_distance_km: f64,
         az_sector_deg: Option<(f64, f64)>,
-    ) {
+    ) -> (usize, usize) {
         let m_per_lat = METERS_PER_DEG_LAT;
         let m_per_lon = meters_per_deg_lon(origin_lat).max(1.0);
         let mut needed: HashSet<(i32, i32)> = HashSet::new();
@@ -603,7 +706,25 @@ impl SrtmCache {
 
         let mut coords: Vec<(i32, i32)> = needed.into_iter().collect();
         coords.sort_unstable();
-        self.preload_tiles_parallel(&coords);
+        self.preload_tiles_parallel_tracked(&coords)
+    }
+
+    /// Preloads all 1°x1° SRTM tiles intersected along rays up to `max_distance_km` from `(origin_lat, origin_lon)`.
+    /// If `az_sector_deg` is `Some((az_center_deg, half_width_deg))`, restricts far-field tile preloading
+    /// beyond 45 km to that solar azimuth wedge while keeping a full 360° ring inside 45 km.
+    pub fn preload_corridor_wedge(
+        &mut self,
+        origin_lat: f64,
+        origin_lon: f64,
+        max_distance_km: f64,
+        az_sector_deg: Option<(f64, f64)>,
+    ) {
+        let _ = self.preload_corridor_wedge_tracked(
+            origin_lat,
+            origin_lon,
+            max_distance_km,
+            az_sector_deg,
+        );
     }
 }
 
@@ -934,6 +1055,12 @@ impl HybridTerrain {
             far_srtm,
         }
     }
+
+    /// Assigns a fresh monotonic `cache_id` so GPU/Metal resident caches rebuild when
+    /// persistent worker tiles or near-field 1m grids change.
+    pub fn bump_cache_id(&mut self) {
+        self.cache_id = NEXT_HYBRID_TERRAIN_ID.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl ElevationSurface for HybridTerrain {
@@ -1187,4 +1314,95 @@ fn decode_arcgis_f32_geotiff(
     }
     Ok((img_w, img_h, flipped))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_synthetic_land_tile(lat_floor: i32, lon_floor: i32, elev_m: i16) -> SrtmTile {
+        let samples = 1200usize;
+        let side = samples + 1;
+        SrtmTile {
+            tile_name: SrtmCache::tile_name(lat_floor, lon_floor),
+            lat_floor,
+            lon_floor,
+            samples,
+            data: vec![elev_m; side * side],
+        }
+    }
+
+    #[test]
+    fn srtm_i16_storage_and_void_repair() {
+        assert_eq!(std::mem::size_of::<i16>(), 2);
+        let side = 1201usize;
+        let n_cells = side * side;
+        let mut raw = Vec::with_capacity(n_cells * 2);
+        let void_idx = 600 * side + 600;
+        let void_idx_2 = 600 * side + 601;
+        for idx in 0..n_cells {
+            let val: i16 = if idx == void_idx || idx == void_idx_2 {
+                -32768
+            } else {
+                1200
+            };
+            raw.extend_from_slice(&val.to_be_bytes());
+        }
+
+        let tile = SrtmTile::load_from_bytes(&raw, "N37W120".to_string(), 37, -120)
+            .expect("synthetic SRTM3 tile should parse");
+        assert!(!tile.is_ocean_tile());
+        assert_eq!(tile.data.len(), n_cells);
+        assert_eq!(tile.data[void_idx], 1200);
+        assert_eq!(tile.data[void_idx_2], 1200);
+        let sampled = tile.sample_bilinear_m(37.5, -119.5);
+        assert!((sampled - 1200.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn srtm_lru_evicts_oldest_land_tiles_and_exempts_ocean() {
+        let mut cache = SrtmCache::new(Vec::<PathBuf>::new()).with_max_land_tiles(2);
+        let k1 = (37, -120);
+        let k2 = (37, -119);
+        let k3 = (38, -120);
+        let k_ocean = (37, -124);
+
+        cache.tiles.insert(k1, make_synthetic_land_tile(37, -120, 1500));
+        cache.touch_tile(k1);
+        cache.tiles.insert(k2, make_synthetic_land_tile(37, -119, 2500));
+        cache.touch_tile(k2);
+        cache.tiles.insert(k_ocean, SrtmTile::ocean_tile(37, -124));
+        cache.touch_tile(k_ocean);
+        assert_eq!(cache.land_tile_count(), 2);
+
+        // Re-touch k1 so k2 becomes the least-recently-used land tile
+        cache.touch_tile(k1);
+        cache.tiles.insert(k3, make_synthetic_land_tile(38, -120, 1800));
+        cache.touch_tile(k3);
+
+        let mut pinned = HashSet::new();
+        pinned.insert(k3);
+        let evicted = cache.evict_lru_except(&pinned);
+        assert_eq!(evicted, 1);
+        assert_eq!(cache.land_tile_count(), 2);
+        assert!(cache.tiles.contains_key(&k1), "recently touched tile must stay");
+        assert!(cache.tiles.contains_key(&k3), "pinned tile must stay");
+        assert!(!cache.tiles.contains_key(&k2), "LRU land tile should be evicted");
+        assert!(
+            cache.tiles.contains_key(&k_ocean),
+            "tiny ocean tiles must be exempt from eviction"
+        );
+        // 2 SRTM3 i16 tiles = 2 * 1201 * 1201 * 2 bytes ~= 5.5 MB
+        let mb = cache.resident_mb();
+        assert!(mb > 5.0 && mb < 6.0, "unexpected resident_mb: {}", mb);
+    }
+
+    #[test]
+    fn hybrid_terrain_bump_cache_id_increments() {
+        let mut terrain = HybridTerrain::new(None, SrtmCache::new(Vec::<PathBuf>::new()));
+        let id0 = terrain.cache_id;
+        terrain.bump_cache_id();
+        assert!(terrain.cache_id > id0);
+    }
+}
+
 

@@ -65,6 +65,11 @@ from .nwp_corridor import (
     fetch_24h_corridor_and_models,
     offset_lat_lon_km,
 )
+from .calibration import (
+    DEFAULT_CALIBRATION_MODEL_PATH,
+    evaluate_calibration_out_of_sample,
+    save_calibration_bundle,
+)
 from .raob_sounding import fetch_raob_sounding
 from .station_obs import fetch_nearest_station_observation
 from .webcam_truth import (
@@ -610,7 +615,7 @@ def _evaluate_corridor_nowcast_event(
     """
     BACKTEST_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     leads_tag = "_".join(f"{x:.1f}" for x in lead_hours_list)
-    ev_cache = BACKTEST_CACHE_DIR / f"nc_ev_v44_{ev['id']}_{leads_tag}.json"
+    ev_cache = BACKTEST_CACHE_DIR / f"nc_ev_v45_{ev['id']}_{leads_tag}.json"
     if (not refresh) and ev_cache.exists():
         try:
             cached = json.loads(ev_cache.read_text(encoding="utf-8"))
@@ -1010,7 +1015,7 @@ def _evaluate_multisensor_solver_event(ev: dict[str, Any], refresh: bool = False
     `PhenoCam` / `NEON` golden-hour sky chromaticity ground truth.
     """
     BACKTEST_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    ev_cache = BACKTEST_CACHE_DIR / f"rc_ev_v44_{ev['id']}.json"
+    ev_cache = BACKTEST_CACHE_DIR / f"rc_ev_v45_{ev['id']}.json"
     if (not refresh) and ev_cache.exists():
         try:
             cached = json.loads(ev_cache.read_text(encoding="utf-8"))
@@ -1709,13 +1714,40 @@ def run_full_backtest_suite(
         ) if marine_stratus_events else 0.0,
     }
 
+    # --- Track 6: Strict Out-of-Sample Probabilistic Calibration (Independent NSRDB 2km DNI + NWS RAOB Only) ---
+    out_of_sample_calibration = evaluate_calibration_out_of_sample(rc_results)
+    try:
+        save_calibration_bundle(out_of_sample_calibration, DEFAULT_CALIBRATION_MODEL_PATH)
+    except Exception:
+        pass
+
+    confidence_calibration["verification_tier"] = "internal_lead_consistency"
+    confidence_calibration["verification_note"] = (
+        "Measures forecast-to-t=0 internal layer consistency against multi-sensor observed state; "
+        "see `out_of_sample_calibration` for independent NSRDB/RAOB probabilistic skill."
+    )
+    webcam_chromaticity_verification["verification_tier"] = "independent_observation"
+
     elapsed_s = round(time.perf_counter() - t_start, 2)
     summary = {
-        "schema_version": "v4.4",
+        "schema_version": "v4.5",
         "generated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "elapsed_seconds": elapsed_s,
         "n_events": len(BENCHMARK_EVENTS),
+        "verification_tiers": {
+            "independent_observation": [
+                "vertical_inversion_verification (NWS 00Z RAOB + ASOS ceilometer)",
+                "webcam_chromaticity_verification (PhenoCam/NEON RGB + NREL NSRDB 2km DNI)",
+                "out_of_sample_calibration (Leave-Site-Out & Chronological CV vs NSRDB 2km DNI + RAOB)",
+            ],
+            "internal_lead_consistency": [
+                "confidence_calibration_verification (hover-card layers vs t=0 multi-sensor truth)",
+                "lead_time_hindcast_skill.sunset_ray_transmittance_mae_pp / alpenglow_score_mae_pts",
+                "corridor_nowcast_skill_by_lead (GOES advected vs GOES t=0)",
+            ],
+        },
         "calibration_config": CALIBRATION_CONFIG,
+        "out_of_sample_calibration": out_of_sample_calibration,
         "spatial_64x64_verification": spatial_64x64_verification,
         "vertical_inversion_verification": vertical_by_mode,
         "multilayer_under_cirrus_verification": multilayer_verification,
@@ -1739,27 +1771,27 @@ def run_full_backtest_suite(
 
 
 if __name__ == "__main__":
-    print("Running PhotoPlanner v4.4 64x64 Multi-Layer Spatial + HRRR S3 + 2km NSRDB + Webcam Chromaticity Benchmark (N=24)...", flush=True)
+    print("Running PhotoPlanner v4.5 Leak-Free Multi-Sensor + Out-of-Sample Calibrated Benchmark (N=24)...", flush=True)
     res = run_full_backtest_suite(max_workers=2)
     print(f"\nCompleted in {res['elapsed_seconds']}s — saved to {SUMMARY_JSON_PATH} and {BENCHMARK_REPORT_JSON_PATH}", flush=True)
     sp = res["spatial_64x64_verification"]
     print(f"\n=== PHASE 3: 64x64 (1.75 km) Multi-Layer Spatial Field ===")
     print(f"  64x64 Active: {sp['n_events_64x64']}/{res['n_events']} | GOES 2D: {sp['n_goes_2d_events']}/{res['n_events']} | HRRR 2D: {sp['n_hrrr_2d_events']}/{res['n_events']} | Marine Offshore-Inland Contrast: +{sp['mean_marine_stratus_coastal_contrast_pp']} pp")
-    print("\n=== TRACK 1: Vertical Altitude & Inversion Accuracy vs 00Z RAOB Balloons & ASOS ===")
+    print("\n=== TRACK 1 (Independent): Vertical Altitude & Inversion Accuracy vs 00Z RAOB Balloons & ASOS ===")
     for mk, mv in res["vertical_inversion_verification"].items():
         print(f"  {mk:22s} | Lid MAE: {str(mv['fog_lid_mae_ft']):>6s} ft ({str(mv['fog_lid_mae_m']):>5s} m) | Bias: {str(mv['fog_lid_bias_ft']):>6s} ft | Summit Above/In Fog Acc: {mv['summit_above_fog_accuracy_pct']}% | ASOS Base MAE: {mv['asos_ceilometer_base_mae_ft']} ft")
     print("\n=== TRACK 2: Multi-Layer CCLC+BTD vs Single-Layer ACTPC ===")
     mlv = res["multilayer_under_cirrus_verification"]
     print(f"  Overlap/Stratus Events (N={mlv['n_overlap_or_stratus_events']}): Single-Layer MAE={mlv['single_layer_actpc_low_mae_vs_asos_pct']}% -> Multi-Layer CCLC+BTD MAE={mlv['multilayer_cclc_btd_low_mae_vs_asos_pct']}% ({mlv['satellite_low_cloud_error_reduction_pct']}% reduction)")
-    print("\n=== TRACK 3: Lead-Time Forecast Skill Curve (+1h -> +72h Hindcasts, 2km NSRDB v4.0.0) ===")
+    print("\n=== TRACK 3: Lead-Time Forecast Skill Curve (+1h -> +72h Leak-Free Hindcasts, 2km NSRDB v4.0.0) ===")
     for mk, mv in res["lead_time_hindcast_skill"].items():
-        print(f"  {mk:14s} | Low MAE: {mv['cloud_low_mae_pp']:5.2f} pp | High MAE: {mv['cloud_high_mae_pp']:5.2f} pp | Ray MAE: {mv['sunset_ray_transmittance_mae_pp']:5.2f} pp | 2km DNI MAE: {mv['golden_hour_dni_mae_pp']:5.2f} pp (r={mv['golden_hour_dni_pearson_r']:.3f} vs ERA5 r={mv['era5_31km_dni_pearson_r']:.3f}) | Alpenglow MAE: {mv['alpenglow_score_mae_pts']:5.2f}")
-    print("\n=== TRACK 4: 3D Hover-Card Confidence Calibration ===")
+        print(f"  {mk:14s} | Low MAE: {mv['cloud_low_mae_pp']:5.2f} pp | High MAE: {mv['cloud_high_mae_pp']:5.2f} pp | Ray MAE (internal): {mv['sunset_ray_transmittance_mae_pp']:5.2f} pp | 2km DNI MAE (indep): {mv['golden_hour_dni_mae_pp']:5.2f} pp (r={mv['golden_hour_dni_pearson_r']:.3f} vs ERA5 r={mv['era5_31km_dni_pearson_r']:.3f}) | Alpenglow MAE: {mv['alpenglow_score_mae_pts']:5.2f}")
+    print("\n=== TRACK 4 (Internal Lead Consistency): 3D Hover-Card Confidence Calibration ===")
     cc = res["confidence_calibration_verification"]
     print(f"  ECE = {cc['expected_calibration_error_pct']}% across {cc['n_total_layer_predictions']} layer predictions")
     for b_k, b_v in cc["reliability_bins"].items():
         print(f"    {b_k:16s} (n={b_v['n_layer_predictions']:3d}): Pred Conf={b_v['mean_predicted_confidence_pct']:5.1f}% vs Empirical={b_v['mean_empirical_accuracy_pct']:5.1f}% (<=20pp hit={b_v['within_20pp_hit_rate_pct']:5.1f}%)")
-    print("\n=== TRACK 5: Mountain Webcam Sky Chromaticity & 2km NSRDB Irradiance Verification ===")
+    print("\n=== TRACK 5 (Independent): Mountain Webcam Sky Chromaticity & 2km NSRDB Irradiance Verification ===")
     wv = res["webcam_chromaticity_verification"]
     sep = wv["regime_chromaticity_separation"]
     ali = wv["alpenglow_score_alignment"]
@@ -1768,3 +1800,28 @@ if __name__ == "__main__":
     print(f"  Burner/Clear vs Overcast/Fog Sky Warmth: RB_p90 {sep['mean_burner_rb_warmth_p90']:.2f} ({sep['mean_burner_kelvin']}K, Glow {sep['mean_burner_empirical_glow']}) vs {sep['mean_overcast_rb_warmth_p90']:.2f} ({sep['mean_overcast_kelvin']}K, Glow {sep['mean_overcast_empirical_glow']}) -> +{sep['empirical_glow_separation_pts']} pts")
     print(f"  Alpenglow Alignment (Airmass-Matched N={ali['airmass_matched_n']}): r={ali['airmass_matched_pearson_r']:.3f}, MAE={ali['airmass_matched_mae_pts']} pts")
     print(f"  2km NSRDB vs 31km ERA5 Coastal Blur Delta: {nsa['mean_coastal_grid_blur_delta_pp']} pp | Truth r: {nsa['by_mode']['truth']['era5_31km_pearson_r']:.3f} -> {nsa['by_mode']['truth']['nsrdb_2km_pearson_r']:.3f}")
+    print("\n=== TRACK 6 (Independent Out-of-Sample CV): Probabilistic Calibration vs 2km NSRDB & NWS RAOB ===")
+    cal_rep = res["out_of_sample_calibration"]
+    for label, key in (("Leave-Site-Out", "transmittance_leave_site_out_cv"), ("Chronological", "transmittance_chronological_cv")):
+        tr_cv = cal_rep.get(key) or {}
+        raw_m = tr_cv.get("raw_uncalibrated") or {}
+        cal_m = tr_cv.get("out_of_sample_calibrated") or {}
+        if raw_m and cal_m:
+            print(
+                f"  Transmittance {label:14s} (N={tr_cv.get('n_samples', 0)}): "
+                f"MAE {raw_m['mae_pct']:.2f}->{cal_m['mae_pct']:.2f} pp | "
+                f"CRPS {raw_m['crps_pct']:.2f}->{cal_m['crps_pct']:.2f} pp | "
+                f"Bias {raw_m['bias_pct']:+.2f}->{cal_m['bias_pct']:+.2f} pp | "
+                f"80% PI Cov {raw_m['pi80_coverage_pct']:.1f}%->{cal_m['pi80_coverage_pct']:.1f}%"
+            )
+    for label, key in (("Leave-Site-Out", "inversion_leave_site_out_cv"), ("Chronological", "inversion_chronological_cv")):
+        inv_cv = cal_rep.get(key) or {}
+        raw_i = inv_cv.get("raw_deterministic_step") or {}
+        cal_i = inv_cv.get("out_of_sample_calibrated") or {}
+        if raw_i and cal_i:
+            print(
+                f"  RAOB Inversion {label:13s} (N={inv_cv.get('n_samples', 0)}): "
+                f"Brier {raw_i['brier_score']:.4f}->{cal_i['brier_score']:.4f} | "
+                f"BSS {raw_i['brier_skill_score_vs_climo']:.3f}->{cal_i['brier_skill_score_vs_climo']:.3f} | "
+                f"ECE {raw_i['ece']:.4f}->{cal_i['ece']:.4f}"
+            )

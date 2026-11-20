@@ -103,16 +103,45 @@ _ASOS_ARCHIVE_STATIONS: list[tuple[str, str, float, float, float]] = [
 ]
 
 
+def _compute_koschmieder_aod_proxy(
+    vis_m: float | None,
+    rh_pct: float | None,
+) -> float | None:
+    """
+    Koschmieder surface extinction proxy for dry haze/wildfire smoke.
+    US ASOS visibility sensors cap unrestricted visibility at 10.0 SM (~16,093 m), so
+    we only infer smoke/haze AOD when visibility is genuinely restricted (< 9.5 SM)
+    AND air is not saturated coastal mist/fog (`rh_pct < 82%`). Between 70% and 82% RH,
+    hygroscopic aerosol swelling is smoothly attenuated so humid marine mist is never
+    misclassified as heavy wildfire smoke (`AOD ~ 0.85`).
+    """
+    if vis_m is None or not (2500.0 < vis_m < 15_250.0):
+        return None
+    if rh_pct is not None and rh_pct >= 82.0:
+        return None
+    beta_sfc = 3.912 / max(2500.0, vis_m)
+    raw_aod = beta_sfc * 1100.0
+    if rh_pct is not None and rh_pct > 70.0:
+        # Smooth hygroscopic attenuation from 1.0 at 70% RH down to 0.25 near 82% RH
+        dry_frac = max(0.25, 1.0 - 0.75 * ((rh_pct - 70.0) / 12.0))
+        raw_aod *= dry_frac
+    return round(max(0.04, min(0.85, raw_aod)), 3)
+
+
 def fetch_historical_asos_observation(
     lat: float,
     lon: float,
     target_utc: dt.datetime,
     max_distance_km: float = 115.0,
+    causal_only: bool = True,
 ) -> dict[str, Any] | None:
     """
     Fetches archived hourly/5-minute ASOS surface ceilometer, visibility, temperature,
     and RH observations nearest to `(lat, lon)` at `target_utc` from the Iowa
     Environmental Mesonet (`mesonet.agron.iastate.edu`) ASOS archive.
+
+    When `causal_only=True` (default), strictly requires `obs_dt <= target_utc` so no
+    post-target observation leaks into hindcasts or nowcasts.
     """
     if target_utc.tzinfo is None:
         target_utc = target_utc.replace(tzinfo=dt.timezone.utc)
@@ -135,9 +164,10 @@ def fetch_historical_asos_observation(
     day_end = (target_utc + dt.timedelta(hours=3)).date() + dt.timedelta(days=1)
 
     for dist_km, sid, sname, st_lat, st_lon, st_elev_m in candidates:
+        mode_tag = "causal" if causal_only else "centered"
         cache_file = (
             OBS_CACHE_DIR
-            / f"asos_v3_hist_{sid}_{target_utc.strftime('%Y%m%d_%H%M')}.json"
+            / f"asos_v4_hist_{mode_tag}_{sid}_{target_utc.strftime('%Y%m%d_%H%M')}.json"
         )
         if cache_file.exists():
             try:
@@ -170,6 +200,11 @@ def fetch_historical_asos_observation(
         best_dt: dt.datetime | None = None
         best_abs_s = 1e12
 
+        max_allowed_dt = (
+            target_utc
+            if causal_only
+            else (target_utc + dt.timedelta(minutes=8))
+        )
         for ln in lines[1:]:
             parts = ln.split(",")
             if len(parts) != len(headers):
@@ -182,7 +217,7 @@ def fetch_historical_asos_observation(
                 )
             except ValueError:
                 continue
-            if obs_dt > target_utc + dt.timedelta(minutes=8):
+            if obs_dt > max_allowed_dt:
                 continue
             diff_s = abs((obs_dt - target_utc).total_seconds())
             # Prefer rows that actually include sky cover or temperature within +/- 75 min
@@ -274,12 +309,7 @@ def fetch_historical_asos_observation(
         if temp_c is not None and dew_c is not None:
             lcl_asl_m = round(st_elev_m + max(40.0, 125.0 * max(0.0, temp_c - dew_c)), 1)
 
-        # US ASOS visibility sensors cap unrestricted visibility at 10.0 SM (~16,093 m).
-        # Only infer surface haze/smoke AOD when visibility is genuinely restricted (< 9.5 SM).
-        aod_proxy: float | None = None
-        if vis_m is not None and 2500.0 < vis_m < 15_250.0:
-            beta_sfc = 3.912 / max(2500.0, vis_m)
-            aod_proxy = round(max(0.04, min(0.85, beta_sfc * 1100.0)), 3)
+        aod_proxy = _compute_koschmieder_aod_proxy(vis_m, rh_pct)
 
         result: dict[str, Any] = {
             "station_id": f"K{sid}" if len(sid) == 3 else sid,
@@ -318,6 +348,76 @@ def fetch_historical_asos_observation(
         return result
 
     return None
+
+
+def _parse_nws_cloud_layers(
+    raw_layers: list[dict[str, Any]],
+    st_elev_m: float,
+) -> tuple[list[dict[str, Any]], float, float, float, float, float | None, float | None]:
+    """
+    Parses NWS `cloudLayers` objects into `(parsed_layers, fog_frac, low_frac, mid_frac,
+    high_frac, fog_base_asl_m, lowest_ceiling_asl_m)`.
+    Handles `VV` (vertical visibility / indefinite ceiling in dense fog, including `VV///`
+    where `base` is `None`) BEFORE the `base_agl_m is None` guard.
+    """
+    parsed_layers: list[dict[str, Any]] = []
+    fog_frac = 0.0
+    low_frac = 0.0
+    mid_frac = 0.0
+    high_frac = 0.0
+    fog_base_asl_m: float | None = None
+    lowest_ceiling_asl_m: float | None = None
+
+    for cl in raw_layers:
+        amt = str(cl.get("amount") or "").upper().strip()
+        frac = _CLOUD_AMOUNT_FRACTION.get(amt, 0.0)
+        base_agl_m = _extract_val(cl.get("base"))
+        base_asl_m = (st_elev_m + base_agl_m) if base_agl_m is not None else None
+        parsed_layers.append(
+            {
+                "amount": amt,
+                "cloud_fraction": frac,
+                "base_agl_m": base_agl_m,
+                "base_asl_m": round(base_asl_m, 1) if base_asl_m is not None else None,
+            }
+        )
+        if frac >= 0.65 and base_asl_m is not None:
+            if lowest_ceiling_asl_m is None or base_asl_m < lowest_ceiling_asl_m:
+                lowest_ceiling_asl_m = base_asl_m
+
+        if amt == "VV":
+            fog_frac = 1.0
+            low_frac = max(low_frac, 1.0)
+            eff_fog_base = base_asl_m if base_asl_m is not None else (st_elev_m + 15.0)
+            if fog_base_asl_m is None or eff_fog_base < fog_base_asl_m:
+                fog_base_asl_m = eff_fog_base
+            if lowest_ceiling_asl_m is None or eff_fog_base < lowest_ceiling_asl_m:
+                lowest_ceiling_asl_m = eff_fog_base
+        elif base_agl_m is None:
+            if amt in ("CLR", "SKC"):
+                pass
+        elif base_agl_m < 650.0:
+            fog_frac = max(fog_frac, frac)
+            low_frac = max(low_frac, frac)
+            if frac >= 0.35 and base_asl_m is not None:
+                if fog_base_asl_m is None or base_asl_m < fog_base_asl_m:
+                    fog_base_asl_m = base_asl_m
+        elif base_agl_m < 2200.0:
+            low_frac = max(low_frac, frac)
+        elif base_agl_m < 6200.0:
+            mid_frac = max(mid_frac, frac)
+        else:
+            high_frac = max(high_frac, frac)
+
+    return (
+        parsed_layers,
+        fog_frac,
+        low_frac,
+        mid_frac,
+        high_frac,
+        fog_base_asl_m,
+        lowest_ceiling_asl_m,
+    )
 
 
 def fetch_nearest_station_observation(
@@ -433,46 +533,15 @@ def fetch_nearest_station_observation(
 
             # Parse ceilometer cloud layers (AGL above station -> ASL)
             raw_layers = op.get("cloudLayers") or []
-            parsed_layers: list[dict[str, Any]] = []
-            fog_frac = 0.0
-            low_frac = 0.0
-            mid_frac = 0.0
-            high_frac = 0.0
-            fog_base_asl_m: float | None = None
-            lowest_ceiling_asl_m: float | None = None
-
-            for cl in raw_layers:
-                amt = str(cl.get("amount") or "").upper().strip()
-                frac = _CLOUD_AMOUNT_FRACTION.get(amt, 0.0)
-                base_agl_m = _extract_val(cl.get("base"))
-                base_asl_m = (st_elev_m + base_agl_m) if base_agl_m is not None else None
-                parsed_layers.append(
-                    {
-                        "amount": amt,
-                        "cloud_fraction": frac,
-                        "base_agl_m": base_agl_m,
-                        "base_asl_m": round(base_asl_m, 1) if base_asl_m is not None else None,
-                    }
-                )
-                if frac >= 0.65 and base_asl_m is not None:
-                    if lowest_ceiling_asl_m is None or base_asl_m < lowest_ceiling_asl_m:
-                        lowest_ceiling_asl_m = base_asl_m
-
-                if base_agl_m is None:
-                    if amt in ("CLR", "SKC"):
-                        pass
-                elif base_agl_m < 650.0 or amt == "VV":
-                    fog_frac = max(fog_frac, frac)
-                    low_frac = max(low_frac, frac)
-                    if frac >= 0.35 and base_asl_m is not None:
-                        if fog_base_asl_m is None or base_asl_m < fog_base_asl_m:
-                            fog_base_asl_m = base_asl_m
-                elif base_agl_m < 2200.0:
-                    low_frac = max(low_frac, frac)
-                elif base_agl_m < 6200.0:
-                    mid_frac = max(mid_frac, frac)
-                else:
-                    high_frac = max(high_frac, frac)
+            (
+                parsed_layers,
+                fog_frac,
+                low_frac,
+                mid_frac,
+                high_frac,
+                fog_base_asl_m,
+                lowest_ceiling_asl_m,
+            ) = _parse_nws_cloud_layers(raw_layers, st_elev_m)
 
             if temp_c is None and vis_m is None and not parsed_layers:
                 continue
@@ -496,12 +565,7 @@ def fetch_nearest_station_observation(
                 if fog_base_asl_m is None:
                     fog_base_asl_m = round(st_elev_m + 35.0, 1)
 
-            # Koschmieder surface extinction proxy only when visibility is restricted (< 9.5 SM;
-            # automated ASOS sensors report 10.0 SM for unlimited clear-air visibility).
-            aod_proxy: float | None = None
-            if vis_m is not None and 2500.0 < vis_m < 15_250.0:
-                beta_sfc = 3.912 / max(2500.0, vis_m)
-                aod_proxy = round(max(0.04, min(0.85, beta_sfc * 1100.0)), 3)
+            aod_proxy = _compute_koschmieder_aod_proxy(vis_m, rh_pct)
 
             result: dict[str, Any] = {
                 "station_id": sid,

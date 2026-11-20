@@ -318,7 +318,8 @@ pub extern "C" fn wasm_raycast_tripod(
             eng.dem.sample_elevation_lat_lon(target_lat, target_lon)
         };
         let drop_target = (total_dist_m * total_dist_m) / (2.0 * 6_371_000.0) * 0.87;
-        let el_angle_deg = ((aim_z - drop_target - cam_eye_z) / total_dist_m)
+        let eff_aim_z = aim_z - drop_target;
+        let el_angle_deg = ((eff_aim_z - cam_eye_z) / total_dist_m)
             .atan()
             .to_degrees();
 
@@ -333,7 +334,7 @@ pub extern "C" fn wasm_raycast_tripod(
             let tz = eng.dem.sample_elevation_lat_lon(slat, slon);
             let curv = (d_m * d_m) / (2.0 * 6_371_000.0) * 0.87;
             let eff_tz = tz - curv;
-            let ray_z = cam_eye_z + frac * (aim_z - cam_eye_z);
+            let ray_z = cam_eye_z + frac * (eff_aim_z - cam_eye_z);
 
             if (3..62).contains(&s) {
                 let diff = eff_tz - ray_z;
@@ -383,7 +384,7 @@ pub extern "C" fn wasm_raycast_tripod(
                 }
                 d += if d < 1200.0 { 22.0 } else { 55.0 };
             }
-            eng.raycast_out[203 + idx] = max_slope.atan().to_degrees().max(0.0) as f32;
+            eng.raycast_out[203 + idx] = max_slope.atan().to_degrees() as f32;
         }
 
         eng.raycast_out[0] = tripod_z as f32;

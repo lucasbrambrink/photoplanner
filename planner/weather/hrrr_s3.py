@@ -60,7 +60,28 @@ UPPER_PRESSURE_LEVELS_MB: tuple[int, ...] = (500, 300, 250)
 _MEM_TILE_CACHE: dict[str, tuple[float, dict[str, np.ndarray], dict[str, Any]]] = {}
 _MEM_LOCK = threading.Lock()
 _TILE_LOCK_MAP: dict[str, threading.Lock] = {}
+_CYCLE_LOCK_MAP: dict[str, threading.Lock] = {}
+_CYCLE_EXTRA_BOXES: dict[str, list[tuple[int, int, int, int]]] = {}
 _MEM_TTL_SECONDS = 1800.0
+
+
+def register_cycle_crop_boxes(
+    cycle_boxes: dict[str, list[tuple[int, int, int, int]]],
+) -> None:
+    """
+    Registers extra `(i0, i1, j0, j1)` crop boxes per HRRR cycle key (`YYYYMMDD_HHz_fFF`)
+    so batch/regional runs slice & cache all sites sharing a CONUS GRIB2 cycle in a single download.
+    """
+    with _MEM_LOCK:
+        for ck, boxes in cycle_boxes.items():
+            existing = set(_CYCLE_EXTRA_BOXES.get(ck, ()))
+            existing.update(boxes)
+            _CYCLE_EXTRA_BOXES[ck] = sorted(existing)
+
+
+def clear_cycle_crop_boxes() -> None:
+    with _MEM_LOCK:
+        _CYCLE_EXTRA_BOXES.clear()
 
 
 def _lcc_xy_m(lat_deg: float, lon_deg: float) -> tuple[float, float]:
@@ -103,22 +124,43 @@ def is_in_hrrr_conus(lat: float, lon: float, margin_cells: float = 4.0) -> bool:
     )
 
 
+def rotate_hrrr_uv_to_earth(u_grid: float, v_grid: float, lon_deg: float) -> tuple[float, float]:
+    """
+    Rotates NOAA HRRR Lambert Conformal Conic grid-relative winds (`uvRelativeToGrid=1`)
+    into Earth-relative `(u_east, v_north)` m/s.
+    With `x = rho*sin(theta), y = -rho*cos(theta)`, `theta = n * (lon - lon0)`:
+      `e_East  = (cos(theta),  sin(theta))` -> `u_E =  u_g * cos(theta) + v_g * sin(theta)`
+      `e_North = (-sin(theta), cos(theta))` -> `v_N = -u_g * sin(theta) + v_g * cos(theta)`
+    """
+    lon_norm = ((lon_deg + 180.0) % 360.0) - 180.0
+    theta = _HRRR_N * (math.radians(lon_norm) - _HRRR_LAM0)
+    ct = math.cos(theta)
+    st = math.sin(theta)
+    return u_grid * ct + v_grid * st, -u_grid * st + v_grid * ct
+
+
 def _unpack_bits_u64(data_bytes: bytes, bit_offset: int, count: int, width: int) -> np.ndarray:
     if width <= 0 or count <= 0:
         return np.zeros(max(0, count), dtype=np.int64)
+    if width > 56:
+        raise ValueError(f"Unsupported GRIB2 bit width > 56: {width}")
     bit_pos = bit_offset + np.arange(count, dtype=np.int64) * int(width)
     byte_idx = (bit_pos >> 3).astype(np.int64)
     bit_in_byte = (bit_pos & 7).astype(np.uint64)
-    padded = np.zeros(len(data_bytes) + 8, dtype=np.uint8)
+    padded = np.zeros(len(data_bytes) + 16, dtype=np.uint8)
     padded[: len(data_bytes)] = np.frombuffer(data_bytes, dtype=np.uint8)
     word = (
-        (padded[byte_idx].astype(np.uint64) << np.uint64(24))
-        | (padded[byte_idx + 1].astype(np.uint64) << np.uint64(16))
-        | (padded[byte_idx + 2].astype(np.uint64) << np.uint64(8))
-        | padded[byte_idx + 3].astype(np.uint64)
+        (padded[byte_idx].astype(np.uint64) << np.uint64(56))
+        | (padded[byte_idx + 1].astype(np.uint64) << np.uint64(48))
+        | (padded[byte_idx + 2].astype(np.uint64) << np.uint64(40))
+        | (padded[byte_idx + 3].astype(np.uint64) << np.uint64(32))
+        | (padded[byte_idx + 4].astype(np.uint64) << np.uint64(24))
+        | (padded[byte_idx + 5].astype(np.uint64) << np.uint64(16))
+        | (padded[byte_idx + 6].astype(np.uint64) << np.uint64(8))
+        | padded[byte_idx + 7].astype(np.uint64)
     )
-    shift = np.uint64(32) - bit_in_byte - np.uint64(width)
-    mask = np.uint64((1 << int(width)) - 1)
+    shift = np.uint64(64) - bit_in_byte - np.uint64(width)
+    mask = (np.uint64(1) << np.uint64(width)) - np.uint64(1)
     return ((word >> shift) & mask).astype(np.int64)
 
 
@@ -230,31 +272,44 @@ def decode_grib2_message(buf: bytes) -> np.ndarray:
             padded[: len(s7)] = np.frombuffer(s7, dtype=np.uint8)
 
             for w_val in np.unique(gwids):
+                w_int = int(w_val)
                 idxs_g = np.nonzero(gwids == w_val)[0]
-                tot_w_pts = int(np.sum(glens[idxs_g]))
+                gl_w = glens[idxs_g]
+                tot_w_pts = int(np.sum(gl_w))
                 if tot_w_pts <= 0:
                     continue
                 intra = np.arange(tot_w_pts, dtype=np.int64) - np.repeat(
-                    np.concatenate(([0], np.cumsum(glens[idxs_g])[:-1])), glens[idxs_g]
+                    np.concatenate(([0], np.cumsum(gl_w)[:-1])), gl_w
                 )
-                target_idx = np.repeat(g_pt_starts[idxs_g], glens[idxs_g]) + intra
-                if w_val == 0:
-                    out_int[target_idx] = np.repeat(grefs[idxs_g], glens[idxs_g])
+                target_idx = np.repeat(g_pt_starts[idxs_g], gl_w) + intra
+                gref_rep = np.repeat(grefs[idxs_g], gl_w)
+                if w_int == 0:
+                    out_int[target_idx] = gref_rep
                 else:
-                    bpos = np.repeat(g_bit_starts[idxs_g], glens[idxs_g]) + intra * int(w_val)
-                    b_idx = (bpos >> 3).astype(np.int64)
-                    b_off = (bpos & 7).astype(np.uint64)
-                    word = (
-                        (padded[b_idx].astype(np.uint64) << np.uint64(24))
-                        | (padded[b_idx + 1].astype(np.uint64) << np.uint64(16))
-                        | (padded[b_idx + 2].astype(np.uint64) << np.uint64(8))
-                        | padded[b_idx + 3].astype(np.uint64)
-                    )
-                    sh = np.uint64(32) - b_off - np.uint64(w_val)
-                    msk = np.uint64((1 << int(w_val)) - 1)
-                    out_int[target_idx] = ((word >> sh) & msk).astype(np.int64) + np.repeat(
-                        grefs[idxs_g], glens[idxs_g]
-                    )
+                    bpos = np.repeat(g_bit_starts[idxs_g], gl_w) + intra * w_int
+                    b_idx = (bpos >> 3).astype(np.intp)
+                    if w_int <= 24:
+                        b_off32 = (bpos & 7).astype(np.uint32)
+                        word32 = (
+                            (padded[b_idx].astype(np.uint32) << np.uint32(24))
+                            | (padded[b_idx + 1].astype(np.uint32) << np.uint32(16))
+                            | (padded[b_idx + 2].astype(np.uint32) << np.uint32(8))
+                            | padded[b_idx + 3].astype(np.uint32)
+                        )
+                        sh32 = np.uint32(32 - w_int) - b_off32
+                        msk32 = np.uint32((1 << w_int) - 1)
+                        out_int[target_idx] = ((word32 >> sh32) & msk32).astype(np.int64) + gref_rep
+                    else:
+                        b_off = (bpos & 7).astype(np.uint64)
+                        word = (
+                            (padded[b_idx].astype(np.uint64) << np.uint64(24))
+                            | (padded[b_idx + 1].astype(np.uint64) << np.uint64(16))
+                            | (padded[b_idx + 2].astype(np.uint64) << np.uint64(8))
+                            | padded[b_idx + 3].astype(np.uint64)
+                        )
+                        sh = np.uint64(32) - b_off - np.uint64(w_int)
+                        msk = np.uint64((1 << w_int) - 1)
+                        out_int[target_idx] = ((word >> sh) & msk).astype(np.int64) + gref_rep
 
             if drt == 3 and order > 0 and len(init_vals) >= order and total_pts >= order:
                 if order == 1:
@@ -490,6 +545,27 @@ def _coalesce_ranges(
     return groups
 
 
+def tile_box_for_corridor(
+    lat: float,
+    lon: float,
+    coords_meta: list[tuple[str, float, float, float, float | None]],
+) -> tuple[int, int, int, int]:
+    """Returns quantized 128-cell HRRR Lambert `(i0, i1, j0, j1)` crop bounds covering `coords_meta`."""
+    ij_pts: list[tuple[float, float]] = [hrrr_latlon_to_ij(lat, lon)]
+    for _, plat, plon, _, _ in coords_meta:
+        ij_pts.append(hrrr_latlon_to_ij(plat, plon))
+    min_i = max(0, int(math.floor(min(p[0] for p in ij_pts))) - 36)
+    max_i = min(HRRR_NX, int(math.ceil(max(p[0] for p in ij_pts))) + 36)
+    min_j = max(0, int(math.floor(min(p[1] for p in ij_pts))) - 36)
+    max_j = min(HRRR_NY, int(math.ceil(max(p[1] for p in ij_pts))) + 36)
+    return (
+        max(0, (min_i // 128) * 128),
+        min(HRRR_NX, ((max_i + 127) // 128) * 128),
+        max(0, (min_j // 128) * 128),
+        min(HRRR_NY, ((max_j + 127) // 128) * 128),
+    )
+
+
 def _fetch_and_crop_cycle_tile(
     init_utc: dt.datetime,
     fhr: int,
@@ -500,11 +576,14 @@ def _fetch_and_crop_cycle_tile(
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     """
     Downloads & decodes `wrfsfcf{fhr:02d}` + `wrfprsf{fhr:02d}` via coalesced HTTP `Range:` requests,
-    cropping to the regional Lambert subgrid `[j0:j1, i0:i1]` and persisting a compact `.npz` cache.
+    cropping to the regional Lambert subgrid `[j0:j1, i0:i1]` (plus any registered sibling boxes
+    sharing the same CONUS cycle) and persisting compact `.npz` caches.
     """
     ymd = init_utc.strftime("%Y%m%d")
     hh = init_utc.strftime("%H")
-    tile_id = f"{ymd}_{hh}z_f{fhr:02d}_i{i0}_{i1}_j{j0}_{j1}"
+    cycle_key = f"{ymd}_{hh}z_f{fhr:02d}"
+    req_box = (i0, i1, j0, j1)
+    tile_id = f"{cycle_key}_i{i0}_{i1}_j{j0}_{j1}"
 
     now_mono = time.monotonic()
     with _MEM_LOCK:
@@ -512,18 +591,31 @@ def _fetch_and_crop_cycle_tile(
             ts, arrs, meta = _MEM_TILE_CACHE[tile_id]
             if now_mono - ts < _MEM_TTL_SECONDS:
                 return arrs, meta
-        t_lock = _TILE_LOCK_MAP.setdefault(tile_id, threading.Lock())
+        c_lock = _CYCLE_LOCK_MAP.setdefault(cycle_key, threading.Lock())
 
-    with t_lock:
+    # Fast disk check before acquiring cycle download lock
+    HRRR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    npz_path = HRRR_CACHE_DIR / f"tile_v1_{tile_id}.npz"
+    meta_path = HRRR_CACHE_DIR / f"tile_v1_{tile_id}.json"
+    if npz_path.exists() and meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            with np.load(npz_path) as npz_doc:
+                arrs = {k: np.array(npz_doc[k], dtype=np.float32) for k in npz_doc.files}
+            if "sfc_hgt" in arrs and "z_950" in arrs:
+                with _MEM_LOCK:
+                    _MEM_TILE_CACHE[tile_id] = (now_mono, arrs, meta)
+                return arrs, meta
+        except Exception:
+            pass
+
+    with c_lock:
         with _MEM_LOCK:
             if tile_id in _MEM_TILE_CACHE:
                 ts, arrs, meta = _MEM_TILE_CACHE[tile_id]
                 if now_mono - ts < _MEM_TTL_SECONDS:
                     return arrs, meta
-
-        HRRR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        npz_path = HRRR_CACHE_DIR / f"tile_v1_{tile_id}.npz"
-        meta_path = HRRR_CACHE_DIR / f"tile_v1_{tile_id}.json"
+            extra_boxes = list(_CYCLE_EXTRA_BOXES.get(cycle_key, ()))
 
         if npz_path.exists() and meta_path.exists():
             try:
@@ -536,6 +628,15 @@ def _fetch_and_crop_cycle_tile(
                     return arrs, meta
             except Exception:
                 pass
+
+        # Collect requested box + any uncached sibling boxes registered for this exact CONUS cycle
+        target_boxes: list[tuple[int, int, int, int]] = [req_box]
+        for bx in extra_boxes:
+            if bx == req_box:
+                continue
+            bx_id = f"{cycle_key}_i{bx[0]}_{bx[1]}_j{bx[2]}_{bx[3]}"
+            if not (HRRR_CACHE_DIR / f"tile_v1_{bx_id}.npz").exists():
+                target_boxes.append(bx)
 
         t0 = time.perf_counter()
         sfc_base = f"{HRRR_S3_BASE}/hrrr.{ymd}/conus/hrrr.t{hh}z.wrfsfcf{fhr:02d}.grib2"
@@ -564,56 +665,73 @@ def _fetch_and_crop_cycle_tile(
                 prs_matched.append((out_k, int(e["start"]), int(e["end"])))
 
         tasks: list[tuple[str, int, int, list[tuple[str, int, int]]]] = []
-        for gs, ge, gitems in _coalesce_ranges(sfc_matched, max_gap_bytes=65_000, max_span_bytes=14_500_000):
+        for gs, ge, gitems in _coalesce_ranges(sfc_matched, max_gap_bytes=350_000, max_span_bytes=18_000_000):
             tasks.append((sfc_base, gs, ge, gitems))
-        for gs, ge, gitems in _coalesce_ranges(prs_matched, max_gap_bytes=65_000, max_span_bytes=8_500_000):
+        for gs, ge, gitems in _coalesce_ranges(prs_matched, max_gap_bytes=350_000, max_span_bytes=12_000_000):
             tasks.append((prs_base, gs, ge, gitems))
 
-        cropped_fields: dict[str, np.ndarray] = {}
+        per_box_fields: dict[tuple[int, int, int, int], dict[str, np.ndarray]] = {
+            bx: {} for bx in target_boxes
+        }
         bytes_downloaded = 0
 
-        def _run_group(task_spec: tuple[str, int, int, list[tuple[str, int, int]]]) -> tuple[int, dict[str, np.ndarray]]:
+        def _run_group(
+            task_spec: tuple[str, int, int, list[tuple[str, int, int]]]
+        ) -> tuple[int, dict[tuple[int, int, int, int], dict[str, np.ndarray]]]:
             g_url, gs, ge, gitems = task_spec
             raw_block = _http_get_bytes(g_url, (gs, ge), timeout=22.0)
-            local_out: dict[str, np.ndarray] = {}
+            local_by_box: dict[tuple[int, int, int, int], dict[str, np.ndarray]] = {
+                bx: {} for bx in target_boxes
+            }
             for out_k, ms, me in gitems:
                 rel_s = ms - gs
                 rel_e = (me - gs + 1) if me >= ms else len(raw_block)
                 grid_2d = decode_grib2_message(raw_block[rel_s:rel_e])
-                local_out[out_k] = np.array(grid_2d[j0:j1, i0:i1], dtype=np.float32, copy=True)
-            return len(raw_block), local_out
+                for bx in target_boxes:
+                    bi0, bi1, bj0, bj1 = bx
+                    local_by_box[bx][out_k] = np.array(grid_2d[bj0:bj1, bi0:bi1], dtype=np.float32, copy=True)
+            return len(raw_block), local_by_box
 
-        with ThreadPoolExecutor(max_workers=4) as dl_pool:
-            for nb, partial in dl_pool.map(_run_group, tasks):
+        with ThreadPoolExecutor(max_workers=8) as dl_pool:
+            for nb, partial_by_box in dl_pool.map(_run_group, tasks):
                 bytes_downloaded += nb
-                cropped_fields.update(partial)
+                for bx, fields in partial_by_box.items():
+                    per_box_fields[bx].update(fields)
 
         valid_utc = init_utc + dt.timedelta(hours=fhr)
-        meta = {
-            "init_utc": init_utc.isoformat(),
-            "valid_utc": valid_utc.isoformat(),
-            "cycle_tag": f"{ymd} {hh}Z f{fhr:02d}",
-            "fhr": fhr,
-            "i0": i0,
-            "i1": i1,
-            "j0": j0,
-            "j1": j1,
-            "bytes_downloaded": bytes_downloaded,
-            "elapsed_ms": round((time.perf_counter() - t0) * 1000.0, 1),
-        }
+        elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 1)
 
-        try:
-            np.savez_compressed(npz_path, **cropped_fields)
-            meta_path.write_text(json.dumps(meta), encoding="utf-8")
-        except Exception:
-            pass
+        req_meta: dict[str, Any] = {}
+        for bx in target_boxes:
+            bi0, bi1, bj0, bj1 = bx
+            bx_id = f"{cycle_key}_i{bi0}_{bi1}_j{bj0}_{bj1}"
+            bx_meta = {
+                "init_utc": init_utc.isoformat(),
+                "valid_utc": valid_utc.isoformat(),
+                "cycle_tag": f"{ymd} {hh}Z f{fhr:02d}",
+                "fhr": fhr,
+                "i0": bi0,
+                "i1": bi1,
+                "j0": bj0,
+                "j1": bj1,
+                "bytes_downloaded": bytes_downloaded,
+                "elapsed_ms": elapsed_ms,
+            }
+            if bx == req_box:
+                req_meta = bx_meta
+            try:
+                np.savez(HRRR_CACHE_DIR / f"tile_v1_{bx_id}.npz", **per_box_fields[bx])
+                (HRRR_CACHE_DIR / f"tile_v1_{bx_id}.json").write_text(json.dumps(bx_meta), encoding="utf-8")
+            except Exception:
+                pass
 
+        cropped_fields = per_box_fields[req_box]
         with _MEM_LOCK:
-            if len(_MEM_TILE_CACHE) >= 8:
+            if len(_MEM_TILE_CACHE) >= 12:
                 oldest_k = min(_MEM_TILE_CACHE, key=lambda k: _MEM_TILE_CACHE[k][0])
                 _MEM_TILE_CACHE.pop(oldest_k, None)
-            _MEM_TILE_CACHE[tile_id] = (now_mono, cropped_fields, meta)
-        return cropped_fields, meta
+            _MEM_TILE_CACHE[tile_id] = (now_mono, cropped_fields, req_meta)
+        return cropped_fields, req_meta
 
 
 def _sample_tile_bilinear(arr: np.ndarray | None, fi_local: float, fj_local: float) -> float:
@@ -654,6 +772,7 @@ def _analyze_hrrr_profile_at_ij(
     arrs: dict[str, np.ndarray],
     fi_loc: float,
     fj_loc: float,
+    lon_deg: float | None = None,
 ) -> dict[str, Any]:
     """
     Extracts a complete radiosonde-equivalent thermodynamic & microphysical column
@@ -665,13 +784,14 @@ def _analyze_hrrr_profile_at_ij(
 
     z_sfc = max(0.0, g("sfc_hgt", 0.0))
     t2m_c = g("t2m_k", 287.15) - 273.15
-    dpt2m_c = g("dpt2m_k", t2m_c - 4.0) - 273.15
+    dpt2m_c = g("dpt2m_k", t2m_c + 273.15 - 4.0) - 273.15
     rh2m = max(2.0, min(100.0, g("rh2m", 65.0)))
     vis_m = max(50.0, min(60_000.0, g("sfc_vis", 32_000.0)))
     hpbl_m = max(60.0, g("hpbl", 450.0))
     cape = max(0.0, g("cape", 0.0))
-    u10 = g("u10", 0.0)
-    v10 = g("v10", 0.0)
+    u10_g = g("u10", 0.0)
+    v10_g = g("v10", 0.0)
+    u10, v10 = rotate_hrrr_uv_to_earth(u10_g, v10_g, lon_deg) if lon_deg is not None else (u10_g, v10_g)
     aotk = g("aotk", float("nan"))
     tcolw = max(0.0, g("tcolw", 0.0))
     tcoli = max(0.0, g("tcoli", 0.0))
@@ -702,11 +822,10 @@ def _analyze_hrrr_profile_at_ij(
         tp = g(f"t_{p}", float("nan")) - 273.15
         rhp = max(1.0, min(100.0, g(f"rh_{p}", 50.0)))
         clmr_g = max(0.0, g(f"clmr_{p}", 0.0)) * 1000.0
-        if math.isfinite(zp) and math.isfinite(tp):
+        if math.isfinite(zp) and math.isfinite(tp) and zp > z_sfc + 14.0:
             rec = {"p_mb": float(p), "z_m": zp, "t_c": tp, "rh": rhp, "clmr_g_kg": clmr_g}
             plev_map[p] = rec
-            if zp > z_sfc + 14.0:
-                levels.append(rec)
+            levels.append(rec)
 
     levels.sort(key=lambda r: r["z_m"])
 
@@ -885,11 +1004,18 @@ def _analyze_hrrr_profile_at_ij(
     rh300 = max(1.0, min(100.0, g("rh_300", 35.0)))
     cimr_hi_g = (max(0.0, g("cimr_500", 0.0)) + max(0.0, g("cimr_300", 0.0))) * 1000.0
 
-    u850, v850 = g("u_850", u10 * 1.3), g("v_850", v10 * 1.3)
-    u700, v700 = g("u_700", u850 * 1.25), g("v_700", v850 * 1.25)
-    u500, v500 = g("u_500", u700 * 1.35), g("v_500", v700 * 1.35)
-    u300, v300 = g("u_300", u500 * 1.35), g("v_300", v500 * 1.35)
-    u250, v250 = g("u_250", u300 * 1.08), g("v_250", v300 * 1.08)
+    def _rot_uv(u_key: str, v_key: str, fb_u: float, fb_v: float) -> tuple[float, float]:
+        ug = g(u_key, float("nan"))
+        vg = g(v_key, float("nan"))
+        if math.isfinite(ug) and math.isfinite(vg):
+            return rotate_hrrr_uv_to_earth(ug, vg, lon_deg) if lon_deg is not None else (ug, vg)
+        return fb_u, fb_v
+
+    u850, v850 = _rot_uv("u_850", "v_850", u10 * 1.3, v10 * 1.3)
+    u700, v700 = _rot_uv("u_700", "v_700", u850 * 1.25, v850 * 1.25)
+    u500, v500 = _rot_uv("u_500", "v_500", u700 * 1.35, v700 * 1.35)
+    u300, v300 = _rot_uv("u_300", "v_300", u500 * 1.35, v500 * 1.35)
+    u250, v250 = _rot_uv("u_250", "v_250", u300 * 1.08, v300 * 1.08)
 
     def _p_val(p_key: int, field: str, fb: float) -> float:
         return plev_map[p_key][field] if p_key in plev_map else fb
@@ -1007,7 +1133,7 @@ def fetch_hrrr_s3_corridor(
     stations: list[dict[str, Any]] = []
     for name, plat, plon, pdist_km, paz_deg in coords_meta:
         fi, fj = hrrr_latlon_to_ij(plat, plon)
-        col = _analyze_hrrr_profile_at_ij(arrs, fi - tile_i0, fj - tile_j0)
+        col = _analyze_hrrr_profile_at_ij(arrs, fi - tile_i0, fj - tile_j0, lon_deg=plon)
         col["name"] = name
         col["lat"] = plat
         col["lon"] = plon
@@ -1031,7 +1157,7 @@ def fetch_hrrr_s3_corridor(
                     best_ocean_ij = (cand_i, cand_j)
                     break
         if best_ocean_ij is not None:
-            marine_ref = _analyze_hrrr_profile_at_ij(arrs, best_ocean_ij[0], best_ocean_ij[1])
+            marine_ref = _analyze_hrrr_profile_at_ij(arrs, best_ocean_ij[0], best_ocean_ij[1], lon_deg=lon)
 
     default_lid_m = (
         float(marine_ref["lid_asl_m"])
@@ -1376,16 +1502,20 @@ def apply_hrrr_column_to_sounding(
         if is_bl_stratus:
             top_m = max(mbl_floor_m + 135.0, float(st["inv_top_asl_m"]))
             base_m = max(mbl_floor_m + 30.0, min(top_m - 85.0, h_stratus_base_m))
-            # Physical Slingo/Stephens LWP optical depth (`tau ~ 145 * LWP` for r_eff ~ 10.3 um)
+            # Physical Slingo/Stephens LWP optical depth (`tau_grid ~ 145 * LWP_grid` for r_eff ~ 10.3 um).
+            # HRRR `TCOLW` is already a grid-box mean, so do NOT multiply by `low_cf` a second time.
             lwp_src = max(float(hrrr_col["tcolw_kg_m2"]), 0.65 * float(m_col["tcolw_kg_m2"]))
-            tau_lwp = min(28.0, max(1.2, 145.0 * lwp_src)) if lwp_src >= 0.008 else min(24.0, 0.030 * (top_m - base_m))
+            if lwp_src >= 0.008:
+                tau_grid_fog = min(28.0, max(0.08, 145.0 * lwp_src))
+            else:
+                tau_grid_fog = max(0.08, low_cf * min(24.0, 0.030 * (top_m - base_m)))
             new_bands.append(
                 {
                     "label": "fog",
                     "base_asl_m": round(base_m, 1),
                     "top_asl_m": round(top_m, 1),
                     "cloud_fraction": round(low_cf, 3),
-                    "optical_depth_vertical": round(max(0.08, low_cf * tau_lwp), 2),
+                    "optical_depth_vertical": round(tau_grid_fog, 2),
                     "aspect_ratio_h_over_d": 0.06,
                     "characteristic_cell_km": 13.0 if low_cf > 0.65 else 5.5,
                     "ice_fraction": 0.0,
@@ -1401,14 +1531,17 @@ def apply_hrrr_column_to_sounding(
             conv_boost = min(1600.0, math.sqrt(max(0.0, float(st["cape_j_kg"]))) * 40.0)
             low_top = max(low_base + 360.0, float(hrrr_col["z_850_m"]) + 320.0 + conv_boost)
             lwp_v = float(hrrr_col["tcolw_kg_m2"])
-            tau_cu = min(28.0, max(2.2, 115.0 * lwp_v)) if lwp_v >= 0.015 else min(26.0, 0.014 * (low_top - low_base))
+            if lwp_v >= 0.015:
+                tau_grid_cu = min(28.0, max(0.08, 115.0 * lwp_v))
+            else:
+                tau_grid_cu = max(0.08, low_cf * min(26.0, 0.014 * (low_top - low_base)))
             new_bands.append(
                 {
                     "label": "low",
                     "base_asl_m": round(low_base, 1),
                     "top_asl_m": round(low_top, 1),
                     "cloud_fraction": round(low_cf, 3),
-                    "optical_depth_vertical": round(max(0.08, low_cf * tau_cu), 2),
+                    "optical_depth_vertical": round(tau_grid_cu, 2),
                     "aspect_ratio_h_over_d": round(min(1.05, 0.18 + math.sqrt(max(0.0, float(st["cape_j_kg"]))) * 0.022), 2),
                     "characteristic_cell_km": 2.5 if float(st["cape_j_kg"]) > 120.0 else 6.0,
                     "ice_fraction": round(max(0.0, min(1.0, (-float(st["temp_850_c"]) - 2.0) / 22.0)), 2),

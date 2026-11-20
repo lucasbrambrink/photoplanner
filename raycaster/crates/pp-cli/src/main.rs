@@ -17,6 +17,8 @@ use pp_trails::{
     RecreationDbHarness,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::io::{self, BufRead, BufWriter, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -248,10 +250,109 @@ enum Commands {
         /// Optional JSON file containing `CorridorBatchInput` (`{ corridor, hourly_evals }`) or `AtmosphericCorridorState`
         #[arg(long)]
         corridor_json: Option<PathBuf>,
+        /// Skip 2D WebGL2 CorridorRadiativeLut generation (faster for backtesting & batch ranking)
+        #[arg(long, default_value_t = false)]
+        skip_lut: bool,
         /// Optional output JSON file path
         #[arg(long)]
         json_out: Option<PathBuf>,
     },
+
+    /// Persistent NDJSON stdin/stdout worker daemon holding an in-memory i16 SRTM LRU cache
+    /// and 1m near-field LiDAR cache for sub-10ms warm corridor raycasts and terrain patches
+    Worker {
+        /// Maximum number of full land SRTM tiles held in RAM (ocean tiles exempt; ~26 MB/tile in i16)
+        #[arg(long, default_value_t = 48)]
+        max_srtm_tiles: usize,
+        /// Maximum number of 1m near-field MaxMipmapGrid1m grids held in RAM
+        #[arg(long, default_value_t = 6)]
+        max_near_grids: usize,
+    },
+}
+
+fn default_sun_az() -> f64 {
+    252.0
+}
+fn default_sun_el() -> f64 {
+    1.5
+}
+fn default_near_grid_m() -> usize {
+    1800
+}
+fn default_az_bins() -> usize {
+    180
+}
+fn default_alt_bins() -> usize {
+    32
+}
+fn default_span_m() -> f64 {
+    9000.0
+}
+fn default_grid_size() -> usize {
+    256
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum WorkerRequest {
+    Ping,
+    Shutdown,
+    CorridorRaycast {
+        lat: f64,
+        lon: f64,
+        #[serde(default)]
+        target_asl_m: Option<f64>,
+        #[serde(default = "default_sun_az")]
+        sun_az_deg: f64,
+        #[serde(default = "default_sun_el")]
+        sun_el_deg: f64,
+        #[serde(default = "default_near_grid_m")]
+        near_grid_m: usize,
+        #[serde(default = "default_az_bins")]
+        az_bins: usize,
+        #[serde(default = "default_alt_bins")]
+        alt_bins: usize,
+        #[serde(default)]
+        skip_lut: bool,
+        #[serde(default)]
+        corridor: Option<AtmosphericCorridorState>,
+        #[serde(default)]
+        hourly_evals: Vec<HourlyCorridorEvalInput>,
+    },
+    TerrainPatch {
+        lat: f64,
+        lon: f64,
+        #[serde(default = "default_span_m")]
+        span_m: f64,
+        #[serde(default = "default_grid_size")]
+        grid_size: usize,
+        #[serde(default = "default_near_grid_m")]
+        near_grid_m: usize,
+    },
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(((bytes.len() + 2) / 3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }
 
 fn resolve_data_dir() -> PathBuf {
@@ -278,6 +379,17 @@ fn resolve_data_dir() -> PathBuf {
     PathBuf::from("/tmp/photoplanner_data")
 }
 
+fn collect_srtm_search_dirs(elevation_dir: &PathBuf) -> Vec<PathBuf> {
+    let mut search_dirs = Vec::new();
+    if let Ok(env_el) = std::env::var("PHOTOPLANNER_ELEVATION_DIR") {
+        search_dirs.push(PathBuf::from(env_el));
+    }
+    if elevation_dir.exists() {
+        search_dirs.push(elevation_dir.clone());
+    }
+    search_dirs
+}
+
 fn load_hybrid_terrain_with_corridor(
     elevation_dir: &PathBuf,
     center_lat: f64,
@@ -288,13 +400,7 @@ fn load_hybrid_terrain_with_corridor(
 ) -> HybridTerrain {
     let data_dir = resolve_data_dir();
     let srtm_cache_dir = data_dir.join("srtm_cache");
-    let mut search_dirs = Vec::new();
-    if let Ok(env_el) = std::env::var("PHOTOPLANNER_ELEVATION_DIR") {
-        search_dirs.push(PathBuf::from(env_el));
-    }
-    if elevation_dir.exists() {
-        search_dirs.push(elevation_dir.clone());
-    }
+    let search_dirs = collect_srtm_search_dirs(elevation_dir);
 
     let mut srtm = SrtmCache::with_aws_skadi_cache(search_dirs, srtm_cache_dir);
     if corridor_reach_km > 65.0 {
@@ -340,6 +446,444 @@ fn load_hybrid_terrain(
         165.0,
         None,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_corridor_raycast_on_terrain(
+    terrain: &HybridTerrain,
+    lat: f64,
+    lon: f64,
+    target_asl_m: Option<f64>,
+    sun_az_deg: f64,
+    sun_el_deg: f64,
+    az_bins: usize,
+    alt_bins: usize,
+    skip_lut: bool,
+    corridor_opt: Option<AtmosphericCorridorState>,
+    hourly_evals: &[HourlyCorridorEvalInput],
+    terrain_ms: f64,
+) -> serde_json::Value {
+    let ground_asl_m = terrain.elevation_m(lat, lon);
+    let origin_asl_m = target_asl_m
+        .map(|z| z.max(ground_asl_m + 1.8))
+        .unwrap_or(ground_asl_m + 1.8);
+
+    let corridor = corridor_opt.unwrap_or_else(|| {
+        AtmosphericCorridorState::clear_standard(lat, lon, origin_asl_m, sun_az_deg)
+    });
+
+    let t_int = Instant::now();
+    let primary_ray = evaluate_corridor_ray(
+        terrain,
+        &corridor,
+        lat,
+        lon,
+        origin_asl_m,
+        sun_az_deg,
+        sun_el_deg,
+    );
+    let overhead_canvas =
+        evaluate_overhead_cloud_canvas(terrain, &corridor, lat, lon, sun_az_deg, sun_el_deg);
+    let lut_opt = if skip_lut {
+        None
+    } else {
+        Some(compute_corridor_radiative_lut(
+            terrain, &corridor, lat, lon, sun_el_deg, az_bins, alt_bins,
+        ))
+    };
+
+    let mut hourly_outputs = Vec::with_capacity(hourly_evals.len());
+    for he in hourly_evals {
+        let st_corr = he.corridor.as_ref().unwrap_or(&corridor);
+        let h_ray = evaluate_corridor_ray(
+            terrain,
+            st_corr,
+            lat,
+            lon,
+            origin_asl_m,
+            he.sun_az_deg,
+            he.sun_el_deg,
+        );
+        let h_canvas = evaluate_overhead_cloud_canvas(
+            terrain,
+            st_corr,
+            lat,
+            lon,
+            he.sun_az_deg,
+            he.sun_el_deg,
+        );
+        let h_lut_b64 = if !skip_lut && he.include_lut {
+            Some(
+                compute_corridor_radiative_lut(
+                    terrain,
+                    st_corr,
+                    lat,
+                    lon,
+                    he.sun_el_deg,
+                    az_bins,
+                    alt_bins,
+                )
+                .to_base64(),
+            )
+        } else {
+            None
+        };
+        hourly_outputs.push(HourlyCorridorEvalOutput {
+            hour_index: he.hour_index,
+            time_local: he.time_local.clone(),
+            sun_az_deg: he.sun_az_deg,
+            sun_el_deg: he.sun_el_deg,
+            ray: h_ray,
+            overhead_canvas: h_canvas,
+            lut_rgba8_b64: h_lut_b64,
+        });
+    }
+    let integrate_ms = t_int.elapsed().as_secs_f64() * 1000.0;
+
+    let corridor_lut_json = if let Some(ref lut) = lut_opt {
+        serde_json::json!({
+            "az_bins": lut.az_bins,
+            "alt_bins": lut.alt_bins,
+            "start_distance_m": lut.start_distance_m,
+            "max_altitude_asl_m": lut.max_altitude_asl_m,
+            "altitude_gamma": lut.altitude_gamma,
+            "horizon_min_deg": lut.horizon_min_deg,
+            "horizon_span_deg": lut.horizon_span_deg,
+            "sun_elevation_deg": lut.sun_elevation_deg,
+            "rgba8_b64": lut.to_base64(),
+        })
+    } else {
+        serde_json::json!({
+            "az_bins": 0,
+            "alt_bins": 0,
+            "start_distance_m": 4600.0,
+            "max_altitude_asl_m": 12500.0,
+            "altitude_gamma": 1.6,
+            "horizon_min_deg": -6.0,
+            "horizon_span_deg": 32.0,
+            "sun_elevation_deg": sun_el_deg,
+            "rgba8_b64": "",
+        })
+    };
+
+    serde_json::json!({
+        "compute_backend": gpu_backend_info().unwrap_or_else(|| "Multi-Core Rayon CPU".to_string()),
+        "timing_ms": {
+            "terrain_load_ms": (terrain_ms * 100.0).round() / 100.0,
+            "corridor_integrate_ms": (integrate_ms * 100.0).round() / 100.0,
+        },
+        "srtm_tiles_loaded": terrain.far_srtm.tiles.len(),
+        "primary_ray": primary_ray,
+        "overhead_canvas": overhead_canvas,
+        "corridor_lut": corridor_lut_json,
+        "hourly_results": hourly_outputs,
+    })
+}
+
+fn near_grid_key(lat: f64, lon: f64, size_m: usize) -> (i32, i32, usize) {
+    (
+        (lat * 10_000.0).round() as i32,
+        (lon * 10_000.0).round() as i32,
+        size_m,
+    )
+}
+
+fn checkout_near_grid(
+    near_cache: &mut VecDeque<((i32, i32, usize), MaxMipmapGrid1m)>,
+    cache_dir: &PathBuf,
+    srtm: &SrtmCache,
+    lat: f64,
+    lon: f64,
+    near_grid_m: usize,
+) -> (Option<((i32, i32, usize), MaxMipmapGrid1m)>, bool) {
+    if near_grid_m == 0 {
+        return (None, true);
+    }
+    let clamped_m = near_grid_m.min(2000);
+    let key = near_grid_key(lat, lon, clamped_m);
+    if let Some(pos) = near_cache.iter().position(|(k, _)| *k == key) {
+        let entry = near_cache.remove(pos).unwrap();
+        return (Some(entry), true);
+    }
+    let grid = MaxMipmapGrid1m::fetch_or_load_3dep_1m(
+        cache_dir, srtm, lat, lon, clamped_m, clamped_m,
+    );
+    (Some((key, grid)), false)
+}
+
+fn checkin_near_grid(
+    near_cache: &mut VecDeque<((i32, i32, usize), MaxMipmapGrid1m)>,
+    max_near_grids: usize,
+    entry: Option<((i32, i32, usize), MaxMipmapGrid1m)>,
+) {
+    if let Some((key, grid)) = entry {
+        if max_near_grids == 0 {
+            return;
+        }
+        near_cache.push_back((key, grid));
+        while near_cache.len() > max_near_grids {
+            near_cache.pop_front();
+        }
+    }
+}
+
+fn write_ndjson_line<W: Write>(writer: &mut W, value: &serde_json::Value) -> io::Result<()> {
+    serde_json::to_writer(&mut *writer, value)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    writer.write_all(b"\n")?;
+    writer.flush()
+}
+
+fn run_persistent_worker(
+    elevation_dir: &PathBuf,
+    max_srtm_tiles: usize,
+    max_near_grids: usize,
+) -> Result<()> {
+    let data_dir = resolve_data_dir();
+    let srtm_cache_dir = data_dir.join("srtm_cache");
+    let dep_cache_dir = data_dir.join("3dep_cache");
+    let search_dirs = collect_srtm_search_dirs(elevation_dir);
+    let srtm_cap = max_srtm_tiles.max(1);
+
+    let srtm = SrtmCache::with_aws_skadi_cache(search_dirs, srtm_cache_dir)
+        .with_max_land_tiles(srtm_cap);
+    let mut terrain = HybridTerrain::new(None, srtm);
+    let mut near_cache: VecDeque<((i32, i32, usize), MaxMipmapGrid1m)> = VecDeque::new();
+    let mut last_near_key: Option<(i32, i32, usize)> = None;
+    let mut requests_served: u64 = 0;
+
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut writer = BufWriter::new(stdout.lock());
+
+    for line_res in stdin.lock().lines() {
+        let line = match line_res {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let req: WorkerRequest = match serde_json::from_str(trimmed) {
+            Ok(r) => r,
+            Err(err) => {
+                let err_resp = serde_json::json!({
+                    "ok": false,
+                    "error": format!("Invalid worker request JSON: {}", err),
+                });
+                if write_ndjson_line(&mut writer, &err_resp).is_err() {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        match req {
+            WorkerRequest::Ping => {
+                let resp = serde_json::json!({
+                    "ok": true,
+                    "op": "ping",
+                    "pid": std::process::id(),
+                    "compute_backend": gpu_backend_info().unwrap_or_else(|| "Multi-Core Rayon CPU".to_string()),
+                    "srtm_tiles_loaded": terrain.far_srtm.tiles.len(),
+                    "srtm_land_tiles_cached": terrain.far_srtm.land_tile_count(),
+                    "srtm_max_land_tiles": srtm_cap,
+                    "srtm_resident_mb": (terrain.far_srtm.resident_mb() * 100.0).round() / 100.0,
+                    "near_grids_cached": near_cache.len(),
+                    "max_near_grids": max_near_grids,
+                    "requests_served": requests_served,
+                });
+                if write_ndjson_line(&mut writer, &resp).is_err() {
+                    break;
+                }
+            }
+            WorkerRequest::Shutdown => {
+                let resp = serde_json::json!({
+                    "ok": true,
+                    "op": "shutdown",
+                    "requests_served": requests_served,
+                });
+                let _ = write_ndjson_line(&mut writer, &resp);
+                break;
+            }
+            WorkerRequest::CorridorRaycast {
+                lat,
+                lon,
+                target_asl_m,
+                sun_az_deg,
+                sun_el_deg,
+                near_grid_m,
+                az_bins,
+                alt_bins,
+                skip_lut,
+                corridor,
+                hourly_evals,
+            } => {
+                let t0 = Instant::now();
+                let (n_loaded, n_evicted) =
+                    terrain
+                        .far_srtm
+                        .preload_corridor_wedge_tracked(lat, lon, 200.0, None);
+
+                let (near_entry, near_hit) = checkout_near_grid(
+                    &mut near_cache,
+                    &dep_cache_dir,
+                    &terrain.far_srtm,
+                    lat,
+                    lon,
+                    near_grid_m,
+                );
+                let active_near_key = near_entry.as_ref().map(|(k, _)| *k);
+                let terrain_changed = n_loaded > 0 || n_evicted > 0 || active_near_key != last_near_key;
+                if let Some((_, grid)) = near_entry {
+                    terrain.near_1m = Some(grid);
+                } else {
+                    terrain.near_1m = None;
+                }
+                if terrain_changed {
+                    terrain.bump_cache_id();
+                    last_near_key = active_near_key;
+                }
+                let terrain_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+                let mut result = execute_corridor_raycast_on_terrain(
+                    &terrain,
+                    lat,
+                    lon,
+                    target_asl_m,
+                    sun_az_deg,
+                    sun_el_deg,
+                    az_bins,
+                    alt_bins,
+                    skip_lut,
+                    corridor,
+                    &hourly_evals,
+                    terrain_ms,
+                );
+
+                // Move near-field grid back into the LRU cache (zero cloning)
+                let moved_back = active_near_key.zip(terrain.near_1m.take());
+                checkin_near_grid(&mut near_cache, max_near_grids, moved_back);
+
+                requests_served += 1;
+                if let Some(obj) = result.as_object_mut() {
+                    obj.insert(
+                        "worker_meta".to_string(),
+                        serde_json::json!({
+                            "worker_cache_hit": n_loaded == 0 && near_hit,
+                            "srtm_newly_loaded": n_loaded,
+                            "srtm_evicted": n_evicted,
+                            "srtm_land_tiles_cached": terrain.far_srtm.land_tile_count(),
+                            "srtm_resident_mb": (terrain.far_srtm.resident_mb() * 100.0).round() / 100.0,
+                            "near_grid_cache_hit": near_hit,
+                            "near_grids_cached": near_cache.len(),
+                        }),
+                    );
+                }
+
+                let resp = serde_json::json!({
+                    "ok": true,
+                    "op": "corridor_raycast",
+                    "result": result,
+                });
+                if write_ndjson_line(&mut writer, &resp).is_err() {
+                    break;
+                }
+            }
+            WorkerRequest::TerrainPatch {
+                lat,
+                lon,
+                span_m,
+                grid_size,
+                near_grid_m,
+            } => {
+                let t0 = Instant::now();
+                let (n_loaded, n_evicted) = terrain.far_srtm.preload_bbox_tracked(
+                    lat - 0.6,
+                    lon - 0.6,
+                    lat + 0.6,
+                    lon + 0.6,
+                );
+                let clamped_near = if near_grid_m == 0 { 0 } else { near_grid_m.min(2000) };
+                let (near_entry, near_hit) = checkout_near_grid(
+                    &mut near_cache,
+                    &dep_cache_dir,
+                    &terrain.far_srtm,
+                    lat,
+                    lon,
+                    clamped_near,
+                );
+                let active_near_key = near_entry.as_ref().map(|(k, _)| *k);
+                let terrain_changed = n_loaded > 0 || n_evicted > 0 || active_near_key != last_near_key;
+                if let Some((_, grid)) = near_entry {
+                    terrain.near_1m = Some(grid);
+                } else {
+                    terrain.near_1m = None;
+                }
+                if terrain_changed {
+                    terrain.bump_cache_id();
+                    last_near_key = active_near_key;
+                }
+                let terrain_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+                let t_eval = Instant::now();
+                let m_per_lat = METERS_PER_DEG_LAT;
+                let m_per_lon = meters_per_deg_lon(lat);
+                let safe_grid = grid_size.clamp(2, 1025);
+                let step_m = span_m / ((safe_grid - 1).max(1) as f64);
+                let (min_z, max_z, elevations) =
+                    compute_terrain_patch_elevations(&terrain, lat, lon, span_m, safe_grid);
+                let eval_ms = t_eval.elapsed().as_secs_f64() * 1000.0;
+
+                let moved_back = active_near_key.zip(terrain.near_1m.take());
+                checkin_near_grid(&mut near_cache, max_near_grids, moved_back);
+
+                let mut raw_le = Vec::with_capacity(elevations.len() * 4);
+                for v in &elevations {
+                    raw_le.extend_from_slice(&v.to_le_bytes());
+                }
+                let elevations_b64 = encode_base64(&raw_le);
+
+                requests_served += 1;
+                let resp = serde_json::json!({
+                    "ok": true,
+                    "op": "terrain_patch",
+                    "result": {
+                        "center_lat": lat,
+                        "center_lon": lon,
+                        "span_m": span_m,
+                        "grid_size": safe_grid,
+                        "step_m": step_m,
+                        "min_elevation_m": min_z,
+                        "max_elevation_m": max_z,
+                        "meters_per_deg_lat": m_per_lat,
+                        "meters_per_deg_lon": m_per_lon,
+                        "elevations_f32_le_b64": elevations_b64,
+                        "timing_ms": {
+                            "terrain_load_ms": (terrain_ms * 100.0).round() / 100.0,
+                            "patch_eval_ms": (eval_ms * 100.0).round() / 100.0,
+                        },
+                        "worker_meta": {
+                            "worker_cache_hit": n_loaded == 0 && near_hit,
+                            "srtm_newly_loaded": n_loaded,
+                            "srtm_evicted": n_evicted,
+                            "srtm_land_tiles_cached": terrain.far_srtm.land_tile_count(),
+                            "srtm_resident_mb": (terrain.far_srtm.resident_mb() * 100.0).round() / 100.0,
+                            "near_grid_cache_hit": near_hit,
+                            "near_grids_cached": near_cache.len(),
+                        },
+                    },
+                });
+                if write_ndjson_line(&mut writer, &resp).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -933,6 +1477,7 @@ fn main() -> Result<()> {
             az_bins,
             alt_bins,
             corridor_json,
+            skip_lut,
             json_out,
         } => {
             let t0 = Instant::now();
@@ -946,130 +1491,45 @@ fn main() -> Result<()> {
             );
             let terrain_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-            let ground_asl_m = terrain.elevation_m(lat, lon);
-            let origin_asl_m = target_asl_m
-                .map(|z| z.max(ground_asl_m + 1.8))
-                .unwrap_or(ground_asl_m + 1.8);
-
-            let (corridor, hourly_evals) = if let Some(ref cpath) = corridor_json {
+            let (corridor_opt, hourly_evals) = if let Some(ref cpath) = corridor_json {
                 let raw = std::fs::read_to_string(cpath)?;
                 if let Ok(batch) = serde_json::from_str::<CorridorBatchInput>(&raw) {
-                    (batch.corridor, batch.hourly_evals)
+                    (Some(batch.corridor), batch.hourly_evals)
                 } else {
                     let single: AtmosphericCorridorState = serde_json::from_str(&raw)?;
-                    (single, Vec::new())
+                    (Some(single), Vec::new())
                 }
             } else {
-                (
-                    AtmosphericCorridorState::clear_standard(lat, lon, origin_asl_m, sun_az_deg),
-                    Vec::new(),
-                )
+                (None, Vec::new())
             };
 
-            let t_int = Instant::now();
-            let primary_ray = evaluate_corridor_ray(
+            let payload = execute_corridor_raycast_on_terrain(
                 &terrain,
-                &corridor,
                 lat,
                 lon,
-                origin_asl_m,
+                target_asl_m,
                 sun_az_deg,
-                sun_el_deg,
-            );
-            let overhead_canvas = evaluate_overhead_cloud_canvas(
-                &terrain,
-                &corridor,
-                lat,
-                lon,
-                sun_az_deg,
-                sun_el_deg,
-            );
-            let lut = compute_corridor_radiative_lut(
-                &terrain,
-                &corridor,
-                lat,
-                lon,
                 sun_el_deg,
                 az_bins,
                 alt_bins,
+                skip_lut,
+                corridor_opt,
+                &hourly_evals,
+                terrain_ms,
             );
-
-            let mut hourly_outputs = Vec::with_capacity(hourly_evals.len());
-            for he in &hourly_evals {
-                let st_corr = he.corridor.as_ref().unwrap_or(&corridor);
-                let h_ray = evaluate_corridor_ray(
-                    &terrain,
-                    st_corr,
-                    lat,
-                    lon,
-                    origin_asl_m,
-                    he.sun_az_deg,
-                    he.sun_el_deg,
-                );
-                let h_canvas = evaluate_overhead_cloud_canvas(
-                    &terrain,
-                    st_corr,
-                    lat,
-                    lon,
-                    he.sun_az_deg,
-                    he.sun_el_deg,
-                );
-                let h_lut_b64 = if he.include_lut {
-                    Some(
-                        compute_corridor_radiative_lut(
-                            &terrain,
-                            st_corr,
-                            lat,
-                            lon,
-                            he.sun_el_deg,
-                            az_bins,
-                            alt_bins,
-                        )
-                        .to_base64(),
-                    )
-                } else {
-                    None
-                };
-                hourly_outputs.push(HourlyCorridorEvalOutput {
-                    hour_index: he.hour_index,
-                    time_local: he.time_local.clone(),
-                    sun_az_deg: he.sun_az_deg,
-                    sun_el_deg: he.sun_el_deg,
-                    ray: h_ray,
-                    overhead_canvas: h_canvas,
-                    lut_rgba8_b64: h_lut_b64,
-                });
-            }
-            let integrate_ms = t_int.elapsed().as_secs_f64() * 1000.0;
-
-            let payload = serde_json::json!({
-                "compute_backend": gpu_backend_info().unwrap_or_else(|| "Multi-Core Rayon CPU".to_string()),
-                "timing_ms": {
-                    "terrain_load_ms": (terrain_ms * 100.0).round() / 100.0,
-                    "corridor_integrate_ms": (integrate_ms * 100.0).round() / 100.0,
-                },
-                "srtm_tiles_loaded": terrain.far_srtm.tiles.len(),
-                "primary_ray": primary_ray,
-                "overhead_canvas": overhead_canvas,
-                "corridor_lut": {
-                    "az_bins": lut.az_bins,
-                    "alt_bins": lut.alt_bins,
-                    "start_distance_m": lut.start_distance_m,
-                    "max_altitude_asl_m": lut.max_altitude_asl_m,
-                    "altitude_gamma": lut.altitude_gamma,
-                    "horizon_min_deg": lut.horizon_min_deg,
-                    "horizon_span_deg": lut.horizon_span_deg,
-                    "sun_elevation_deg": lut.sun_elevation_deg,
-                    "rgba8_b64": lut.to_base64(),
-                },
-                "hourly_results": hourly_outputs,
-            });
 
             if let Some(out_path) = json_out {
                 std::fs::write(&out_path, serde_json::to_string(&payload)?)?;
             } else {
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             }
+        }
+
+        Commands::Worker {
+            max_srtm_tiles,
+            max_near_grids,
+        } => {
+            run_persistent_worker(&cli.elevation_dir, max_srtm_tiles, max_near_grids)?;
         }
     }
 

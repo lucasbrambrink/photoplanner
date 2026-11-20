@@ -669,7 +669,7 @@ struct GpuCloudBand {
     float tau_core_vert;
     float cell_d_m;
     float delta_edd_factor;
-    float _pad0;
+    float max_slant_airmass;
     float _pad1;
 };
 
@@ -713,6 +713,8 @@ kernel void kernel_corridor_radiative_lut(
     float z_asl = 12500.0f * pow(max(v_norm, 0.0f), 1.6f);
 
     float k_ref = clamp(params.refraction_k, 0.05f, 0.55f);
+    float k_std = 0.135f;
+    float k_excess = max(0.0f, k_ref - k_std);
     float earth_r = 6371008.8f;
     float r_eff = earth_r / (1.0f - k_ref);
 
@@ -747,6 +749,9 @@ kernel void kernel_corridor_radiative_lut(
     float weights[32];
 
     float s_m = max(0.0f, params.start_dist_m);
+    float z_cur_m = z_asl + s_m * tan_alpha0 + (s_m * s_m) / (2.0f * r_eff);
+    float slope_cur = tan_alpha0 + s_m / r_eff;
+
     while (s_m < atmo_limit_m) {
         bool in_weather = (s_m < params.max_corridor_m);
         float base_ds_m = (!in_weather) ? 8000.0f : ((s_m < 10000.0f) ? 250.0f : ((s_m < 40000.0f) ? 600.0f : ((s_m < 120000.0f) ? 1250.0f : 2500.0f)));
@@ -759,11 +764,19 @@ kernel void kernel_corridor_radiative_lut(
         s_m = step_end_m;
         if (step_horiz_m <= 0.0f) break;
 
-        float drop_mid = (s_mid_m * s_mid_m) / (2.0f * r_eff);
-        float z_ray_m = z_asl + s_mid_m * tan_alpha0 + drop_mid;
+        float k_local = clamp(
+            k_std * exp(-max(0.0f, z_cur_m) / 8434.0f)
+            + k_excess * exp(-max(0.0f, z_cur_m - 1200.0f) / 1000.0f),
+            0.0f, 0.55f
+        );
+        float inv_r_eff = (1.0f - k_local) / earth_r;
+        float z_ray_m = z_cur_m + 0.5f * step_horiz_m * slope_cur + 0.125f * step_horiz_m * step_horiz_m * inv_r_eff;
+        float dz_ds = slope_cur + 0.5f * step_horiz_m * inv_r_eff;
+        z_cur_m += step_horiz_m * slope_cur + 0.5f * step_horiz_m * step_horiz_m * inv_r_eff;
+        slope_cur += step_horiz_m * inv_r_eff;
+
         if (z_ray_m > 45000.0f || z_ray_m < -150.0f) break;
 
-        float dz_ds = tan_alpha0 + s_mid_m / r_eff;
         float dz_step_m = abs(step_horiz_m * dz_ds);
         float ds_path_m = sqrt(step_horiz_m * step_horiz_m + dz_step_m * dz_step_m);
         float s_km = min(s_mid_m, params.max_corridor_m) * 0.001f;
@@ -816,20 +829,32 @@ kernel void kernel_corridor_radiative_lut(
         }
 
         float h_ray = 8434.0f;
-        float t_local = max(212.0f, temp_k - lapse * 0.001f * max(0.0f, z_ray_m - surf_z));
-        float rho_rel = (press / 1013.25f) * exp(-max(0.0f, z_ray_m) / h_ray) * (288.15f / t_local);
+        float agl_signed = z_ray_m - surf_z;
+        float agl_m = max(0.0f, agl_signed);
+        float t_local = max(212.0f, temp_k - lapse * 0.001f * agl_m);
+        float p_local_rel = clamp((press / 1013.25f) * exp(-agl_signed / h_ray), 0.0f, 1.06f);
+        float rho_rel = p_local_rel * (288.15f / t_local);
         float d_ray_base = (ds_path_m / h_ray) * max(0.0f, rho_rel);
 
         float oz_dz = (z_ray_m - 22500.0f) / 5200.0f;
         float d_oz_scale = ds_path_m * (exp(-0.5f * oz_dz * oz_dz) / (2.5066283f * 5200.0f)) * (oz / 300.0f);
 
-        float agl_m = max(0.0f, z_ray_m - surf_z);
-        float inv_trap = 1.0f;
+        float z_step_lo = z_ray_m - 0.5f * dz_step_m;
+        float lid_asl = max(surf_z + 300.0f, pbl) + 600.0f;
+        float w_below = 1.0f;
+        float w_above = 0.35f;
         if (inv_str > 0.5f && inv_top > surf_z) {
-            inv_trap = (z_ray_m <= inv_top) ? (1.0f + min(1.4f, 0.22f * inv_str)) : 0.22f;
-        } else if (z_ray_m > max(surf_z + 300.0f, pbl) + 600.0f) {
-            inv_trap = 0.35f;
+            lid_asl = inv_top;
+            w_below = 1.0f + min(1.4f, 0.22f * inv_str);
+            w_above = 0.22f;
         }
+        float lid_agl = max(0.0f, lid_asl - surf_z);
+        float f_above = exp(-lid_agl / h_aer);
+        float norm = max(0.05f, w_below * (1.0f - f_above) + w_above * f_above);
+        float f_step_below = (dz_step_m > 1.0e-3f)
+            ? clamp((lid_asl - z_step_lo) / dz_step_m, 0.0f, 1.0f)
+            : ((z_ray_m <= lid_asl) ? 1.0f : 0.0f);
+        float inv_trap = (f_step_below * w_below + (1.0f - f_step_below) * w_above) / norm;
         float d_aer_550 = ds_path_m * (aod / h_aer) * exp(-agl_m / h_aer) * inv_trap;
 
         for (uint b = 0u; b < 6u; b++) {
@@ -856,7 +881,9 @@ kernel void kernel_corridor_radiative_lut(
                     float du_v = (dz_step_m / h_band) * neg_ln;
                     float du_g = (step_horiz_m / max(250.0f, cb.cell_d_m)) * neg_ln * (1.0f - 0.50f * c);
                     sum_cloud_hazard += w_st * sqrt(du_v * du_v + du_g * du_g);
-                    sum_uncond_cloudy_tau += w_st * c * (cb.tau_core_vert / h_band) * min(ds_path_m, h_band * 12.0f) * cb.delta_edd_factor;
+                    float local_slant = min(ds_path_m / max(dz_step_m, 1.0e-3f), cb.max_slant_airmass);
+                    float eff_band_frac = (dz_step_m / h_band) * local_slant;
+                    sum_uncond_cloudy_tau += w_st * c * cb.tau_core_vert * eff_band_frac * cb.delta_edd_factor;
                 }
             }
         }
@@ -1061,7 +1088,7 @@ struct GpuCloudBand {
     tau_core_vert: f32,
     cell_d_m: f32,
     delta_edd_factor: f32,
-    _pad0: f32,
+    max_slant_airmass: f32,
     _pad1: f32,
 }
 
@@ -1344,7 +1371,9 @@ impl MetalEngine {
             for key in tile_keys {
                 let tile = &terrain.far_srtm.tiles[&key];
                 let len = tile.data.len();
-                dst[cursor..cursor + len].copy_from_slice(&tile.data);
+                for (d, &v) in dst[cursor..cursor + len].iter_mut().zip(tile.data.iter()) {
+                    *d = v as f32;
+                }
                 srtm_metas.push(GpuSrtmTileMeta {
                     lat_floor: tile.lat_floor,
                     lon_floor: tile.lon_floor,
@@ -1793,8 +1822,8 @@ pub fn dispatch_corridor_lut_gpu(
                 let h_band = (b.top_asl_m - b.base_asl_m).max(80.0);
                 let cell_d_m = (b.characteristic_cell_km.max(0.25) * 1000.0)
                     .min((h_band / b.aspect_ratio_h_over_d.max(0.03)).max(250.0));
-                let g_asym = 0.85 * (1.0 - b.ice_fraction) + 0.77 * b.ice_fraction;
-                let delta_edd = 1.0 - g_asym * g_asym * 0.88;
+                let delta_edd = 0.30 * (1.0 - b.ice_fraction) + 0.20 * b.ice_fraction;
+                let max_slant_airmass = 7.5 * (1.0 - b.ice_fraction) + 4.2 * b.ice_fraction;
                 gpu_bands.push(GpuCloudBand {
                     base_asl_m: b.base_asl_m as f32,
                     top_asl_m: b.top_asl_m as f32,
@@ -1802,7 +1831,7 @@ pub fn dispatch_corridor_lut_gpu(
                     tau_core_vert: b.in_cloud_vertical_tau() as f32,
                     cell_d_m: cell_d_m as f32,
                     delta_edd_factor: delta_edd as f32,
-                    _pad0: 0.0,
+                    max_slant_airmass: max_slant_airmass as f32,
                     _pad1: 0.0,
                 });
                 band_count += 1;

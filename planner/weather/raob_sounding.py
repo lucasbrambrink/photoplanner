@@ -117,12 +117,13 @@ def _candidate_synoptic_times(target_utc: dt.datetime, causal_only: bool) -> lis
         base_day - dt.timedelta(hours=24),
     ]
     if causal_only:
-        # Allow 00Z/12Z nominal time once balloon release + boundary-layer ascent has occurred
-        # (23:15 UTC for 00Z, 11:15 UTC for 12Z -> nominal_ts - 45 min <= t_u)
-        candidates = [c for c in candidates if (c - dt.timedelta(minutes=45)) <= t_u]
+        # Operational radiosonde balloons launched ~45 min pre-nominal take ~90-120 min to reach
+        # 10 hPa and typically appear on GTS/IEM ~45-75 min AFTER nominal synoptic time.
+        # Enforce `nominal + 60 min <= t_u` so causal nowcasts & backtests never leak future 00Z/12Z soundings.
+        candidates = [c for c in candidates if (c + dt.timedelta(minutes=60)) <= t_u]
 
     candidates.sort(key=lambda c: abs((t_u - c).total_seconds()))
-    return [c for c in candidates if abs((t_u - c).total_seconds()) <= 14.0 * 3600.0]
+    return [c for c in candidates if abs((t_u - c).total_seconds()) <= 18.0 * 3600.0]
 
 
 def _analyze_raob_profile(
@@ -146,10 +147,15 @@ def _analyze_raob_profile(
         pr = row.get("pres")
         if h is None or tc is None or pr is None:
             continue
-        h_f = float(h)
-        tc_f = float(tc)
-        pr_f = float(pr)
-        dc_f = float(dc) if dc is not None else (tc_f - 18.0)
+        try:
+            h_f = float(h)
+            tc_f = float(tc)
+            pr_f = float(pr)
+            dc_f = float(dc) if (dc is not None and str(dc).strip() not in ("", "M")) else (tc_f - 18.0)
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(h_f) and math.isfinite(tc_f) and math.isfinite(pr_f) and math.isfinite(dc_f)):
+            continue
         rh_w, rh_eff = _rh_liquid_or_ice_pct(tc_f, dc_f)
         levels.append(
             {
@@ -239,11 +245,15 @@ def _analyze_raob_profile(
         stratus_top_m = round(max(stratus_top_m, min(inv_base_m + 35.0, stratus_top_m + 60.0)), 1)
 
     # 3. Multi-layer radiosonde cloud-fraction proxies (WMO / Wang-Rossow RH profiles)
-    def _band_cloud_proxy(z_min_agl: float, z_max_asl: float, rh_crit: float, rh_full: float) -> float:
+    # Use consistent ASL bounds (clamped >= st_elev_m) so high-elevation mountain stations
+    # like KREV (1,516 m) and KFGZ (2,192 m) never suffer multi-kilometer blind gaps between bands.
+    def _band_cloud_proxy_asl(z_min_asl: float, z_max_asl: float, rh_crit: float, rh_full: float) -> float:
+        lo_m = max(st_elev_m, z_min_asl)
+        hi_m = max(lo_m + 150.0, z_max_asl)
         band = [
             lv["rh_eff_pct"]
             for lv in levels
-            if (lv["hght_m"] >= st_elev_m + z_min_agl) and (lv["hght_m"] <= z_max_asl)
+            if (lv["hght_m"] >= lo_m) and (lv["hght_m"] <= hi_m)
         ]
         if not band:
             return 0.0
@@ -252,10 +262,10 @@ def _analyze_raob_profile(
             return 0.0
         return round(min(1.0, ((peak_rh - rh_crit) / max(2.0, rh_full - rh_crit)) ** 1.15), 3)
 
-    fog_cf_proxy = _band_cloud_proxy(0.0, max(st_elev_m + 650.0, inv_base_m or 750.0), 84.0, 96.5)
-    low_cf_proxy = _band_cloud_proxy(0.0, max(st_elev_m + 2400.0, 2500.0), 82.0, 96.0)
-    mid_cf_proxy = _band_cloud_proxy(2200.0, 6500.0, 78.0, 94.0)
-    high_cf_proxy = _band_cloud_proxy(6200.0, 14800.0, 72.0, 93.0)
+    fog_cf_proxy = _band_cloud_proxy_asl(st_elev_m, max(st_elev_m + 650.0, inv_base_m or 750.0), 84.0, 96.5)
+    low_cf_proxy = _band_cloud_proxy_asl(st_elev_m, max(st_elev_m + 1800.0, 2600.0), 82.0, 96.0)
+    mid_cf_proxy = _band_cloud_proxy_asl(max(st_elev_m + 1200.0, 2200.0), 6500.0, 78.0, 94.0)
+    high_cf_proxy = _band_cloud_proxy_asl(6200.0, 14800.0, 72.0, 93.0)
 
     def _wind_at_pres(target_p: float) -> list[float] | None:
         if not winds_by_pres:
@@ -342,8 +352,8 @@ def fetch_raob_sounding(
     RAOB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     now_mono = time.monotonic()
 
-    for d_km, sid, sname, slat, slon, selev in ranked_stations[:2]:
-        for syn_dt in synoptic_times[:2]:
+    for syn_dt in synoptic_times[:2]:
+        for d_km, sid, sname, slat, slon, selev in ranked_stations[:2]:
             ts_str = syn_dt.strftime("%Y%m%d%H00")
             cache_key = f"{sid}_{ts_str}"
             raw_levels: list[dict[str, Any]] | None = None

@@ -47,8 +47,10 @@ from .nwp_corridor import (
     local_tz_for_lon,
     offset_lat_lon_km,
 )
+from .calibration import load_calibration_bundle
 from .raob_sounding import fetch_raob_sounding
 from .station_obs import fetch_nearest_station_observation
+from .terrain_coupling import compute_lake_mirror_index, compute_probabilistic_fog_bands
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 RUST_BIN = ROOT_DIR / "raycaster" / "target" / "release" / "photoplanner"
@@ -500,8 +502,8 @@ def _blend_nowcast_into_station(
                     "top_asl_m": round(mid_top, 1),
                     "cloud_fraction": round(mid_cf, 3),
                     "optical_depth_vertical": round(max(0.06, tau_mid), 2),
-                    "aspect_ratio_h_over_d": 0.08 if is_cirrus_fallstreak else 0.22,
-                    "characteristic_cell_km": 22.0 if is_cirrus_fallstreak else 6.5,
+                    "aspect_ratio_h_over_d": 0.06 if is_cirrus_fallstreak else (0.09 if float(st.get("cape_j_kg", 0.0)) < 180.0 else 0.35),
+                    "characteristic_cell_km": 26.0 if is_cirrus_fallstreak else (15.0 if float(st.get("cape_j_kg", 0.0)) < 180.0 else 6.5),
                     "ice_fraction": 0.85 if is_cirrus_fallstreak else 0.35,
                 }
             )
@@ -528,8 +530,8 @@ def _blend_nowcast_into_station(
                     "top_asl_m": round(hi_top, 1),
                     "cloud_fraction": round(high_cf, 3),
                     "optical_depth_vertical": round(max(0.05, tau_hi), 2),
-                    "aspect_ratio_h_over_d": 0.08,
-                    "characteristic_cell_km": 16.0,
+                    "aspect_ratio_h_over_d": 0.05,
+                    "characteristic_cell_km": 28.0,
                     "ice_fraction": 1.0,
                 }
             )
@@ -1301,8 +1303,26 @@ def _invoke_rust_corridor_raycast(
     sun_az_deg: float,
     sun_el_deg: float,
     batch_input: dict[str, Any],
+    skip_lut: bool = False,
 ) -> dict[str, Any]:
-    """Invokes `./raycaster/target/release/photoplanner corridor-raycast` with `CorridorBatchInput`."""
+    """Invokes the persistent Rust `photoplanner worker` daemon (or one-shot CLI when disabled)."""
+    from ..rust_worker import get_rust_worker, is_rust_worker_enabled
+
+    if is_rust_worker_enabled():
+        return get_rust_worker().corridor_raycast(
+            lat=lat,
+            lon=lon,
+            target_elev_m=target_elev_m,
+            sun_az_deg=sun_az_deg,
+            sun_el_deg=sun_el_deg,
+            batch_input=batch_input,
+            skip_lut=skip_lut,
+            near_grid_m=1800,
+            az_bins=180,
+            alt_bins=32,
+            timeout=90.0,
+        )
+
     DEFAULT_ELEVATION_DIR.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f_in:
         json.dump(batch_input, f_in)
@@ -1339,7 +1359,9 @@ def _invoke_rust_corridor_raycast(
             "--json-out",
             str(out_path),
         ]
-        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=35)
+        if skip_lut:
+            cmd.append("--skip-lut")
+        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=90)
         return json.loads(out_path.read_text(encoding="utf-8"))
     finally:
         for p in (in_path, out_path):
@@ -1380,6 +1402,7 @@ def solve_weather_and_corridor(
     enable_multilayer_goes: bool = True,
     enable_raob: bool = True,
     enable_hrrr_s3: bool = True,
+    include_lut: bool = True,
 ) -> bytes:
     cal = {**CALIBRATION_CONFIG, **(calibration_overrides or {})}
     model_engine = (model_engine or "ensemble").lower().strip()
@@ -1401,8 +1424,8 @@ def solve_weather_and_corridor(
     sr_info, ss_info = _find_sunrise_sunset_golden_hours(lat, lon, req_date, tz_offset_hr)
     primary_mins = ss_info[0] if is_sunset else sr_info[0]
     conjugate_mins, conjugate_az, conjugate_el = sr_info if is_sunset else ss_info
-    primary_hr_idx = max(0, min(23, int(round(primary_mins / 60.0))))
-    conjugate_hr_idx = max(0, min(23, int(round(conjugate_mins / 60.0))))
+    primary_hr_idx = max(0, min(23, int(primary_mins // 60)))
+    conjugate_hr_idx = max(0, min(23, int(conjugate_mins // 60)))
 
     target_local_dt = dt.datetime(
         req_date.year,
@@ -1972,7 +1995,7 @@ def solve_weather_and_corridor(
         if hr == conjugate_hr_idx:
             eval_az, eval_el = conjugate_az, conjugate_el
             eval_time_str = f"{conjugate_mins // 60:02d}:{conjugate_mins % 60:02d}"
-            inc_lut = True
+            inc_lut = bool(include_lut)
         elif hr == primary_hr_idx:
             eval_az, eval_el = sun_az_deg, sun_el_deg
             eval_time_str = f"{primary_mins // 60:02d}:{primary_mins % 60:02d}"
@@ -1993,6 +2016,35 @@ def solve_weather_and_corridor(
             }
         )
 
+    # Append 5 exact golden-hour solar-elevation rays spanning [1.5 deg, 12.0 deg] for the
+    # requested sunrise/sunset phase so golden-hour direct-beam transmittance accurately resolves
+    # 3D ridge shadowing (e.g. a 4 deg ridge blocking 2.2/4.2 deg while clearing 6.5..11.2 deg)
+    # without hourly-slot alignment gaps.
+    golden_arc_targets = (2.2, 4.2, 6.5, 9.0, 11.2)
+    golden_arc_meta: list[tuple[int, str, float, float]] = []
+    scan_step = -2 if is_sunset else 2
+    scan_samples: list[tuple[int, float, float]] = []
+    for k_step in range(0, 68):
+        m_cand = max(0, min(1439, int(primary_mins) + k_step * scan_step))
+        az_c, el_c = _solar_ephemeris_local(lat, lon, req_date, float(m_cand), tz_offset_hr)
+        scan_samples.append((m_cand, az_c, el_c))
+    for idx_arc, tgt_el in enumerate(golden_arc_targets):
+        best_m, best_az, best_el = min(scan_samples, key=lambda s: abs(s[2] - tgt_el))
+        if best_el >= 0.5:
+            hr_arc = max(0, min(23, int(best_m // 60)))
+            t_arc_str = f"{best_m // 60:02d}:{best_m % 60:02d}"
+            golden_arc_meta.append((hr_arc, t_arc_str, best_az, best_el))
+            hourly_eval_inputs.append(
+                {
+                    "hour_index": 100 + idx_arc,
+                    "time_local": t_arc_str,
+                    "sun_az_deg": best_az,
+                    "sun_el_deg": best_el,
+                    "corridor": hourly_corridor_states[hr_arc],
+                    "include_lut": False,
+                }
+            )
+
     primary_corridor_state = hourly_corridor_states[primary_hr_idx]
     batch_input = {
         "corridor": primary_corridor_state,
@@ -2000,7 +2052,7 @@ def solve_weather_and_corridor(
     }
 
     rust_out = _invoke_rust_corridor_raycast(
-        lat, lon, target_elev_m, sun_az_deg, sun_el_deg, batch_input
+        lat, lon, target_elev_m, sun_az_deg, sun_el_deg, batch_input, skip_lut=(not include_lut)
     )
 
     primary_ray = rust_out["primary_ray"]
@@ -2954,6 +3006,52 @@ def solve_weather_and_corridor(
         "historical_replay": historical_replay_meta,
     }
 
+    golden_hour_arc: list[dict[str, Any]] = []
+    arc_rust_rows = hourly_rust_results[24:] if len(hourly_rust_results) > 24 else []
+    for arc_i, (hr_arc, t_arc_str, az_arc, el_arc) in enumerate(golden_arc_meta):
+        if arc_i >= len(arc_rust_rows):
+            break
+        r_arc = arc_rust_rows[arc_i] or {}
+        a_ray = r_arc.get("ray") or {}
+        a_blk = a_ray.get("dominant_blocker") or {}
+        a_snd = hourly_soundings_0km[hr_arc]
+        a_col_aod = (
+            0.65 * float(a_snd["rust_station"]["aod_550nm"])
+            + 0.35 * float(nwp_bundle["aod_100km_24h"][hr_arc])
+        )
+        a_exp, a_prob, a_p10, a_p50, a_p90 = _normalize_corridor_ray_pct(a_ray, a_col_aod)
+        a_disk = float(a_ray.get("terrain_disk_visibility", 1.0))
+        a_sky_exp = round(min(100.0, a_exp / a_disk), 1) if a_disk >= 0.05 else None
+        golden_hour_arc.append(
+            {
+                "time_local": t_arc_str,
+                "sun_az_deg": round(az_arc, 2),
+                "sun_el_deg": round(el_arc, 2),
+                "expected_transmittance_pct": a_exp,
+                "atmospheric_transmittance_pct": a_sky_exp,
+                "direct_beam_pct": a_prob,
+                "p10_pct": a_p10,
+                "p50_pct": a_p50,
+                "p90_pct": a_p90,
+                "terrain_disk_fraction": round(a_disk, 3),
+                "blocker_label": a_blk.get("blocker_type") or "clear",
+            }
+        )
+
+    if golden_hour_arc:
+        gh_exp_pct = round(sum(x["expected_transmittance_pct"] for x in golden_hour_arc) / len(golden_hour_arc), 1)
+        gh_p10_pct = round(sum(x["p10_pct"] for x in golden_hour_arc) / len(golden_hour_arc), 1)
+        gh_p50_pct = round(sum(x["p50_pct"] for x in golden_hour_arc) / len(golden_hour_arc), 1)
+        gh_p90_pct = round(sum(x["p90_pct"] for x in golden_hour_arc) / len(golden_hour_arc), 1)
+        _sky_vals = [x["atmospheric_transmittance_pct"] for x in golden_hour_arc if x["atmospheric_transmittance_pct"] is not None]
+        gh_atmo_pct = round(sum(_sky_vals) / len(_sky_vals), 1) if _sky_vals else gh_exp_pct
+    else:
+        gh_exp_pct = float(exp_trans_pct)
+        gh_p10_pct = float(p10_pct)
+        gh_p50_pct = float(p50_pct)
+        gh_p90_pct = float(p90_pct)
+        gh_atmo_pct = float(exp_trans_pct)
+
     corridor_raycast_summary = {
         "max_corridor_km": 380.0,
         "direct_beam_probability_pct": direct_prob_pct,
@@ -2961,6 +3059,12 @@ def solve_weather_and_corridor(
         "transmittance_p10_pct": p10_pct,
         "transmittance_p50_pct": p50_pct,
         "transmittance_p90_pct": p90_pct,
+        "golden_hour_expected_transmittance_pct": gh_exp_pct,
+        "golden_hour_atmospheric_transmittance_pct": gh_atmo_pct,
+        "golden_hour_p10_pct": gh_p10_pct,
+        "golden_hour_p50_pct": gh_p50_pct,
+        "golden_hour_p90_pct": gh_p90_pct,
+        "golden_hour_arc": golden_hour_arc,
         "color_temperature_kelvin": kelvin,
         "chappuis_rose_index": chappuis_rose,
         "terrain_disk_fraction": round(float(primary_ray.get("terrain_disk_visibility", 1.0)), 3),
@@ -2976,6 +3080,93 @@ def solve_weather_and_corridor(
         "segments": primary_ray.get("segments"),
         "overhead_canvas": overhead_canvas,
     }
+
+    calibrated_probabilities: dict[str, Any] | None = None
+    _cal_bundle = load_calibration_bundle()
+    if _cal_bundle is not None:
+        _t_cal, _i_cal = _cal_bundle
+        _cal_lead_h = max(0.0, float(lead_hours))
+        _c_p10, _c_p50, _c_p90 = _t_cal.predict_one(
+            raw_exp_pct=float(gh_exp_pct),
+            raw_p10_pct=float(gh_p10_pct),
+            raw_p90_pct=float(gh_p90_pct),
+            cloud_low_pct=float(st0["cloud_low_pct"]),
+            cloud_mid_pct=float(st0["cloud_mid_pct"]),
+            cloud_high_pct=float(st0["cloud_high_pct"]),
+            is_coastal=bool(is_coastal),
+            lead_hours=_cal_lead_h,
+        )
+        _above_fog_prob = _i_cal.predict_one(
+            clearance_ft=float(summit_clearance_ft),
+            lead_hours=_cal_lead_h,
+        )
+        calibrated_probabilities = {
+            "schema_version": "cal_v1",
+            "transmittance_p10_pct": round(_c_p10, 1),
+            "transmittance_p50_pct": round(_c_p50, 1),
+            "transmittance_p90_pct": round(_c_p90, 1),
+            "summit_above_fog_prob_pct": round(_above_fog_prob * 100.0, 1),
+            "n_unique_training_events": int(_t_cal.n_unique_events),
+        }
+
+    prob_fog_bands = compute_probabilistic_fog_bands(
+        fog_top_ft=fog_top_ft,
+        fog_base_ft=fog_base_ft,
+        target_elev_ft=target_elev_ft,
+        inversion_delta_t_f=inversion_delta_t_f,
+        lead_hours=lead_hours,
+        raob_assimilated=bool(st0.get("raob_assimilated")),
+        hrrr_s3_active=bool(has_hrrr_s3),
+        is_coastal=is_coastal,
+        calibrated_above_fog_prob_pct=(
+            calibrated_probabilities["summit_above_fog_prob_pct"]
+            if calibrated_probabilities is not None
+            else None
+        ),
+    )
+    inversion_model.update(
+        {
+            "fog_top_p10_ft": prob_fog_bands["fog_top_p10_ft"],
+            "fog_top_p50_ft": prob_fog_bands["fog_top_p50_ft"],
+            "fog_top_p90_ft": prob_fog_bands["fog_top_p90_ft"],
+            "fog_lid_sigma_ft": prob_fog_bands["fog_lid_sigma_ft"],
+            "summit_clearance_p10_ft": prob_fog_bands["summit_clearance_p10_ft"],
+            "summit_clearance_p50_ft": prob_fog_bands["summit_clearance_p50_ft"],
+            "summit_clearance_p90_ft": prob_fog_bands["summit_clearance_p90_ft"],
+            "summit_above_fog_prob_pct": prob_fog_bands["summit_above_fog_prob_pct"],
+            "breakout_verdict": prob_fog_bands["breakout_verdict"],
+            "probabilistic_summary": prob_fog_bands["summary"],
+        }
+    )
+
+    # Sample exact upwind 3D terrain horizon angle H(wind_dir_deg) from CorridorRadiativeLut alpha channel
+    # when available, falling back to cosine-weighted corridor horizon when skip_lut is enabled.
+    _az_diff_wind = abs(((wind_dir_deg - sun_az_deg + 540.0) % 360.0) - 180.0)
+    _corr_hor_deg = max(0.0, float(primary_ray.get("terrain_horizon_deg", 0.0)))
+    _upwind_hor_est = _corr_hor_deg * max(0.25, math.cos(math.radians(min(90.0, _az_diff_wind))))
+    try:
+        _lut_az = int(corridor_lut.get("az_bins") or 0)
+        _lut_alt = int(corridor_lut.get("alt_bins") or 0)
+        _lut_b64 = corridor_lut.get("rgba8_b64") or ""
+        if _lut_az > 0 and _lut_alt > 0 and _lut_b64:
+            _lut_bytes = base64.b64decode(_lut_b64)
+            _max_alt = float(corridor_lut.get("max_altitude_asl_m") or 12500.0)
+            _gamma = float(corridor_lut.get("altitude_gamma") or 1.6)
+            _h_min = float(corridor_lut.get("horizon_min_deg", -6.0))
+            _h_span = float(corridor_lut.get("horizon_span_deg", 32.0))
+            _v_norm = max(0.0, min(1.0, target_elev_m / max(1.0, _max_alt))) ** (1.0 / max(0.2, _gamma))
+            _iv = max(0, min(_lut_alt - 1, int(round(_v_norm * (_lut_alt - 1)))))
+            _iu = int(round((float(wind_dir_deg) % 360.0) / 360.0 * _lut_az)) % _lut_az
+            _off = (_iv * _lut_az + _iu) * 4 + 3
+            if _off < len(_lut_bytes):
+                _upwind_hor_est = max(0.0, _h_min + (_lut_bytes[_off] / 255.0) * _h_span)
+    except Exception:
+        pass
+    lake_mirror_reflection = compute_lake_mirror_index(
+        wind_speed_10m_mph=float(st0["wind_10m_kmh"]) * 0.621371,
+        wind_dir_deg=float(wind_dir_deg),
+        upwind_horizon_deg=_upwind_hor_est,
+    )
 
     payload_dict = {
         "date": req_date.isoformat(),
@@ -2996,6 +3187,7 @@ def solve_weather_and_corridor(
         "transmittance_p10_pct": p10_pct,
         "transmittance_p50_pct": p50_pct,
         "transmittance_p90_pct": p90_pct,
+        "calibrated_probabilities": calibrated_probabilities,
         "color_temperature_kelvin": kelvin,
         "chappuis_rose_index": chappuis_rose,
         "lcl_cloud_base_ft": lcl_cloud_base_ft,
@@ -3011,6 +3203,7 @@ def solve_weather_and_corridor(
         "wind_dir_deg": wind_dir_deg,
         "valley_inversion_fog_pct": inversion_chance_pct,
         "inversion_model": inversion_model,
+        "lake_mirror_reflection": lake_mirror_reflection,
         "ai_ensemble": ai_ensemble,
         "spatial_cloud_field": spatial_cloud_field,
         "mesoscale_cloud_grid": mesoscale_cloud_grid,

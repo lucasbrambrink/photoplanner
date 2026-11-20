@@ -473,6 +473,44 @@ pub fn tobler_speed_m_per_min(slope: f64) -> f64 {
     (speed_km_h * 0.85) * (1000.0 / 60.0)
 }
 
+/// Determines how many vertices of `route.geometry` represent unique trail path.
+///
+/// - **Loop** and **Point to Point** routes always scan 100% of vertices (never truncated).
+/// - **Out & Back** routes that are stored as a doubled track returning within 250 m of the
+///   trailhead stop at the true turnaround apex (maximum distance from the trailhead).
+/// - Single-leg Out & Back geometries (start and end > 250 m apart) scan 100% of vertices.
+pub fn effective_scan_len(route: &TrailRouteRecord) -> usize {
+    let n = route.geometry.len();
+    if n < 2 {
+        return n;
+    }
+    let rt = route.route_type.to_lowercase();
+    if rt.contains("loop") || rt.contains("point") {
+        return n;
+    }
+    let (lon0, lat0) = (route.geometry[0][0], route.geometry[0][1]);
+    let (lon_end, lat_end) = (route.geometry[n - 1][0], route.geometry[n - 1][1]);
+    let end_to_start_m = haversine_m(lat0, lon0, lat_end, lon_end);
+    if end_to_start_m > 250.0 {
+        // Single-leg geometry (does not double back to start)
+        return n;
+    }
+    // Doubled Out & Back: locate the actual turnaround apex farthest from trailhead
+    let mut apex_idx = n / 2;
+    let mut max_d = -1.0_f64;
+    for (i, pt) in route.geometry.iter().enumerate() {
+        let d = haversine_m(lat0, lon0, pt[1], pt[0]);
+        if d > max_d {
+            max_d = d;
+            apex_idx = i;
+        }
+    }
+    if max_d <= 250.0 {
+        return n;
+    }
+    (apex_idx + 1).max(2).min(n)
+}
+
 /// Samples candidate vantage points along a hike geometry, runs parallel 1m+SRTM horizon ray-casting
 /// to detect Light Notches from the trail, and calculates Tobler hike durations and departure times.
 pub fn build_itinerary_for_route(
@@ -497,17 +535,17 @@ pub fn build_itinerary_for_route(
         };
     }
 
-    // 1. Walk the first half of the route geometry (up to turnaround / apex) to compute cumulative
-    // distance, elevation gain, and Tobler hiking duration at every vertex.
-    let half_len = (route.geometry.len() / 2 + 1).max(2).min(route.geometry.len());
-    let mut cum_dist_m = vec![0.0_f64; half_len];
-    let mut cum_gain_m = vec![0.0_f64; half_len];
-    let mut cum_time_min = vec![0.0_f64; half_len];
-    let mut vertex_z = vec![0.0_f64; half_len];
+    // 1. Walk the full unique trail geometry (full loop/point-to-point, or up to turnaround apex
+    // on doubled out-and-back tracks) to compute cumulative distance, gain, and Tobler time.
+    let scan_len = effective_scan_len(route);
+    let mut cum_dist_m = vec![0.0_f64; scan_len];
+    let mut cum_gain_m = vec![0.0_f64; scan_len];
+    let mut cum_time_min = vec![0.0_f64; scan_len];
+    let mut vertex_z = vec![0.0_f64; scan_len];
 
     vertex_z[0] = terrain.elevation_m(route.geometry[0][1], route.geometry[0][0]);
 
-    for i in 1..half_len {
+    for i in 1..scan_len {
         let (lon0, lat0) = (route.geometry[i - 1][0], route.geometry[i - 1][1]);
         let (lon1, lat1) = (route.geometry[i][0], route.geometry[i][1]);
         let seg_d_m = haversine_m(lat0, lon0, lat1, lon1);
@@ -528,15 +566,14 @@ pub fn build_itinerary_for_route(
         cum_time_min[i] = cum_time_min[i - 1] + dt_min;
     }
 
-    // 2. Select `sample_count` spatially diverse candidate vertices along the trail
-    // prioritizing the upper/scenic half and destination turnaround
+    // 2. Select `sample_count` spatially diverse candidate vertices along the unique trail corridor
     let mut candidate_indices = Vec::new();
-    let step = (half_len / sample_count.max(1)).max(1);
-    for idx in (step..half_len).step_by(step) {
+    let step = (scan_len / sample_count.max(1)).max(1);
+    for idx in (step..scan_len).step_by(step) {
         candidate_indices.push(idx);
     }
-    if !candidate_indices.contains(&(half_len - 1)) {
-        candidate_indices.push(half_len - 1);
+    if !candidate_indices.contains(&(scan_len - 1)) {
+        candidate_indices.push(scan_len - 1);
     }
 
     // 3. Batch all sunrise & sunset 0.10° horizon windows across all candidate trail points into
@@ -778,25 +815,23 @@ pub fn find_best_viewpoints_for_seed(
             if route.geometry.len() < 2 {
                 return None;
             }
-            let half_len = (route.geometry.len() / 2 + 1)
-                .max(2)
-                .min(route.geometry.len());
+            let scan_len = effective_scan_len(route);
 
             let mut cum_dist_m = 0.0_f64;
             let mut cum_gain_m = 0.0_f64;
             let mut cum_time_min = 0.0_f64;
             let mut prev_z = terrain.elevation_m(route.geometry[0][1], route.geometry[0][0]);
 
-            let mut path_3d: Vec<[f64; 3]> = Vec::with_capacity(half_len);
+            let mut path_3d: Vec<[f64; 3]> = Vec::with_capacity(scan_len);
             path_3d.push([
                 route.geometry[0][0],
                 route.geometry[0][1],
                 (prev_z * 10.0).round() / 10.0,
             ]);
 
-            let mut samples = Vec::with_capacity(half_len / 3 + 2);
+            let mut samples = Vec::with_capacity(scan_len / 3 + 2);
 
-            for i in 1..half_len {
+            for i in 1..scan_len {
                 let (lon0, lat0) = (route.geometry[i - 1][0], route.geometry[i - 1][1]);
                 let (lon1, lat1) = (route.geometry[i][0], route.geometry[i][1]);
                 let seg_d_m = haversine_m(lat0, lon0, lat1, lon1);
@@ -817,7 +852,7 @@ pub fn find_best_viewpoints_for_seed(
                 cum_gain_m += gain;
                 cum_time_min += dt_min;
 
-                if i % 3 != 0 && i != half_len - 1 {
+                if i % 3 != 0 && i != scan_len - 1 {
                     continue;
                 }
                 samples.push((i, lat1, lon1, z1, cum_dist_m, cum_gain_m, cum_time_min));
@@ -1082,6 +1117,8 @@ pub fn analyze_custom_tripod_point(
     .max(10.0);
     let cam_eye_z = tripod_z + 1.75;
     let aim_z = target_3d.upper_face_z_m;
+    let drop_target = (total_d_m * total_d_m) / (2.0 * 6_371_000.0) * 0.87;
+    let eff_aim_z = aim_z - drop_target;
 
     let mut sightline_profile = Vec::with_capacity(steps + 1);
     let mut max_obstruction_m = 0.0_f64;
@@ -1096,7 +1133,7 @@ pub fn analyze_custom_tripod_point(
         let tz = terrain.elevation_m(slat, slon);
         let curv_drop = (d_m * d_m) / (2.0 * 6_371_000.0) * 0.87;
         let eff_tz = tz - curv_drop;
-        let ray_z = cam_eye_z + frac * (aim_z - cam_eye_z);
+        let ray_z = cam_eye_z + frac * (eff_aim_z - cam_eye_z);
 
         if s > 2 && s < steps - 2 {
             let diff = eff_tz - ray_z;
@@ -1125,22 +1162,20 @@ pub fn analyze_custom_tripod_point(
         if route.geometry.len() < 2 {
             continue;
         }
-        let half_len = (route.geometry.len() / 2 + 1)
-            .max(2)
-            .min(route.geometry.len());
+        let scan_len = effective_scan_len(route);
 
         let mut cum_dist_m = 0.0_f64;
         let mut cum_gain_m = 0.0_f64;
         let mut cum_time_min = 0.0_f64;
         let mut prev_z = terrain.elevation_m(route.geometry[0][1], route.geometry[0][0]);
-        let mut path_3d: Vec<[f64; 3]> = Vec::with_capacity(half_len);
+        let mut path_3d: Vec<[f64; 3]> = Vec::with_capacity(scan_len);
         path_3d.push([
             route.geometry[0][0],
             route.geometry[0][1],
             (prev_z * 10.0).round() / 10.0,
         ]);
 
-        for i in 1..half_len {
+        for i in 1..scan_len {
             let (lon0, lat0) = (route.geometry[i - 1][0], route.geometry[i - 1][1]);
             let (lon1, lat1) = (route.geometry[i][0], route.geometry[i][1]);
             let seg_d_m = haversine_m(lat0, lon0, lat1, lon1);
@@ -1281,5 +1316,431 @@ pub fn analyze_custom_tripod_point(
         horizon_curve,
     })
 }
+
+/// Task 3.1: A single resampled corridor point spaced every `150–250 m` along a trail.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrailCorridorSample {
+    pub milepost: f64,
+    pub lat: f64,
+    pub lon: f64,
+    pub elevation_m: f64,
+    pub elevation_ft: f64,
+    pub cumulative_gain_ft: f64,
+    pub tobler_minutes: u32,
+    pub slope_pct: f64,
+    pub horizon_openness_pct: f64,
+    pub above_fog_p50: bool,
+    pub above_fog_p90: bool,
+}
+
+/// A contiguous segment along a trail where hikers emerge into open skyline or above the fog lid.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrailBreakoutZone {
+    pub zone_kind: String, // "horizon_opening" | "fog_breakout"
+    pub start_milepost: f64,
+    pub end_milepost: f64,
+    pub peak_elevation_ft: f64,
+    pub peak_openness_pct: f64,
+    pub tobler_minutes_to_entry: u32,
+    pub summary: String,
+}
+
+/// Task 3.2: Four non-prescriptive trail photography nudge categories.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TrailNudgeCategory {
+    HorizonOpening,
+    LightNotchWindow,
+    FogBreakout,
+    HeadlampSafety,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrailNudge {
+    pub category: TrailNudgeCategory,
+    pub milepost: f64,
+    pub elevation_ft: f64,
+    pub trigger_time_local: Option<String>,
+    pub headline: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrailCorridorScanReport {
+    pub route_name: String,
+    pub route_type: String,
+    pub spacing_m: f64,
+    pub scanned_length_miles: f64,
+    pub samples: Vec<TrailCorridorSample>,
+    pub breakout_zones: Vec<TrailBreakoutZone>,
+    pub nudges: Vec<TrailNudge>,
+}
+
+/// Task 3.1: Resamples a 3D trail polyline (`[lon, lat, elev_m]`) at continuous `spacing_m`
+/// intervals (clamped to `150–250 m`), computing cumulative Tobler hiking time, local horizon
+/// openness proxy (from relative topographic prominence or supplied raycasted openness), and
+/// contiguous Horizon-Opening & Fog-Breakout zones across the FULL loop or out-and-back corridor.
+pub fn scan_trail_corridor_breakouts(
+    route: &TrailRouteRecord,
+    elevations_m: &[f64],
+    spacing_m: f64,
+    fog_top_p50_ft: Option<f64>,
+    fog_top_p90_ft: Option<f64>,
+    horizon_openness_override: Option<&[f64]>,
+) -> TrailCorridorScanReport {
+    let spacing = spacing_m.clamp(150.0, 250.0);
+    let scan_len = effective_scan_len(route).min(elevations_m.len());
+    if scan_len < 2 {
+        return TrailCorridorScanReport {
+            route_name: route.name.clone(),
+            route_type: route.route_type.clone(),
+            spacing_m: spacing,
+            scanned_length_miles: 0.0,
+            samples: Vec::new(),
+            breakout_zones: Vec::new(),
+            nudges: Vec::new(),
+        };
+    }
+
+    let min_z = elevations_m[..scan_len]
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    let max_z = elevations_m[..scan_len]
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    let z_span = (max_z - min_z).max(1.0);
+
+    let mut samples: Vec<TrailCorridorSample> = Vec::new();
+    let mut cum_dist_m = 0.0_f64;
+    let mut cum_gain_m = 0.0_f64;
+    let mut cum_time_min = 0.0_f64;
+    let mut next_sample_m = 0.0_f64;
+
+    for i in 0..scan_len {
+        let lon = route.geometry[i][0];
+        let lat = route.geometry[i][1];
+        let z = elevations_m[i];
+        let mut slope = 0.0_f64;
+
+        if i > 0 {
+            let prev_lon = route.geometry[i - 1][0];
+            let prev_lat = route.geometry[i - 1][1];
+            let prev_z = elevations_m[i - 1];
+            let seg_d = haversine_m(prev_lat, prev_lon, lat, lon);
+            let dz = z - prev_z;
+            slope = if seg_d > 1.0 { dz / seg_d } else { 0.0 };
+            cum_dist_m += seg_d;
+            cum_gain_m += dz.max(0.0);
+            if seg_d > 0.1 {
+                cum_time_min += seg_d / tobler_speed_m_per_min(slope).max(10.0);
+            }
+        }
+
+        if cum_dist_m + 1e-6 >= next_sample_m || i == scan_len - 1 {
+            let elev_ft = z * 3.28084;
+            let rel_prom = ((z - min_z) / z_span).clamp(0.0, 1.0);
+            let openness = horizon_openness_override
+                .and_then(|arr| arr.get(i).copied())
+                .unwrap_or_else(|| (25.0 + 70.0 * rel_prom).clamp(0.0, 100.0));
+            let above_p50 = fog_top_p50_ft.map_or(false, |lid| elev_ft >= lid);
+            let above_p90 = fog_top_p90_ft.map_or(false, |lid| elev_ft >= lid);
+
+            samples.push(TrailCorridorSample {
+                milepost: ((cum_dist_m / 1609.344) * 100.0).round() / 100.0,
+                lat: (lat * 100_000.0).round() / 100_000.0,
+                lon: (lon * 100_000.0).round() / 100_000.0,
+                elevation_m: (z * 10.0).round() / 10.0,
+                elevation_ft: elev_ft.round(),
+                cumulative_gain_ft: (cum_gain_m * 3.28084).round(),
+                tobler_minutes: cum_time_min.round() as u32,
+                slope_pct: (slope * 1000.0).round() / 10.0,
+                horizon_openness_pct: (openness * 10.0).round() / 10.0,
+                above_fog_p50: above_p50,
+                above_fog_p90: above_p90,
+            });
+            next_sample_m = cum_dist_m + spacing;
+        }
+    }
+
+    let mut breakout_zones: Vec<TrailBreakoutZone> = Vec::new();
+
+    // Detect contiguous Horizon Opening breakout zones (openness >= 65%)
+    let mut in_open = false;
+    let mut start_idx = 0usize;
+    for (idx, s) in samples.iter().enumerate() {
+        let is_open = s.horizon_openness_pct >= 65.0;
+        if is_open && !in_open {
+            in_open = true;
+            start_idx = idx;
+        } else if (!is_open || idx == samples.len() - 1) && in_open {
+            let end_idx = if is_open { idx } else { idx - 1 };
+            let slice = &samples[start_idx..=end_idx];
+            let peak_el = slice.iter().map(|x| x.elevation_ft).fold(0.0_f64, f64::max);
+            let peak_op = slice
+                .iter()
+                .map(|x| x.horizon_openness_pct)
+                .fold(0.0_f64, f64::max);
+            breakout_zones.push(TrailBreakoutZone {
+                zone_kind: "horizon_opening".to_string(),
+                start_milepost: slice[0].milepost,
+                end_milepost: slice[slice.len() - 1].milepost,
+                peak_elevation_ft: peak_el,
+                peak_openness_pct: peak_op,
+                tobler_minutes_to_entry: slice[0].tobler_minutes,
+                summary: format!(
+                    "Open skyline corridor from Mile {:.2}–{:.2} (up to {:.0} ft, {:.0}% horizon openness).",
+                    slice[0].milepost,
+                    slice[slice.len() - 1].milepost,
+                    peak_el,
+                    peak_op
+                ),
+            });
+            in_open = false;
+        }
+    }
+
+    // Detect contiguous Fog-Lid Breakout zones (above expected P50 lid)
+    if let Some(lid_p50) = fog_top_p50_ft {
+        let mut in_above = false;
+        let mut f_start = 0usize;
+        for (idx, s) in samples.iter().enumerate() {
+            if s.above_fog_p50 && !in_above {
+                in_above = true;
+                f_start = idx;
+            } else if (!s.above_fog_p50 || idx == samples.len() - 1) && in_above {
+                let f_end = if s.above_fog_p50 { idx } else { idx - 1 };
+                let slice = &samples[f_start..=f_end];
+                let peak_el = slice.iter().map(|x| x.elevation_ft).fold(0.0_f64, f64::max);
+                breakout_zones.push(TrailBreakoutZone {
+                    zone_kind: "fog_breakout".to_string(),
+                    start_milepost: slice[0].milepost,
+                    end_milepost: slice[slice.len() - 1].milepost,
+                    peak_elevation_ft: peak_el,
+                    peak_openness_pct: slice
+                        .iter()
+                        .map(|x| x.horizon_openness_pct)
+                        .fold(0.0_f64, f64::max),
+                    tobler_minutes_to_entry: slice[0].tobler_minutes,
+                    summary: format!(
+                        "Above expected {:.0} ft fog lid from Mile {:.2}–{:.2} (peak {:.0} ft).",
+                        lid_p50,
+                        slice[0].milepost,
+                        slice[slice.len() - 1].milepost,
+                        peak_el
+                    ),
+                });
+                in_above = false;
+            }
+        }
+    }
+
+    let scanned_miles = ((cum_dist_m / 1609.344) * 100.0).round() / 100.0;
+    let nudges = generate_trail_nudges(&samples, &breakout_zones, None, None, fog_top_p50_ft, fog_top_p90_ft);
+
+    TrailCorridorScanReport {
+        route_name: route.name.clone(),
+        route_type: route.route_type.clone(),
+        spacing_m: spacing,
+        scanned_length_miles: scanned_miles,
+        samples,
+        breakout_zones,
+        nudges,
+    }
+}
+
+/// Task 3.2: Generates gentle, non-prescriptive Trail Nudges across 4 field categories:
+///   1. `HorizonOpening` — where the trail breaks out into open views
+///   2. `LightNotchWindow` — optional detected topographic notch alignment window
+///   3. `FogBreakout` — expected (P50) and high-confidence (P90) cloud-sea breakout mileposts
+///   4. `HeadlampSafety` — time-reversed departure & twilight return headlamp reminder
+pub fn generate_trail_nudges(
+    samples: &[TrailCorridorSample],
+    breakout_zones: &[TrailBreakoutZone],
+    light_notch_window: Option<(f64, &str, u32)>, // (milepost, peak_local_hhmm, duration_min)
+    target_golden_hour_hhmm: Option<&str>,
+    fog_top_p50_ft: Option<f64>,
+    fog_top_p90_ft: Option<f64>,
+) -> Vec<TrailNudge> {
+    let mut nudges: Vec<TrailNudge> = Vec::new();
+
+    if let Some(hz) = breakout_zones.iter().find(|z| z.zone_kind == "horizon_opening") {
+        nudges.push(TrailNudge {
+            category: TrailNudgeCategory::HorizonOpening,
+            milepost: hz.start_milepost,
+            elevation_ft: hz.peak_elevation_ft,
+            trigger_time_local: None,
+            headline: format!("Open Horizon Begins at Mile {:.2}", hz.start_milepost),
+            detail: hz.summary.clone(),
+        });
+    }
+
+    if let Some((mp, peak_time, dur_min)) = light_notch_window {
+        let elev_ft = samples
+            .iter()
+            .min_by(|a, b| (a.milepost - mp).abs().partial_cmp(&(b.milepost - mp).abs()).unwrap())
+            .map_or(0.0, |s| s.elevation_ft);
+        nudges.push(TrailNudge {
+            category: TrailNudgeCategory::LightNotchWindow,
+            milepost: mp,
+            elevation_ft: elev_ft,
+            trigger_time_local: Some(peak_time.to_string()),
+            headline: format!("Light Notch Alignment (~{} min) at Mile {:.2}", dur_min, mp),
+            detail: format!(
+                "Topographic horizon notch channels grazing light around {} near Mile {:.2}.",
+                peak_time, mp
+            ),
+        });
+    }
+
+    if let Some(lid_p50) = fog_top_p50_ft {
+        if let Some(first_p50) = samples.iter().find(|s| s.above_fog_p50) {
+            let p90_note = match (fog_top_p90_ft, samples.iter().find(|s| s.above_fog_p90)) {
+                (Some(lid_p90), Some(s90)) => format!(
+                    " >90% clear-sky odds past Mile {:.2} ({:.0} ft, P90 lid {:.0} ft).",
+                    s90.milepost, s90.elevation_ft, lid_p90
+                ),
+                _ => String::new(),
+            };
+            nudges.push(TrailNudge {
+                category: TrailNudgeCategory::FogBreakout,
+                milepost: first_p50.milepost,
+                elevation_ft: first_p50.elevation_ft,
+                trigger_time_local: None,
+                headline: format!("Cloud-Sea Breakout at Mile {:.2}", first_p50.milepost),
+                detail: format!(
+                    "Trail climbs above the expected {:.0} ft inversion lid around Mile {:.2} ({:.0} ft).{}",
+                    lid_p50, first_p50.milepost, first_p50.elevation_ft, p90_note
+                ),
+            });
+        }
+    }
+
+    if let Some(peak_s) = samples
+        .iter()
+        .max_by(|a, b| a.elevation_ft.partial_cmp(&b.elevation_ft).unwrap())
+    {
+        let depart_time = target_golden_hour_hhmm
+            .map(|hhmm| subtract_minutes_from_hhmm(hhmm, peak_s.tobler_minutes as i64 + 20));
+        let depart_clause = match &depart_time {
+            Some(t) => format!("Leave the trailhead around {} ", t),
+            None => "Budget ".to_string(),
+        };
+        nudges.push(TrailNudge {
+            category: TrailNudgeCategory::HeadlampSafety,
+            milepost: peak_s.milepost,
+            elevation_ft: peak_s.elevation_ft,
+            trigger_time_local: depart_time,
+            headline: format!("Pacing & Headlamp Window ({} min climb)", peak_s.tobler_minutes),
+            detail: format!(
+                "{}({} min Tobler pace + 20 min setup to Mile {:.2}). Pack a headlamp for blue-hour approach or descent.",
+                depart_clause, peak_s.tobler_minutes, peak_s.milepost
+            ),
+        });
+    }
+
+    nudges
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_route(route_type: &str, geom: Vec<[f64; 2]>) -> TrailRouteRecord {
+        TrailRouteRecord {
+            id: 1,
+            name: "Test Ridge".to_string(),
+            route_type: route_type.to_string(),
+            distance_miles: 4.0,
+            elevation_gain_feet: 1500.0,
+            trailhead_id: "th-1".to_string(),
+            trailhead_name: "Test TH".to_string(),
+            trailhead_lat: geom[0][1],
+            trailhead_lon: geom[0][0],
+            geometry: geom,
+            landmarks: vec!["Ridge".to_string()],
+        }
+    }
+
+    #[test]
+    fn loop_trail_scans_100_percent_never_truncated() {
+        // Closed square loop ~2 km perimeter
+        let geom = vec![
+            [-122.500, 37.560],
+            [-122.495, 37.560],
+            [-122.495, 37.565],
+            [-122.500, 37.565],
+            [-122.500, 37.560],
+        ];
+        let route = make_route("Loop", geom.clone());
+        assert_eq!(effective_scan_len(&route), geom.len());
+    }
+
+    #[test]
+    fn doubled_out_and_back_stops_at_true_apex() {
+        // Outbound 4 vertices to apex at index 3, then return 3 vertices back to start
+        let geom = vec![
+            [-122.500, 37.560],
+            [-122.496, 37.560],
+            [-122.492, 37.560],
+            [-122.488, 37.560], // apex (farthest)
+            [-122.492, 37.560],
+            [-122.496, 37.560],
+            [-122.500, 37.560],
+        ];
+        let route = make_route("Out & Back", geom);
+        assert_eq!(effective_scan_len(&route), 4);
+    }
+
+    #[test]
+    fn single_leg_out_and_back_scans_full_leg() {
+        let geom = vec![
+            [-122.500, 37.560],
+            [-122.495, 37.560],
+            [-122.490, 37.560],
+            [-122.485, 37.560],
+        ];
+        let route = make_route("Out & Back", geom.clone());
+        assert_eq!(effective_scan_len(&route), geom.len());
+    }
+
+    #[test]
+    fn continuous_scanner_and_four_category_nudges_detect_fog_breakout() {
+        // 10-vertex ascending ridge loop ~2.7 km
+        let mut geom = Vec::new();
+        let mut elevs = Vec::new();
+        for i in 0..10 {
+            geom.push([-122.500 + (i as f64) * 0.003, 37.560]);
+            elevs.push(200.0 + (i as f64) * 70.0); // 656 ft -> 2723 ft
+        }
+        let route = make_route("Loop", geom);
+        let report = scan_trail_corridor_breakouts(
+            &route,
+            &elevs,
+            200.0,
+            Some(1500.0),
+            Some(1950.0),
+            None,
+        );
+        assert!(report.samples.len() >= 8);
+        assert!(report.breakout_zones.iter().any(|z| z.zone_kind == "fog_breakout"));
+        assert!(report.breakout_zones.iter().any(|z| z.zone_kind == "horizon_opening"));
+
+        let nudges = generate_trail_nudges(
+            &report.samples,
+            &report.breakout_zones,
+            Some((1.1, "19:22", 14)),
+            Some("19:30"),
+            Some(1500.0),
+            Some(1950.0),
+        );
+        assert_eq!(nudges.len(), 4);
+        assert!(nudges.iter().any(|n| n.category == TrailNudgeCategory::HorizonOpening));
+        assert!(nudges.iter().any(|n| n.category == TrailNudgeCategory::LightNotchWindow));
+        assert!(nudges.iter().any(|n| n.category == TrailNudgeCategory::FogBreakout));
+        assert!(nudges.iter().any(|n| n.category == TrailNudgeCategory::HeadlampSafety));
+    }
+}
+
 
 

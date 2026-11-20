@@ -113,8 +113,37 @@ def _parse_goes_scan_times(key: str) -> tuple[dt.datetime, dt.datetime] | None:
         return None
 
 
+def _read_cf_unsigned_array(ds: Any, raw: np.ndarray) -> tuple[np.ndarray, int]:
+    """
+    Reinterprets NetCDF4/HDF5 integer arrays carrying CF `_Unsigned="true"` (common across
+    NOAA GOES-R ABI L2 `HT`, `COD`, `CMI`, and `DQF` datasets) because `h5py` ignores the
+    CF `_Unsigned` attribute and returns signed `int16`/`int8` (causing wraparound above
+    32767, e.g. `HT > 10,000 m` ASL wrapping to `-9,000 m`).
+    Returns `(unpacked_raw, fill_value)` in matching integer dtype.
+    """
+    unsigned_attr = ds.attrs.get("_Unsigned", "")
+    if isinstance(unsigned_attr, bytes):
+        unsigned_attr = unsigned_attr.decode("utf-8", errors="ignore")
+    is_unsigned = str(unsigned_attr).strip().lower() in ("true", "1", "yes")
+
+    fv_attr = ds.attrs.get("_FillValue")
+    fv_raw = int(fv_attr[0]) if hasattr(fv_attr, "__len__") else (int(fv_attr) if fv_attr is not None else -1)
+
+    if is_unsigned and np.issubdtype(raw.dtype, np.signedinteger):
+        if raw.dtype == np.int16:
+            return raw.view(np.uint16), fv_raw & 0xFFFF
+        if raw.dtype == np.int8:
+            return raw.view(np.uint8), fv_raw & 0xFF
+        if raw.dtype == np.int32:
+            return raw.view(np.uint32), fv_raw & 0xFFFFFFFF
+    return raw, fv_raw
+
+
 def _select_goes_bucket(is_west: bool, ref_utc: dt.datetime) -> tuple[str, str]:
     if is_west:
+        # GOES-18 became operational GOES-West on 2023-01-04; GOES-17 served prior dates
+        if ref_utc < dt.datetime(2023, 1, 4, tzinfo=dt.timezone.utc):
+            return "noaa-goes17", "GOES-17 West"
         return "noaa-goes18", "GOES-18 West"
     # GOES-19 became operational GOES-East on 2025-04-07; GOES-16 served prior dates
     if ref_utc < dt.datetime(2025, 4, 8, tzinfo=dt.timezone.utc):
@@ -374,9 +403,8 @@ def _decode_goes_l2_frame(
                 y_10km = f_h["y"][:].astype(np.float64) * float(
                     f_h["y"].attrs["scale_factor"][0]
                 ) + float(f_h["y"].attrs["add_offset"][0])
-                ht_raw = f_h["HT"][:]
-                ht_dqf = f_h["DQF"][:]
-                ht_fv = int(f_h["HT"].attrs["_FillValue"][0])
+                ht_raw, ht_fv = _read_cf_unsigned_array(f_h["HT"], f_h["HT"][:])
+                ht_dqf, _ = _read_cf_unsigned_array(f_h["DQF"], f_h["DQF"][:])
                 ht_sf = float(f_h["HT"].attrs["scale_factor"][0])
                 ht_ao = float(f_h["HT"].attrs["add_offset"][0])
                 ht_10km_full = np.where(
@@ -392,15 +420,19 @@ def _decode_goes_l2_frame(
         x_h0, y_h0 = _latlonh_to_goes_xy(
             lat_grid, lon_grid, 3000.0 if enable_parallax else 0.0, proj_meta
         )
-        rf_h, cf_h, _ = _xy_to_fractional_indices(x_h0, y_h0, x_10km, y_10km)
+        rf_h, cf_h, val_h0 = _xy_to_fractional_indices(x_h0, y_h0, x_10km, y_10km)
         ri_h = np.rint(rf_h).astype(np.int32)
         ci_h = np.rint(cf_h).astype(np.int32)
-        ht_pass1 = ht_10km_full[ri_h, ci_h]
+        ht_pass1 = np.where(val_h0, ht_10km_full[ri_h, ci_h], np.nan)
         if enable_parallax:
             h_est = np.where(np.isfinite(ht_pass1), np.clip(ht_pass1, 0.0, 16500.0), 2500.0)
             x_h1, y_h1 = _latlonh_to_goes_xy(lat_grid, lon_grid, h_est, proj_meta)
-            rf_h, cf_h, _ = _xy_to_fractional_indices(x_h1, y_h1, x_10km, y_10km)
-            ht_grid = ht_10km_full[np.rint(rf_h).astype(np.int32), np.rint(cf_h).astype(np.int32)]
+            rf_h, cf_h, val_h1 = _xy_to_fractional_indices(x_h1, y_h1, x_10km, y_10km)
+            ht_grid = np.where(
+                val_h1,
+                ht_10km_full[np.rint(rf_h).astype(np.int32), np.rint(cf_h).astype(np.int32)],
+                np.nan,
+            )
         else:
             ht_grid = ht_pass1
 
@@ -429,8 +461,9 @@ def _decode_goes_l2_frame(
     if codc_bytes is not None:
         try:
             with h5py.File(io.BytesIO(codc_bytes), "r") as f_c:
-                cod_raw = f_c["COD"][r2_min:r2_max, c2_min:c2_max]
-                cod_fv = int(f_c["COD"].attrs["_FillValue"][0])
+                cod_raw, cod_fv = _read_cf_unsigned_array(
+                    f_c["COD"], f_c["COD"][r2_min:r2_max, c2_min:c2_max]
+                )
                 cod_sf = float(f_c["COD"].attrs["scale_factor"][0])
                 cod_ao = float(f_c["COD"].attrs["add_offset"][0])
                 cod_full = np.where(
@@ -544,15 +577,18 @@ def _decode_goes_l2_frame(
                 yc_10 = f_cc["y"][:].astype(np.float64) * float(
                     f_cc["y"].attrs["scale_factor"][0]
                 ) + float(f_cc["y"].attrs["add_offset"][0])
-                cc_dqf = f_cc["DQF"][:]
-                ok_cc = cc_dqf <= 1
+                cc_dqf, _ = _read_cf_unsigned_array(f_cc["DQF"], f_cc["DQF"][:])
+                ok_cc = (cc_dqf >= 0) & (cc_dqf <= 1)
 
                 def _proj_cclc_band(ds_name: str, h_band_m: float) -> np.ndarray:
-                    raw_b = f_cc[ds_name][:]
-                    fv_b = int(f_cc[ds_name].attrs["_FillValue"][0])
+                    raw_b, fv_b = _read_cf_unsigned_array(f_cc[ds_name], f_cc[ds_name][:])
+                    sf_attr = f_cc[ds_name].attrs.get("scale_factor")
+                    ao_attr = f_cc[ds_name].attrs.get("add_offset")
+                    sf_b = float(sf_attr[0]) if hasattr(sf_attr, "__len__") else (float(sf_attr) if sf_attr is not None else 1.0)
+                    ao_b = float(ao_attr[0]) if hasattr(ao_attr, "__len__") else (float(ao_attr) if ao_attr is not None else 0.0)
                     arr_pct = np.where(
                         (raw_b != fv_b) & ok_cc,
-                        np.clip(raw_b.astype(np.float32), 0.0, 100.0) / 100.0,
+                        np.clip(raw_b.astype(np.float32) * sf_b + ao_b, 0.0, 100.0) / 100.0,
                         np.nan,
                     )
                     xb, yb = _latlonh_to_goes_xy(
@@ -616,14 +652,12 @@ def _decode_goes_l2_frame(
             with h5py.File(io.BytesIO(cmip_c07_bytes), "r") as f7, h5py.File(
                 io.BytesIO(cmip_c13_bytes), "r"
             ) as f13:
-                r7 = f7["CMI"][r2_min:r2_max, c2_min:c2_max]
-                fv7 = int(f7["CMI"].attrs["_FillValue"][0])
+                r7, fv7 = _read_cf_unsigned_array(f7["CMI"], f7["CMI"][r2_min:r2_max, c2_min:c2_max])
                 sf7 = float(f7["CMI"].attrs["scale_factor"][0])
                 ao7 = float(f7["CMI"].attrs["add_offset"][0])
                 tb07_2km = np.where(r7 != fv7, r7.astype(np.float32) * sf7 + ao7, np.nan)
 
-                r13 = f13["CMI"][r2_min:r2_max, c2_min:c2_max]
-                fv13 = int(f13["CMI"].attrs["_FillValue"][0])
+                r13, fv13 = _read_cf_unsigned_array(f13["CMI"], f13["CMI"][r2_min:r2_max, c2_min:c2_max])
                 sf13 = float(f13["CMI"].attrs["scale_factor"][0])
                 ao13 = float(f13["CMI"].attrs["add_offset"][0])
                 tb13_2km = np.where(r13 != fv13, r13.astype(np.float32) * sf13 + ao13, np.nan)
@@ -644,11 +678,15 @@ def _decode_goes_l2_frame(
                 warm_bl_top = (tb13_px >= 270.0) & (tb13_px <= 290.5) & (~alpine_snow_zone) & val_b
 
                 # 1) Dark/civil-twilight emissive droplet regime (`sun_el <= 1.2 deg`):
-                # Liquid stratus has lower 3.9 um emissivity than 10.3 um -> `tb13 - tb07 >= +1.6 K`
+                # Liquid stratus has lower 3.9 um emissivity than 10.3 um -> `tb13 - tb07 >= +1.6 K` over ocean/coast.
+                # Over inland continental soil/prairie, clear silicate land has natural `+1.5..+3.0 K` BTD
+                # at night, so NOAA operational FLS requires `>= +3.3 K` inland to prevent clear-sky false fog.
                 btd_emissive = tb13_px - tb07_px
+                btd_thresh = 1.55 if is_coastal else 3.30
+                btd_span = 2.55 if is_coastal else 2.80
                 night_fog = np.where(
                     warm_bl_top & (sun_el_px <= 1.2),
-                    np.clip((btd_emissive - 1.55) / 2.55, 0.0, 1.0),
+                    np.clip((btd_emissive - btd_thresh) / btd_span, 0.0, 1.0),
                     0.0,
                 )
                 # 2) Grazing low-sun twilight regime (`1.2 < sun_el <= 7.5 deg` over cool marine sector):
@@ -667,10 +705,15 @@ def _decode_goes_l2_frame(
         except Exception:
             has_btd_fog = False
 
-    # Keep optical depths consistent when CCLC or BTD uncovers obscured low/mid decks
-    tau_low = np.maximum(tau_low, (low_cf * 6.4).astype(np.float32))
-    tau_mid = np.maximum(tau_mid, (mid_cf * 4.8).astype(np.float32))
-    tau_high = np.maximum(tau_high, (high_cf * 1.15).astype(np.float32))
+    # Preserve real GOES `CODC` optical depths on the `ACTPC`-detected fraction (especially
+    # optically thin golden-hour cirrus `tau ~ 0.2..0.8`), and only add climatological optical
+    # depth for the newly uncovered cloud fraction contributed by `CCLC` or twilight `BTD`.
+    delta_low_cf = np.maximum(0.0, low_cf - actp_low_cf)
+    delta_mid_cf = np.maximum(0.0, mid_cf - actp_mid_cf)
+    delta_high_cf = np.maximum(0.0, high_cf - actp_high_cf)
+    tau_low = np.clip(tau_low + delta_low_cf * 6.4, 0.0, 48.0).astype(np.float32)
+    tau_mid = np.clip(tau_mid + delta_mid_cf * 4.8, 0.0, 48.0).astype(np.float32)
+    tau_high = np.clip(tau_high + delta_high_cf * 0.95, 0.0, 48.0).astype(np.float32)
     tau_total = np.clip(tau_low + tau_mid + tau_high, 0.0, 52.0).astype(np.float32)
 
     if tb13_grid is not None and np.any(np.isfinite(tb13_grid)):
@@ -997,9 +1040,9 @@ def _fetch_iem_wms_fallback(
 
 
 def _list_cmipc_c07_c13_keys(
-    bucket: str, ref_utc: dt.datetime, lookback_minutes: int = 28
+    bucket: str, ref_utc: dt.datetime, lookback_minutes: int = 55
 ) -> tuple[list[tuple[dt.datetime, dt.datetime, str]], list[tuple[dt.datetime, dt.datetime, str]]]:
-    """Lists `ABI-L2-CMIPC` Channel 07 (`3.9 um`) and Channel 13 (`10.3 um`) keys in one pass."""
+    """Lists `ABI-L2-CMIPC` Channel 07 (`3.9 um`) and Channel 13 (`10.3 um`) keys across any ABI scan mode."""
     t_earliest = ref_utc - dt.timedelta(minutes=lookback_minutes)
     cur = t_earliest.replace(minute=0, second=0, microsecond=0)
     end_hr = ref_utc.replace(minute=0, second=0, microsecond=0)
@@ -1007,22 +1050,28 @@ def _list_cmipc_c07_c13_keys(
     c13_list: list[tuple[dt.datetime, dt.datetime, str]] = []
     while cur <= end_hr:
         yr, doy, hh = cur.year, cur.timetuple().tm_yday, cur.hour
-        for band_code, target_list in (("C07_", c07_list), ("C13_", c13_list)):
-            prefix = f"ABI-L2-CMIPC/{yr}/{doy:03d}/{hh:02d}/OR_ABI-L2-CMIPC-M6{band_code}"
-            url = f"https://{bucket}.s3.amazonaws.com/?list-type=2&prefix={prefix}"
-            try:
-                req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-                with urllib.request.urlopen(req, timeout=5.5) as resp:
-                    xml_bytes = resp.read()
-                root = ET.fromstring(xml_bytes)
-                for item in root.findall("s3:Contents", _S3_NS):
-                    k_el = item.find("s3:Key", _S3_NS)
-                    if k_el is not None and k_el.text:
-                        parsed = _parse_goes_scan_times(k_el.text)
-                        if parsed is not None:
-                            target_list.append((parsed[0], parsed[1], k_el.text))
-            except Exception:
-                continue
+        prefix = f"ABI-L2-CMIPC/{yr}/{doy:03d}/{hh:02d}/OR_ABI-L2-CMIPC-M"
+        url = f"https://{bucket}.s3.amazonaws.com/?list-type=2&prefix={prefix}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=5.5) as resp:
+                xml_bytes = resp.read()
+            root = ET.fromstring(xml_bytes)
+            for item in root.findall("s3:Contents", _S3_NS):
+                k_el = item.find("s3:Key", _S3_NS)
+                if k_el is None or not k_el.text:
+                    continue
+                key_txt = k_el.text
+                if "C07_" in key_txt:
+                    parsed = _parse_goes_scan_times(key_txt)
+                    if parsed is not None:
+                        c07_list.append((parsed[0], parsed[1], key_txt))
+                elif "C13_" in key_txt:
+                    parsed = _parse_goes_scan_times(key_txt)
+                    if parsed is not None:
+                        c13_list.append((parsed[0], parsed[1], key_txt))
+        except Exception:
+            pass
         cur += dt.timedelta(hours=1)
     c07_list.sort(key=lambda t: t[0])
     c13_list.sort(key=lambda t: t[0])
@@ -1067,7 +1116,7 @@ def fetch_goes_corridor_nowcast(
         else ref_utc.strftime("%Y%m%d_%H%M")
     )
     cache_key = (
-        f"goes_v6_{lat:.2f}_{lon:.2f}_{time_bucket_str}_"
+        f"goes_v7_{lat:.2f}_{lon:.2f}_{time_bucket_str}_"
         f"p{int(enable_parallax)}_m{int(enable_multiscale_flow)}_ml{int(enable_multilayer_fusion)}"
     )
     now_mono = time.monotonic()
@@ -1076,8 +1125,8 @@ def fetch_goes_corridor_nowcast(
         if (not is_live_mode) or (now_mono - ts < _MEM_TTL_SECONDS):
             return cached
 
-    npz_cache_file = GOES_CACHE_DIR / "decoded_v6" / f"{cache_key}.npz"
-    meta_cache_file = GOES_CACHE_DIR / "decoded_v6" / f"{cache_key}.json"
+    npz_cache_file = GOES_CACHE_DIR / "decoded_v7" / f"{cache_key}.npz"
+    meta_cache_file = GOES_CACHE_DIR / "decoded_v7" / f"{cache_key}.json"
     if npz_cache_file.exists() and meta_cache_file.exists():
         age_disk = time.time() - meta_cache_file.stat().st_mtime
         if (not is_live_mode) or (age_disk < _MEM_TTL_SECONDS):
@@ -1119,7 +1168,7 @@ def fetch_goes_corridor_nowcast(
                     else None
                 )
                 f_btd_keys = (
-                    list_pool.submit(_list_cmipc_c07_c13_keys, bucket, ref_utc, 28)
+                    list_pool.submit(_list_cmipc_c07_c13_keys, bucket, ref_utc, 55)
                     if need_twilight_btd
                     else None
                 )
@@ -1155,11 +1204,20 @@ def fetch_goes_corridor_nowcast(
                 ccl_0 = _pick_closest_causal_key(ccl_entries, t_0_dt, ref_utc, 12.0) if ccl_entries else None
                 ccl_15 = _pick_closest_causal_key(ccl_entries, t_15_dt, ref_utc, 12.0) if ccl_entries else None
                 ccl_30 = _pick_closest_causal_key(ccl_entries, t_30_dt, ref_utc, 12.0) if ccl_entries else None
+                # Match twilight BTD channels symmetrically across all 3 causal frames so
+                # golden-hour optical flow, pinning, and growth tendency see consistent fog edges.
                 c07_0 = _pick_closest_causal_key(c07_entries, t_0_dt, ref_utc, 10.0) if c07_entries else None
                 c13_0 = _pick_closest_causal_key(c13_entries, t_0_dt, ref_utc, 10.0) if c13_entries else None
+                c07_15 = _pick_closest_causal_key(c07_entries, t_15_dt, ref_utc, 10.0) if c07_entries else None
+                c13_15 = _pick_closest_causal_key(c13_entries, t_15_dt, ref_utc, 10.0) if c13_entries else None
+                c07_30 = _pick_closest_causal_key(c07_entries, t_30_dt, ref_utc, 10.0) if c07_entries else None
+                c13_30 = _pick_closest_causal_key(c13_entries, t_30_dt, ref_utc, 10.0) if c13_entries else None
 
                 needed_keys: set[str] = {ctp_key_0, ctp_key_15, ctp_key_30}
-                for opt_p in (ach_0, ach_15, ach_30, cod_0, ccl_0, ccl_15, ccl_30, c07_0, c13_0):
+                for opt_p in (
+                    ach_0, ach_15, ach_30, cod_0, ccl_0, ccl_15, ccl_30,
+                    c07_0, c13_0, c07_15, c13_15, c07_30, c13_30,
+                ):
                     if opt_p is not None:
                         needed_keys.add(opt_p[1])
 
@@ -1199,6 +1257,8 @@ def fetch_goes_corridor_nowcast(
                         is_coastal,
                         enable_parallax=enable_parallax,
                         cclc_bytes=downloaded.get(ccl_15[1]) if ccl_15 else None,
+                        cmip_c07_bytes=downloaded.get(c07_15[1]) if c07_15 else None,
+                        cmip_c13_bytes=downloaded.get(c13_15[1]) if c13_15 else None,
                         scan_utc=t_15_dt,
                         enable_multilayer_fusion=enable_multilayer_fusion,
                     )
@@ -1215,6 +1275,8 @@ def fetch_goes_corridor_nowcast(
                         is_coastal,
                         enable_parallax=enable_parallax,
                         cclc_bytes=downloaded.get(ccl_30[1]) if ccl_30 else None,
+                        cmip_c07_bytes=downloaded.get(c07_30[1]) if c07_30 else None,
+                        cmip_c13_bytes=downloaded.get(c13_30[1]) if c13_30 else None,
                         scan_utc=t_30_dt,
                         enable_multilayer_fusion=enable_multilayer_fusion,
                     )
@@ -1253,13 +1315,10 @@ def fetch_goes_corridor_nowcast(
                     enable_multiscale=enable_multiscale_flow,
                 )
 
-                # 3-frame Eulerian stationarity residual for orographic feature pinning
-                euler_low = _box3x3_smooth(
-                    0.5 * (np.abs(dec_0["low_cf"] - dec_15["low_cf"]) + np.abs(dec_15["low_cf"] - dec_30["low_cf"]))
-                ).astype(np.float32)
-                euler_high = _box3x3_smooth(
-                    0.5 * (np.abs(up_0 - up_15) + np.abs(up_15 - up_30))
-                ).astype(np.float32)
+                # Apples-to-apples 30-minute Eulerian stationarity residual (`|c(t0) - c(t-30)|`)
+                # matching the 30-minute Lagrangian hindcast window so moving fronts aren't falsely pinned.
+                euler_low = np.abs(dec_0["low_cf"] - dec_30["low_cf"]).astype(np.float32)
+                euler_high = np.abs(up_0 - up_30).astype(np.float32)
 
                 # Dominant motion summary for UI telemetry
                 if c_low_c >= c_hi_c:
