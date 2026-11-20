@@ -3775,6 +3775,89 @@ function renderWeatherCard(w) {
   renderHistoricalReplayPanel(w);
   renderAstroCard(w, state.shootReport);
   updateViewfinderReadout();
+  syncBriefVerdictHero(w);
+}
+
+function syncBriefVerdictHero(w) {
+  if (!w) return;
+  const cal = w.calibrated_probabilities || {};
+  const inv = w.inversion_model || {};
+  const p50 = Math.round(cal.transmittance_p50_pct ?? w.transmittance_p50_pct ?? w.ray_transmittance_pct ?? 0);
+  const p10 = Math.round(cal.transmittance_p10_pct ?? w.transmittance_p10_pct ?? Math.max(0, p50 - 20));
+  const p90 = Math.round(cal.transmittance_p90_pct ?? w.transmittance_p90_pct ?? Math.min(100, p50 + 20));
+  const score = Number(w.alpenglow_score ?? 0);
+
+  let tier = "GAMBLE";
+  let dotCls = "is-gamble";
+  if (score >= 66 || (p50 >= 62 && score >= 52)) {
+    tier = "GO";
+    dotCls = "is-go";
+  } else if (score < 38 || p50 < 24) {
+    tier = "BUST";
+    dotCls = "is-bust";
+  }
+
+  const dotEl = document.getElementById("brief-verdict-dot");
+  if (dotEl) {
+    dotEl.classList.remove("is-go", "is-gamble", "is-bust");
+    dotEl.classList.add(dotCls);
+  }
+  const badgeEl = document.getElementById("brief-verdict-badge");
+  if (badgeEl) badgeEl.textContent = `${tier} · ${score}/100`;
+
+  const oddsEl = document.getElementById("brief-light-odds");
+  if (oddsEl) oddsEl.textContent = `${p50}%`;
+
+  const bandEl = document.getElementById("brief-prob-range");
+  const medEl = document.getElementById("brief-prob-median");
+  if (bandEl) {
+    bandEl.style.left = `${Math.max(0, Math.min(100, p10))}%`;
+    bandEl.style.width = `${Math.max(3, Math.min(100 - p10, p90 - p10))}%`;
+  }
+  if (medEl) {
+    medEl.style.left = `${Math.max(0, Math.min(100, p50))}%`;
+  }
+  const p10El = document.getElementById("brief-p10-label");
+  const p50El = document.getElementById("brief-p50-label");
+  const p90El = document.getElementById("brief-p90-label");
+  if (p10El) p10El.textContent = `P10 ${p10}%`;
+  if (p50El) p50El.textContent = `P50 ${p50}%`;
+  if (p90El) p90El.textContent = `P90 ${p90}%`;
+
+  const noteEl = document.getElementById("brief-causal-note");
+  if (noteEl) {
+    const rawRec = String(w.recommendation || w.verdict || "").trim();
+    const shortSentence = rawRec.split(/(?<=[.!?])\s+/)[0] || rawRec;
+    noteEl.textContent = shortSentence;
+  }
+
+  const peakEl = document.getElementById("brief-peak-time");
+  if (peakEl) {
+    const phaseKey = String(w.phase || "sunset").toLowerCase().includes("sunrise") ? "sunrise" : "sunset";
+    const win = state.shootReport?.golden_hour_windows?.find((g) => g.phase.toLowerCase().includes(phaseKey));
+    peakEl.textContent = win?.peak_time_local || formatMinutesToHHMM(state.currentMinutes);
+  }
+
+  const fogEl = document.getElementById("brief-fog-clearance");
+  if (fogEl) {
+    const fogP50 = Math.round(inv.fog_top_p50_ft ?? inv.fog_top_ft ?? 0);
+    const lmElevFt = Math.round(state.shootReport?.target_landmark?.summit_elevation_ft ?? 0);
+    if (fogP50 > 0 && lmElevFt > 0) {
+      const diff = lmElevFt - fogP50;
+      fogEl.textContent = `${fogP50.toLocaleString()} ft (${diff >= 0 ? "+" : ""}${diff.toLocaleString()})`;
+    } else if (fogP50 > 0) {
+      fogEl.textContent = `${fogP50.toLocaleString()} ft`;
+    } else {
+      fogEl.textContent = "Clear";
+    }
+  }
+
+  const condEl = document.getElementById("brief-temp-wind");
+  if (condEl) {
+    const temp = w.temp_sunset_f != null ? `${Math.round(w.temp_sunset_f)}°F` : "--";
+    const wind = w.wind_mph != null ? `${Math.round(w.wind_mph)} mph` : "--";
+    condEl.textContent = `${temp} · ${wind}`;
+  }
 }
 
 function formatSignedInt(val, suffix = "") {
@@ -5297,7 +5380,7 @@ function syncFluidLabButtons() {
     pill.setAttribute("aria-pressed", String(state.showAtmosphere));
     pill.classList.toggle("is-fluid-active", state.showAtmosphere);
     if (!state.showAtmosphere) {
-      pill.textContent = "🧪 Fluid Lab: Off";
+      pill.textContent = "Fluid Lab: Off";
     }
   }
   const badge = document.getElementById("fluid-perf-badge");
@@ -5733,9 +5816,9 @@ document.getElementById("btn-vp-clouds-rest-wave")?.addEventListener("click", ()
 });
 
 const playBtn = document.getElementById("btn-play-sun");
-playBtn.addEventListener("click", () => {
+playBtn?.addEventListener("click", () => {
   state.isPlayingSun = !state.isPlayingSun;
-  playBtn.textContent = state.isPlayingSun ? "⏸ Pause" : "▶ Animate";
+  playBtn.textContent = state.isPlayingSun ? "⏸" : "▶";
   playBtn.classList.toggle("is-active", state.isPlayingSun);
 });
 
@@ -5750,16 +5833,24 @@ function syncThemeToggleButton(theme) {
 
 syncThemeToggleButton(document.documentElement.getAttribute("data-theme") || "dark");
 
-document.getElementById("theme-toggle").addEventListener("click", () => {
+document.getElementById("theme-toggle")?.addEventListener("click", () => {
   const root = document.documentElement;
   const next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
   root.setAttribute("data-theme", next);
   syncThemeToggleButton(next);
 });
 
-// Escape key exits First-Person Tripod Viewfinder back to 3D Orbit when no popover is open
+// Escape key closes Atmospheric Lab Drawer first, or exits Viewfinder back to 3D Orbit
 window.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && state.cameraMode !== "orbit") {
+  if (e.key !== "Escape") return;
+  const labDrawer = document.getElementById("lab-drawer");
+  if (labDrawer && !labDrawer.hidden) {
+    labDrawer.hidden = true;
+    document.getElementById("btn-open-lab")?.setAttribute("aria-expanded", "false");
+    document.getElementById("btn-open-lab")?.classList.remove("is-active");
+    return;
+  }
+  if (state.cameraMode !== "orbit") {
     const anyPopoverOpen = document.querySelector("[popover]:popover-open");
     if (!anyPopoverOpen) {
       setCameraMode("orbit");
@@ -5983,7 +6074,7 @@ volumetricEngine.onTelemetryCallback = (tel) => {
       fluidPerfBadge.title = `${solverTag} Step: ${stepStr} ms`;
     }
     if (viewportGpuPill) {
-      viewportGpuPill.textContent = `🧪 Fluid Lab: ${Math.round(rollingFps)} FPS`;
+      viewportGpuPill.textContent = `Fluid Lab: ${Math.round(rollingFps)} FPS`;
     }
   }
   if (fluidSummarySub) {
@@ -6137,7 +6228,7 @@ function animate(nowMs = performance.now()) {
       fluidPerfBadge.textContent = state.showAtmosphere ? "Idle (0W)" : "Fast Mode";
     }
     if (viewportGpuPill) {
-      viewportGpuPill.textContent = state.showAtmosphere ? "🧪 Fluid Lab: Idle" : "🧪 Fluid Lab: Off";
+      viewportGpuPill.textContent = state.showAtmosphere ? "Fluid Lab: Idle" : "Fluid Lab: Off";
     }
     return;
   }
@@ -6176,8 +6267,8 @@ function animate(nowMs = performance.now()) {
     }
     if (viewportGpuPill) {
       viewportGpuPill.textContent = state.showAtmosphere
-        ? `🧪 Fluid Lab: ${Math.round(rollingFps)} FPS`
-        : "🧪 Fluid Lab: Off";
+        ? `Fluid Lab: ${Math.round(rollingFps)} FPS`
+        : "Fluid Lab: Off";
     }
   }
 
@@ -6211,6 +6302,174 @@ function animate(nowMs = performance.now()) {
 
   volumetricEngine.renderPipeline(worldScene, overlayScene, dtRealS, state.showAtmosphere);
 }
+
+// ============================================================================
+// Proposal A UI Orchestrator: Floating Sheet, Regional Hunt, GPX Upload & Lab Drawer
+// ============================================================================
+(function initProposalAInterface() {
+  // 1. Collapsible Floating Left Sheet
+  const sheetEl = document.getElementById("planner-sheet");
+  const toggleSheetBtn = document.getElementById("btn-toggle-sheet");
+  toggleSheetBtn?.addEventListener("click", () => {
+    const collapsed = sheetEl.classList.toggle("is-collapsed");
+    toggleSheetBtn.setAttribute("aria-expanded", String(!collapsed));
+  });
+
+  // 2. Floating Sheet 3-Tab Switcher (Viewpoints | Hunt Tonight | Trail & Pin)
+  let huntLoadedOnce = false;
+  document.querySelectorAll("[data-sheet-tab]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const target = btn.dataset.sheetTab;
+      document.querySelectorAll("[data-sheet-tab]").forEach((b) => {
+        const active = b === btn;
+        b.classList.toggle("is-active", active);
+        b.setAttribute("aria-selected", String(active));
+      });
+      ["brief", "hunt", "trail"].forEach((id) => {
+        const panel = document.getElementById(`panel-${id}`);
+        if (panel) {
+          panel.hidden = id !== target;
+          panel.classList.toggle("is-active", id === target);
+        }
+      });
+      if (target === "hunt" && !huntLoadedOnce) {
+        huntLoadedOnce = true;
+        runRegionalLightHuntUI();
+      }
+    });
+  });
+
+  // 3. Slide-Over Atmospheric Lab Drawer (Closed by Default)
+  const labDrawer = document.getElementById("lab-drawer");
+  const btnOpenLab = document.getElementById("btn-open-lab");
+  const btnCloseLab = document.getElementById("btn-close-lab");
+
+  function setLabDrawerOpen(open) {
+    if (!labDrawer) return;
+    labDrawer.hidden = !open;
+    btnOpenLab?.setAttribute("aria-expanded", String(open));
+    btnOpenLab?.classList.toggle("is-active", open);
+  }
+
+  btnOpenLab?.addEventListener("click", () => setLabDrawerOpen(labDrawer?.hidden));
+  btnCloseLab?.addEventListener("click", () => setLabDrawerOpen(false));
+
+  document.querySelectorAll("[data-lab-tab]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const target = btn.dataset.labTab;
+      document.querySelectorAll("[data-lab-tab]").forEach((b) => b.classList.toggle("is-active", b === btn));
+      ["physics", "fluid", "verify"].forEach((id) => {
+        const panel = document.getElementById(`lab-panel-${id}`);
+        if (panel) {
+          panel.hidden = id !== target;
+          panel.classList.toggle("is-active", id === target);
+        }
+      });
+    });
+  });
+
+  // 4. Bottom Dock Fog-Sea Band Quick Cycle (P50 -> P90 -> P10 -> Off)
+  const fogCycleOrder = ["p50", "p90", "p10", "off"];
+  document.getElementById("btn-cycle-fog-band")?.addEventListener("click", () => {
+    const curIdx = fogCycleOrder.indexOf(state.fogSliceBand || "p50");
+    const nextBand = fogCycleOrder[(curIdx + 1) % fogCycleOrder.length];
+    setFogSliceBand(nextBand);
+  });
+
+  // 5. Regional "Where Tonight?" Light Hunter (/api/regional-hunt)
+  async function runRegionalLightHuntUI() {
+    const resultsEl = document.getElementById("regional-hunt-results");
+    const regionSel = document.getElementById("hunt-region-select");
+    if (!resultsEl || !regionSel) return;
+    const region = regionSel.value || "bay_area";
+    const isSunrise = document.getElementById("tab-corridor-sunrise")?.classList.contains("is-active");
+    const phase = isSunrise ? "sunrise" : "sunset";
+    resultsEl.innerHTML = `<p class="empty-hint">Scanning ${region.replace("_", " ")} peaks &amp; corridors for ${phase}…</p>`;
+    try {
+      const qs = new URLSearchParams({ region, date: state.date, phase, max_spots: "6" });
+      const res = await fetch(`/api/regional-hunt?${qs.toString()}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const rows = data.all_ranked || [];
+      if (!rows.length) {
+        resultsEl.innerHTML = `<p class="empty-hint">No spots ranked in this region.</p>`;
+        return;
+      }
+      resultsEl.innerHTML = "";
+      rows.forEach((spot) => {
+        const card = document.createElement("button");
+        card.type = "button";
+        card.className = "hunt-card";
+        const vLower = String(spot.verdict || "gamble").toLowerCase();
+        const p50 = Math.round(spot.metrics?.calibrated_p50_pct ?? 0);
+        card.innerHTML = `
+          <div class="hunt-card-head">
+            <strong>${escapeFieldCardHtml(spot.name)}</strong>
+            <span class="hunt-pill is-${vLower}">${escapeFieldCardHtml(spot.verdict)} · ${p50}%</span>
+          </div>
+          <div class="hunt-card-reason">${escapeFieldCardHtml(spot.causal_attribution || spot.primary_phenomenon)}</div>
+        `;
+        card.addEventListener("click", () => {
+          // If landmark is in selector, jump directly; otherwise load custom coordinate target
+          const lmSelect = document.getElementById("landmark-select");
+          const matchingOpt = lmSelect
+            ? Array.from(lmSelect.options).find((o) =>
+                spot.name.toLowerCase().includes(o.value.toLowerCase()) ||
+                o.value.toLowerCase().includes(spot.name.toLowerCase().split(",")[0])
+              )
+            : null;
+          if (matchingOpt) {
+            lmSelect.value = matchingOpt.value;
+            state.landmark = matchingOpt.value;
+            loadLandmarkScenario();
+          } else {
+            loadCustomTargetCoordinate(spot.lat, spot.lon, spot.name);
+          }
+        });
+        resultsEl.appendChild(card);
+      });
+    } catch (err) {
+      resultsEl.innerHTML = `<p class="empty-hint">Regional hunt unavailable: ${escapeFieldCardHtml(err.message)}</p>`;
+    }
+  }
+
+  document.getElementById("btn-run-regional-hunt")?.addEventListener("click", runRegionalLightHuntUI);
+  document.getElementById("hunt-region-select")?.addEventListener("change", runRegionalLightHuntUI);
+
+  // 6. Custom GPX / GeoJSON Trail Upload (/api/trail-upload)
+  const gpxInput = document.getElementById("gpx-file-input");
+  const gpxOut = document.getElementById("gpx-upload-results");
+  gpxInput?.addEventListener("change", async () => {
+    const file = gpxInput.files?.[0];
+    if (!file || !gpxOut) return;
+    gpxOut.hidden = false;
+    gpxOut.innerHTML = `<span class="muted-note">Analyzing ${escapeFieldCardHtml(file.name)}…</span>`;
+    try {
+      const text = await file.text();
+      const isSunrise = document.getElementById("tab-corridor-sunrise")?.classList.contains("is-active");
+      const phase = isSunrise ? "sunrise" : "sunset";
+      const qs = new URLSearchParams({ date: state.date, phase, include_weather: "true" });
+      const res = await fetch(`/api/trail-upload?${qs.toString()}`, {
+        method: "POST",
+        headers: { "Content-Type": file.name.endsWith(".gpx") ? "application/gpx+xml" : "application/geo+json" },
+        body: text,
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const doc = await res.json();
+      const nudgesHtml = (doc.nudges || [])
+        .slice(0, 3)
+        .map((n) => `<div><strong>${escapeFieldCardHtml(n.category || "Nudge")}:</strong> ${escapeFieldCardHtml(n.message || "")}</div>`)
+        .join("");
+      gpxOut.innerHTML = `
+        <strong>${escapeFieldCardHtml(doc.trail_name || file.name)}</strong>
+        <div class="muted-note">${doc.total_distance_miles} mi · +${Math.round(doc.elevation_gain_ft || 0).toLocaleString()} ft · Est ${doc.tobler_ascent_minutes} min</div>
+        ${nudgesHtml || '<div class="muted-note">Route analyzed — ready for field card export.</div>'}
+      `;
+    } catch (err) {
+      gpxOut.innerHTML = `<span class="muted-note">Upload error: ${escapeFieldCardHtml(err.message)}</span>`;
+    }
+  });
+})();
 
 syncFluidLabButtons();
 ensureRenderLoopRunning();

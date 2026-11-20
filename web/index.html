@@ -3,9 +3,9 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="color-scheme" content="light dark" />
-  <title>PhotoPlanner 3D — Raycasted Terrain, Lens Viewfinder &amp; Calibrated Light Engine</title>
-  <link rel="stylesheet" href="/styles.css?v=20261120a" />
+  <meta name="color-scheme" content="dark light" />
+  <title>PhotoPlanner — 3D Light &amp; Lens Viewfinder</title>
+  <link rel="stylesheet" href="/styles.css?v=20261120b" />
   <script type="importmap">
     {
       "imports": {
@@ -16,1050 +16,703 @@
   </script>
 </head>
 <body>
-  <!-- Compact single-row top bar (< 10% viewport height per content-first-noise-reduction) -->
-  <header class="topbar">
-    <div class="brand-cluster">
-      <span class="brand-badge" aria-hidden="true">☀️</span>
-      <div class="brand-text-wrap">
-        <h1 class="brand-title">PhotoPlanner</h1>
-        <span class="brand-tag">3D Viewfinder</span>
-      </div>
-    </div>
+  <!-- Full-Bleed 100vw × 100dvh 3D Topographic & Light Stage -->
+  <main class="viewport-stage" id="viewport-stage" aria-label="Interactive 3D Topographic Light &amp; Lens Viewfinder">
+    <div id="canvas-container" class="canvas-container"></div>
+    <img id="webcam-ghost-overlay" class="webcam-ghost-overlay" alt="" hidden />
 
-    <form id="query-form" class="query-bar" aria-label="Landmark &amp; Shoot Date Controls">
-      <div class="control-group control-group-subject">
-        <label for="landmark-select" class="control-label">Subject</label>
-        <select id="landmark-select" class="form-control" name="landmark">
-          <optgroup label="SF Peninsula &amp; Pacific Coast">
-            <option value="Pedro Point Headlands" selected>Pedro Point Headlands (625 ft • Pacifica)</option>
-            <option value="Montara Mountain">Montara Mountain (1,898 ft • SF Coast)</option>
-          </optgroup>
-          <optgroup label="Yosemite National Park">
-            <option value="Half Dome">Half Dome (8,840 ft)</option>
-            <option value="Clouds Rest">Clouds Rest (9,930 ft)</option>
-            <option value="Upper Yosemite Fall">Upper Yosemite Fall</option>
-            <option value="Sentinel Dome">Sentinel Dome</option>
-            <option value="Bridalveil Fall">Bridalveil Fall</option>
-            <option value="North Dome">North Dome</option>
-            <option value="Cathedral Peak">Cathedral Peak</option>
-            <option value="Tenaya Lake">Tenaya Lake</option>
-          </optgroup>
-        </select>
+    <!-- Floating 3D Cloud Hover Provenance Tooltip (pointer-events: none) -->
+    <div id="cloud-hover-tooltip" class="cloud-hover-tooltip" role="status" aria-live="polite" hidden></div>
+
+    <!-- First-Person Optical Camera Viewfinder Overlay (Full-Bleed, Pure EVF) -->
+    <div class="viewfinder-overlay" id="viewfinder-overlay" hidden>
+      <div class="vf-corner vf-tl"></div>
+      <div class="vf-corner vf-tr"></div>
+      <div class="vf-corner vf-bl"></div>
+      <div class="vf-corner vf-br"></div>
+      <div class="vf-grid" aria-hidden="true">
+        <div class="vf-line vf-v1"></div>
+        <div class="vf-line vf-v2"></div>
+        <div class="vf-line vf-h1"></div>
+        <div class="vf-line vf-h2"></div>
+        <div class="vf-center-cross"></div>
       </div>
 
-      <div class="control-group">
-        <label for="shoot-date" class="control-label">Date</label>
-        <input type="date" id="shoot-date" class="form-control" name="date" />
-      </div>
-
-      <div class="control-group">
-        <label for="max-miles" class="control-label">Hike</label>
-        <select id="max-miles" class="form-control" name="max_miles">
-          <option value="10">≤ 10 mi</option>
-          <option value="16" selected>≤ 16 mi</option>
-          <option value="22">≤ 22 mi</option>
-        </select>
-      </div>
-
-      <button type="submit" id="compute-btn" class="btn-primary">
-        Plan Shoot
-      </button>
-    </form>
-
-    <div class="topbar-actions">
-      <a class="btn-ghost" href="/guides" title="Browse daily SEO Light Guides for 40 regional peaks, trails &amp; lakes">
-        <span aria-hidden="true">🧭</span>
-        <span class="action-btn-label">Guides</span>
-      </a>
-      <button type="button" class="btn-ghost btn-field-card" id="btn-export-field-card" title="Export self-contained offline backcountry Field Card (HTML/Print)">
-        <span aria-hidden="true">📋</span>
-        <span class="action-btn-label">Field Card</span>
-      </button>
-      <button type="button" class="btn-ghost" id="btn-open-calendar" popovertarget="annual-calendar-popover" title="Scan 365-day solar keyhole alignments">
-        <span aria-hidden="true">📅</span>
-        <span class="action-btn-label">Best Dates</span>
-      </button>
-      <button type="button" class="btn-ghost" popovertarget="engine-methodology-popover" title="Raycasted Terrain, Calibrated Corridor Physics &amp; Optional GPU Fluid Lab">
-        <span aria-hidden="true">ℹ️</span>
-        <span class="action-btn-label">Engine</span>
-      </button>
-      <button type="button" id="theme-toggle" class="btn-ghost btn-theme-toggle" aria-label="Toggle color theme" title="Switch Light / Dark studio theme">
-        <span id="theme-toggle-icon" aria-hidden="true">☀️</span>
-        <span id="theme-toggle-label" class="action-btn-label">Light</span>
-      </button>
-    </div>
-  </header>
-
-  <!-- Native Popover for Annual Keyhole Light-Notch Alignment Finder -->
-  <div id="annual-calendar-popover" class="methodology-popover calendar-popover" popover>
-    <div class="popover-header">
-      <div>
-        <span class="eyebrow">365-DAY SOLAR EPHEMERIS + HORIZON SOLVER</span>
-        <h2 id="calendar-popover-title">Annual Keyhole Light-Notch Alignments</h2>
-      </div>
-      <button type="button" class="btn-ghost btn-sm" popovertarget="annual-calendar-popover" popovertargetaction="hide">
-        Close
-      </button>
-    </div>
-    <p class="calendar-intro">
-      Exact dates of the year when the rising or setting sun aligns directly through narrow topographic mountain V-notches as seen from <strong id="calendar-vp-name">VP1</strong>:
-    </p>
-    <div id="calendar-alignments-list" class="calendar-alignments-list">
-      <div class="calendar-empty">Scanning 365-day solar ephemeris against 1m LiDAR + SRTM horizon profile…</div>
-    </div>
-  </div>
-
-  <!-- Native Popover for Engine Methodology & Technical Telemetry -->
-  <div id="engine-methodology-popover" class="methodology-popover" popover>
-    <div class="popover-header">
-      <div>
-        <span class="eyebrow fluid-eyebrow">SYSTEM ARCHITECTURE &amp; DATA PROVENANCE</span>
-        <h2>Unified 4-Layer WebGL2 Fluid Atmosphere + Provenance Engine</h2>
-      </div>
-      <button type="button" class="btn-ghost btn-sm" popovertarget="engine-methodology-popover" popovertargetaction="hide">
-        Close
-      </button>
-    </div>
-    <p class="popover-lead">
-      <strong>PhotoPlanner 3D</strong> unifies real multi-source atmospheric observations with a 4-layer GPU fluid simulation and per-parcel confidence tracking:
-    </p>
-    <ol class="methodology-list">
-      <li>
-        <strong>Unified 4-Layer 128×128×48 GPU Moist Navier-Stokes:</strong> Simultaneously resolves sub-inversion marine stratus/fog, boundary-layer cumulus, mid-level altocumulus/lenticular waves, and upper-tropospheric 3D ice cirrus at their exact pressure-level ASL altitudes from <code>0 m</code> to <code>12.2 km</code>.
-      </li>
-      <li>
-        <strong>Multi-Sensor Ground Truth &amp; Historical Hindcasts:</strong> Fuses 5-band GOES-18/19 <code>ABI-L2-CCLC</code> + twilight 3.9 µm fog <code>BTD</code>, 5-minute ASOS laser ceilometers, and <code>00Z/12Z</code> NWS radiosonde balloons, with instant 3D comparison against archived <code>+1h</code>, <code>+24h</code>, and <code>+72h</code> hindcasts.
-      </li>
-      <li>
-        <strong>1m USGS 3DEP Terrain + GPU Sightline Ray-Caster:</strong> Click any point on the 3D terrain in <strong>Inspect</strong> mode for sub-millisecond curved-Earth sightline profiling, 360° horizon notches, and trailhead routing.
-      </li>
-    </ol>
-    <div class="telemetry-grid popover-telemetry-grid" id="telemetry-details">
-      <div><span>Near-Field DEM</span> <strong>USGS 3DEP 1m F32 Binary Stream</strong></div>
-      <div><span>3D Fluid Column</span> <strong>128×128×48 GPU + 64×64 (1.75 km) Spatial Field</strong></div>
-      <div><span>Cloud Provenance</span> <strong>GOES-18 CCLC/BTD + ASOS + 00Z Balloon</strong></div>
-      <div><span>Solar Ephemeris</span> <strong>380 km Curved-Earth 6-Band Radiative LUT</strong></div>
-    </div>
-  </div>
-
-  <!-- Native Popover for 3D Map Layers, Surface Style & Color Legend -->
-  <div id="map-layers-popover" class="layers-popover" popover>
-    <div class="popover-header">
-      <div>
-        <span class="eyebrow">VIEWPORT RENDERING</span>
-        <h2>Map Surface &amp; Overlays</h2>
-      </div>
-      <button type="button" class="btn-ghost btn-sm" popovertarget="map-layers-popover" popovertargetaction="hide">
-        Done
-      </button>
-    </div>
-
-    <div class="layers-section">
-      <div class="section-caption">Terrain Surface Style</div>
-      <div class="surface-segment-group" role="group" aria-label="Terrain Surface Style">
-        <button type="button" class="mode-btn is-active" id="btn-surf-granite" data-surface="0">
-          Granite Relief
-        </button>
-        <button type="button" class="mode-btn" id="btn-surf-aerial" data-surface="1">
-          USGS Satellite
-        </button>
-        <button type="button" class="mode-btn" id="btn-surf-topo" data-surface="2">
-          Topo Contours
+      <!-- Optical Full-Frame Camera Focal-Length Dial -->
+      <div class="vf-top-lens-bar" id="vf-lens-bar" role="group" aria-label="Full-Frame Camera Focal Length">
+        <span class="vf-lens-label">35mm</span>
+        <button type="button" class="vf-lens-btn" data-focal-mm="16">16</button>
+        <button type="button" class="vf-lens-btn" data-focal-mm="24">24</button>
+        <button type="button" class="vf-lens-btn is-active" data-focal-mm="35">35</button>
+        <button type="button" class="vf-lens-btn" data-focal-mm="50">50</button>
+        <button type="button" class="vf-lens-btn" data-focal-mm="70">70</button>
+        <button type="button" class="vf-lens-btn" data-focal-mm="200">200<span class="vf-unit">mm</span></button>
+        <span class="vf-fov-pill" id="vf-fov-readout">54° × 38°</span>
+        <button type="button" class="vf-lens-btn vf-fieldcard-btn" id="btn-vf-export-field-card" title="Export Offline Backcountry Field Card">
+          Field Card
         </button>
       </div>
-    </div>
 
-    <div class="layers-section">
-      <div class="section-caption">Fog-Sea Elevation Slice (Probabilistic Band)</div>
-      <div class="surface-segment-group" id="layers-fog-band-group" role="group" aria-label="Fog-Sea Elevation Band">
-        <button type="button" class="mode-btn" data-fog-band="p10" title="Optimistic P10 fog-sea lid height">P10 Low</button>
-        <button type="button" class="mode-btn is-active" data-fog-band="p50" title="Expected P50 fog-sea lid height">P50 Lid</button>
-        <button type="button" class="mode-btn" data-fog-band="p90" title="Conservative P90 fog-sea lid height">P90 High</button>
-        <button type="button" class="mode-btn" data-fog-band="off" title="Hide 3D fog-sea elevation plane">Off</button>
+      <div class="vf-bottom-hud" id="vf-hud-readout">
+        VP1 · 35mm FF · Bearing 117.9° ESE · 1.66 mi
       </div>
     </div>
 
-    <div class="layers-section">
-      <div class="section-caption">3D Layers &amp; Color Key</div>
-      <div class="layer-check-list">
-        <label class="layer-check-row">
-          <input type="checkbox" id="toggle-atmosphere" />
-          <i class="swatch swatch-vp1" aria-hidden="true"></i>
-          <span><strong>GPU Fluid Lab (Opt-In)</strong> (Heavy WebGL2 3D Navier-Stokes)</span>
-        </label>
-        <label class="layer-check-row">
-          <input type="checkbox" id="toggle-sightlines" checked />
-          <span class="swatch-trio" aria-hidden="true">
-            <i class="swatch swatch-vp1"></i>
-            <i class="swatch swatch-vp2"></i>
-            <i class="swatch swatch-vp3"></i>
-          </span>
-          <span><strong>Trails &amp; Sightlines</strong> (VP1 / VP2 / VP3)</span>
-        </label>
-        <label class="layer-check-row">
-          <input type="checkbox" id="toggle-viewshed" />
-          <i class="swatch swatch-viewshed" aria-hidden="true"></i>
-          <span><strong>Live Viewshed Heatmap</strong> (Unobstructed LOS)</span>
-        </label>
-        <label class="layer-check-row">
-          <input type="checkbox" id="toggle-alpenglow-zone" checked />
-          <i class="swatch swatch-alpenglow" aria-hidden="true"></i>
-          <span><strong>Alpenglow Landing Zone</strong> (Lit Cliff Highlight)</span>
-        </label>
-        <label class="layer-check-row">
-          <input type="checkbox" id="toggle-sun-beams" />
-          <i class="swatch swatch-alpenglow" aria-hidden="true"></i>
-          <span><strong>Analytical Grazing Vectors</strong> (Silhouette Lines)</span>
-        </label>
-        <label class="layer-check-row">
-          <input type="checkbox" id="toggle-light-field" />
-          <i class="swatch swatch-viewshed" aria-hidden="true"></i>
-          <span><strong>Analytical Ray Lattice</strong> (Valley Vector Grid)</span>
-        </label>
-      </div>
+    <!-- Loading Indicator (Minimal Center Capsule) -->
+    <div class="viewport-loading" id="viewport-loading">
+      <span class="spinner" aria-hidden="true"></span>
+      <span id="loading-text">Loading terrain &amp; solar corridor…</span>
     </div>
-  </div>
 
-  <!-- Native Popover for Curated Weather & Landmark Benchmark Scenarios (content-first-noise-reduction) -->
-  <div id="scenarios-popover" class="scenarios-popover" popover>
-    <div class="popover-header">
-      <div>
-        <span class="eyebrow">CURATED ATMOSPHERIC BENCHMARKS</span>
-        <h2>Featured Shoot Scenarios</h2>
-      </div>
-      <button type="button" class="btn-ghost btn-sm" popovertarget="scenarios-popover" popovertargetaction="hide">
-        Done
-      </button>
-    </div>
-    <p class="popover-lead">
-      Jump directly to live forecasts or multi-sensor archived ground truth (GOES-18 CCLC + ASOS + 00Z Balloon) vs. historical hindcasts:
-    </p>
-    <div class="scenario-preset-list">
-      <button type="button" class="scenario-preset-card" id="btn-vp-yesterday-pedro">
-        <span class="scenario-preset-icon" aria-hidden="true">🌅</span>
-        <span class="scenario-preset-body">
-          <strong>Pedro Point Yesterday Sunset</strong>
-          <span>Observed GOES-18 CCLC + KHAF + KOAK Truth vs. +24h/+72h Hindcast</span>
-        </span>
-      </button>
-      <button type="button" class="scenario-preset-card" id="btn-vp-today-sf">
-        <span class="scenario-preset-icon" aria-hidden="true">🔥</span>
-        <span class="scenario-preset-body">
-          <strong>Montara Mountain Live Today</strong>
-          <span>Live GOES-18 CCLC/BTD + METAR + 4-Model Coastal Column</span>
-        </span>
-      </button>
-      <button type="button" class="scenario-preset-card" id="btn-vp-fog-sea">
-        <span class="scenario-preset-icon" aria-hidden="true">☁️</span>
-        <span class="scenario-preset-body">
-          <strong>Montara Marine Cloud-Sea ('25)</strong>
-          <span>Jun 5, 2025 • KOAK 00Z Balloon Lid (2,020 ft) vs. NWP Hindcast</span>
-        </span>
-      </button>
-      <button type="button" class="scenario-preset-card" id="btn-vp-clear-slot">
-        <span class="scenario-preset-icon" aria-hidden="true">✨</span>
-        <span class="scenario-preset-body">
-          <strong>Pedro Point Crimson Cirrus ('25)</strong>
-          <span>May 16, 2025 • Multi-Layer CCLC Cirrus + Sub-Inversion Slot</span>
-        </span>
-      </button>
-      <button type="button" class="scenario-preset-card" id="btn-vp-halfdome-alpenglow">
-        <span class="scenario-preset-icon" aria-hidden="true">🏔️</span>
-        <span class="scenario-preset-body">
-          <strong>Half Dome Cumulus &amp; Cirrus ('25)</strong>
-          <span>May 25, 2025 • GOES-18 + KREV Balloon Truth vs. +24h/+72h Forecast</span>
-        </span>
-      </button>
-      <button type="button" class="scenario-preset-card" id="btn-vp-clouds-rest-wave">
-        <span class="scenario-preset-icon" aria-hidden="true">🌬️</span>
-        <span class="scenario-preset-body">
-          <strong>Clouds Rest Sierra Wave ('25)</strong>
-          <span>Jun 7, 2025 • Standing Lee-Wave Ice Canopy Truth vs. Hindcast</span>
-        </span>
-      </button>
-    </div>
-  </div>
-
-  <!-- Main Workspace Split: Left = Focused Planner Sidebar | Right = Clean 3D Topographic Stage -->
-  <main class="workspace">
-    <aside class="planner-sidebar" aria-label="Recommended Viewpoints and Atmospheric Telemetry">
-      <!-- Compact Landmark Header Card -->
-      <section class="card landmark-summary-card" id="landmark-summary">
-        <div class="landmark-header-row">
-          <div class="landmark-title-group">
-            <span class="eyebrow" id="summary-eyebrow">TARGET SUBJECT</span>
-            <h2 class="landmark-name" id="summary-title">Pedro Point Headlands</h2>
+    <!-- =====================================================================
+         TOP-LEFT: Floating Collapsible Photographer Sheet (Proposal A)
+         ===================================================================== -->
+    <aside class="floating-sheet" id="planner-sheet" aria-label="Shoot Brief &amp; Planner">
+      <!-- Compact Brand + Location / Date / Phase Header -->
+      <div class="sheet-header">
+        <div class="brand-row">
+          <div class="brand-mark">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="8" r="3.5" />
+              <path d="M3 20l6-8 4 5 3-4 5 7H3z" />
+            </svg>
+            <span class="brand-wordmark">PhotoPlanner</span>
           </div>
-          <span class="relief-pill" id="summary-elevation">625 ft</span>
+          <div class="sheet-header-right">
+            <span class="elev-chip" id="summary-elevation">625 ft</span>
+            <button type="button" class="icon-btn icon-btn-xs" id="btn-toggle-sheet" aria-expanded="true" title="Collapse or expand brief panel">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <polyline points="18 15 12 9 6 15" />
+              </svg>
+            </button>
+          </div>
         </div>
-        <p class="landmark-meta" id="summary-subtitle">
-          Loading 1m USGS 3DEP LiDAR &amp; 3D trail sightlines…
-        </p>
-      </section>
 
-      <!-- Optional GPU Fluid Lab & 4-Layer Atmospheric Column (Collapsed by default; opt-in for heavy GPU sim) -->
-      <details class="card weather-card fluid-card" id="fluid-physics-disclosure">
-        <summary class="weather-summary">
-          <div class="weather-summary-main">
-            <span class="eyebrow fluid-eyebrow">ATMOSPHERIC COLUMN • OPT-IN GPU FLUID LAB</span>
-            <span class="weather-verdict" id="fluid-regime-title">Multi-Layer Cloud Profile &amp; Provenance</span>
-            <span class="weather-summary-sub" id="fluid-summary-sub">
-              Fast Terrain Mode Active • Click GPU Fluid Lab to enable 3D volumetric sim
-            </span>
-          </div>
-          <div class="weather-summary-right">
-            <span class="alpenglow-score-badge fluid-perf-badge" id="fluid-perf-badge">Fast Mode</span>
-            <span class="disclosure-chevron" aria-hidden="true">▾</span>
-          </div>
-        </summary>
+        <form id="query-form" class="sheet-controls" aria-label="Subject and Date">
+          <select id="landmark-select" class="input-select" name="landmark" aria-label="Photography Subject">
+            <optgroup label="SF Peninsula &amp; Pacific Coast">
+              <option value="Pedro Point Headlands" selected>Pedro Point Headlands</option>
+              <option value="Montara Mountain">Montara Mountain</option>
+            </optgroup>
+            <optgroup label="Yosemite National Park">
+              <option value="Half Dome">Half Dome</option>
+              <option value="Clouds Rest">Clouds Rest</option>
+              <option value="Upper Yosemite Fall">Upper Yosemite Fall</option>
+              <option value="Sentinel Dome">Sentinel Dome</option>
+              <option value="Bridalveil Fall">Bridalveil Fall</option>
+              <option value="North Dome">North Dome</option>
+              <option value="Cathedral Peak">Cathedral Peak</option>
+              <option value="Tenaya Lake">Tenaya Lake</option>
+            </optgroup>
+          </select>
 
-        <div class="weather-expanded-body">
-          <!-- Historical Verification: Observed Multi-Sensor Truth vs. Archived Hindcasts (Past Dates Only) -->
-          <div class="historical-replay-panel" id="historical-replay-panel" hidden>
-            <div class="historical-replay-header">
-              <span class="historical-replay-eyebrow">HISTORICAL VERIFICATION • 3D REPLAY</span>
-              <span class="conf-pill conf-high" id="historical-replay-badge">Observed Truth</span>
+          <div class="sheet-date-phase-row">
+            <input type="date" id="shoot-date" class="input-date" name="date" aria-label="Shoot Date" />
+            <div class="phase-switch" role="tablist" aria-label="Light Phase">
+              <button type="button" class="phase-btn" id="tab-corridor-sunrise" data-phase="sunrise">Sunrise</button>
+              <button type="button" class="phase-btn is-active" id="tab-corridor-sunset" data-phase="sunset">Sunset</button>
             </div>
-            <div class="historical-replay-btns" id="historical-replay-btns" role="group" aria-label="Historical Truth vs Hindcast Mode">
-              <button type="button" class="corridor-tab is-active" data-replay-mode="truth" title="Archived GOES-18 5-Layer CCLC + 3.9µm BTD + ASOS Ceilometer + 00Z/12Z Weather Balloon">
-                Observed Truth
-              </button>
-              <button type="button" class="corridor-tab" data-replay-mode="nowcast_1h" title="Causal +1h satellite optical-flow &amp; METAR/balloon nowcast before golden hour">
-                +1h Nowcast
-              </button>
-              <button type="button" class="corridor-tab" data-replay-mode="hindcast_24h" title="Genuine Day-1 (+24h) archived NWP forecast run issued the day prior">
-                +24h Forecast
-              </button>
-              <button type="button" class="corridor-tab" data-replay-mode="hindcast_72h" title="Genuine Day-3 (+72h) archived NWP forecast run issued 3 days prior">
-                +72h Forecast
-              </button>
-            </div>
-            <div class="historical-delta-strip" id="historical-delta-strip" hidden></div>
           </div>
 
-          <!-- Honest Data Provenance & Overall Confidence Banner -->
-          <div class="atmo-provenance-banner" id="atmo-provenance-banner">
-            <div class="atmo-provenance-top">
-              <span class="atmo-pipeline-label" id="atmo-pipeline-label">Loading GOES-18 / METAR / 4-Model Sounding…</span>
-              <span class="conf-pill conf-moderate" id="atmo-overall-conf-pill">--% Conf</span>
+          <!-- Hidden compatibility hooks -->
+          <select id="max-miles" name="max_miles" hidden>
+            <option value="10">10</option>
+            <option value="16" selected>16</option>
+            <option value="22">22</option>
+          </select>
+          <span id="summary-title" hidden>Pedro Point Headlands</span>
+          <span id="summary-subtitle" hidden></span>
+        </form>
+      </div>
+
+      <!-- Collapsible Body of Floating Sheet -->
+      <div class="sheet-body" id="sheet-body">
+        <!-- Hero Verdict Strip: The 5-Second Answer -->
+        <section class="verdict-hero" aria-label="Light Verdict">
+          <div class="verdict-top-row">
+            <div class="verdict-status-wrap">
+              <span class="verdict-dot" id="brief-verdict-dot" aria-hidden="true"></span>
+              <span class="verdict-label" id="brief-verdict-badge">EVALUATING</span>
             </div>
-            <p class="atmo-sim-disclosure" id="atmo-sim-disclosure">
-              Layer altitudes, coverage &amp; wind shear come from satellite, METAR &amp; NWP soundings; optional WebGL2 Fluid Lab renders fine 3D billows on desktop GPUs.
+            <div class="verdict-odds-wrap">
+              <span class="verdict-odds-num" id="brief-light-odds">--%</span>
+              <span class="verdict-odds-caption">light odds</span>
+            </div>
+          </div>
+
+          <div class="prob-whisker" title="Calibrated P10–P90 transmittance band (median P50 marked)">
+            <div class="prob-whisker-track">
+              <div class="prob-whisker-band" id="brief-prob-range" style="left: 20%; width: 50%;"></div>
+              <div class="prob-whisker-median" id="brief-prob-median" style="left: 50%;"></div>
+            </div>
+            <div class="prob-whisker-labels">
+              <span id="brief-p10-label">P10 --%</span>
+              <span id="brief-p50-label">P50 --%</span>
+              <span id="brief-p90-label">P90 --%</span>
+            </div>
+          </div>
+
+          <p class="verdict-reason" id="brief-causal-note">
+            Solving 380 km curved-Earth solar corridor and local inversion height…
+          </p>
+
+          <div class="brief-tri-stats">
+            <div class="tri-stat">
+              <span class="tri-label">Peak Light</span>
+              <strong class="tri-val" id="brief-peak-time">--:--</strong>
+            </div>
+            <div class="tri-stat">
+              <span class="tri-label">Fog Lid</span>
+              <strong class="tri-val" id="brief-fog-clearance">--</strong>
+            </div>
+            <div class="tri-stat">
+              <span class="tri-label">Conditions</span>
+              <strong class="tri-val" id="brief-temp-wind">--</strong>
+            </div>
+          </div>
+        </section>
+
+        <!-- 3 Clean Tabs: Brief (Viewpoints) | Hunt (Regional) | Trail (GPX & Pin) -->
+        <nav class="sheet-tabs" role="tablist" aria-label="Planner Views">
+          <button type="button" class="sheet-tab is-active" data-sheet-tab="brief" role="tab" aria-selected="true">
+            Viewpoints
+          </button>
+          <button type="button" class="sheet-tab" data-sheet-tab="hunt" role="tab" aria-selected="false">
+            Hunt Tonight
+          </button>
+          <button type="button" class="sheet-tab" data-sheet-tab="trail" role="tab" aria-selected="false">
+            Trail &amp; Pin
+          </button>
+        </nav>
+
+        <!-- Tab 1: Recommended Viewpoints -->
+        <div class="sheet-panel is-active" id="panel-brief" role="tabpanel">
+          <div id="vp-cards-container" class="vp-cards-list"></div>
+          <div class="sheet-footer-links">
+            <button type="button" class="link-btn" id="btn-open-calendar" popovertarget="annual-calendar-popover">
+              365-Day Keyhole Dates
+            </button>
+            <a class="link-btn" href="/guides">Regional Guides</a>
+            <a class="link-btn" href="/api/backtest-report">Accuracy</a>
+          </div>
+        </div>
+
+        <!-- Tab 2: Regional "Where Tonight?" Light Hunter -->
+        <div class="sheet-panel" id="panel-hunt" role="tabpanel" hidden>
+          <div class="hunt-controls-row">
+            <select id="hunt-region-select" class="input-select input-select-sm" aria-label="Hunt Region">
+              <option value="bay_area">Bay Area &amp; Marin</option>
+              <option value="sierra">Sierra &amp; Yosemite</option>
+              <option value="central_coast">Big Sur &amp; Central Coast</option>
+              <option value="pnw">Pacific Northwest</option>
+              <option value="rockies">Rocky Mountains</option>
+              <option value="southwest">American Southwest</option>
+              <option value="east_coast">East Coast &amp; Acadia</option>
+            </select>
+            <button type="button" class="btn-subtle btn-sm" id="btn-run-regional-hunt">
+              Scan Region
+            </button>
+          </div>
+          <div id="regional-hunt-results" class="hunt-results-list">
+            <p class="empty-hint">
+              Rank regional peaks, ridges &amp; alpine lakes for tonight's calibrated cloud-sea breakout, alpenglow, and mirror reflections.
+            </p>
+          </div>
+        </div>
+
+        <!-- Tab 3: Click-to-Inspect Terrain & GPX Trail Upload -->
+        <div class="sheet-panel" id="panel-trail" role="tabpanel" hidden>
+          <div class="trail-mode-block">
+            <div class="block-caption">Terrain Click Action</div>
+            <div class="segmented" id="hud-click-mode-group" role="group" aria-label="Terrain Click Action">
+              <button type="button" class="seg-btn is-active" id="btn-click-tripod" data-click-mode="tripod">
+                Drop Tripod Pin
+              </button>
+              <button type="button" class="seg-btn" id="btn-click-target" data-click-mode="target">
+                Set Subject Target
+              </button>
+            </div>
+            <p class="cursor-hint" id="cursor-coords-bar">
+              Click any ridge or trail on the 3D terrain to inspect exact line-of-sight.
             </p>
           </div>
 
-          <!-- Matched Mountain / Coastal Webcam Ground-Truth Summary Strip -->
-          <div class="webcam-sidebar-strip" id="webcam-sidebar-strip">
-            <div class="webcam-sidebar-meta">
-              <span class="webcam-swatch-dot" id="webcam-sidebar-swatch" aria-hidden="true"></span>
-              <div class="webcam-sidebar-text">
-                <strong id="webcam-sidebar-title">Matching Scientific Camera…</strong>
-                <span id="webcam-sidebar-sub">PhenoCam / NEON Scientific Sky Chromaticity</span>
+          <div class="gpx-drop-block">
+            <div class="block-caption">Custom Route (.GPX / .GeoJSON)</div>
+            <label class="gpx-upload-zone" for="gpx-file-input">
+              <input type="file" id="gpx-file-input" accept=".gpx,.geojson,.json" hidden />
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="17 8 12 3 7 8" />
+                <line x1="12" y1="3" x2="12" y2="15" />
+              </svg>
+              <span>Upload GPX or GeoJSON trail</span>
+            </label>
+            <div id="gpx-upload-results" class="gpx-results" hidden></div>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- =====================================================================
+         TOP-RIGHT: Quiet Monochrome Utility Icons (4 controls total)
+         ===================================================================== -->
+    <div class="top-right-controls" role="toolbar" aria-label="Viewport Tools">
+      <button type="button" class="pill-btn pill-btn-accent btn-exit-vf" id="btn-orbit-mode" data-mode="orbit" hidden>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="19" y1="12" x2="5" y2="12" /><polyline points="12 19 5 12 12 5" /></svg>
+        <span>3D Orbit</span>
+        <kbd class="kbd-hint">Esc</kbd>
+      </button>
+
+      <button type="button" class="pill-btn btn-enter-vf-quick" id="btn-enter-vp-vf" title="Enter first-person camera lens viewfinder (16–200 mm)">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
+          <circle cx="12" cy="13" r="4" />
+        </svg>
+        <span>Viewfinder</span>
+      </button>
+
+      <button type="button" class="icon-btn" id="btn-open-layers" popovertarget="map-layers-popover" title="Map surface, Fog-Sea band &amp; 3D overlays" aria-label="Map Layers">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polygon points="12 2 2 7 12 12 22 7 12 2" />
+          <polyline points="2 17 12 22 22 17" />
+          <polyline points="2 12 12 17 22 12" />
+        </svg>
+      </button>
+
+      <button type="button" class="icon-btn" id="btn-export-field-card" title="Export Offline Backcountry Field Card (HTML / Print)" aria-label="Export Field Card">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+          <polyline points="14 2 14 8 20 8" />
+          <line x1="12" y1="18" x2="12" y2="12" />
+          <polyline points="9 15 12 18 15 15" />
+        </svg>
+      </button>
+
+      <button type="button" class="icon-btn" id="btn-open-lab" aria-expanded="false" aria-controls="lab-drawer" title="Open Atmospheric Lab (NWP Models, GPU Fluid Lab, Webcam &amp; Verification)" aria-label="Atmospheric Lab">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <line x1="4" y1="21" x2="4" y2="14" /><line x1="4" y1="10" x2="4" y2="3" />
+          <line x1="12" y1="21" x2="12" y2="12" /><line x1="12" y1="8" x2="12" y2="3" />
+          <line x1="20" y1="21" x2="20" y2="16" /><line x1="20" y1="12" x2="20" y2="3" />
+          <line x1="1" y1="14" x2="7" y2="14" /><line x1="9" y1="8" x2="15" y2="8" /><line x1="17" y1="16" x2="23" y2="16" />
+        </svg>
+      </button>
+    </div>
+
+    <!-- Contextual Clicked Tripod Sightline Inspector (Only appears when user clicks 3D terrain) -->
+    <aside class="tripod-inspector-card" id="tripod-inspector-card" hidden aria-label="Custom Tripod Line-of-Sight Inspector">
+      <div class="inspector-header">
+        <div class="inspector-title-wrap">
+          <span class="eyebrow" id="inspector-eyebrow">CUSTOM SIGHTLINE</span>
+          <h4 class="inspector-title" id="inspector-title">Clicked Vantage Point</h4>
+        </div>
+        <div class="inspector-header-actions">
+          <button type="button" class="btn-subtle btn-xs" id="btn-enter-custom-vf">Viewfinder</button>
+          <button type="button" class="icon-btn icon-btn-xs" id="btn-close-inspector" aria-label="Close Sightline Inspector">✕</button>
+        </div>
+      </div>
+      <div class="inspector-status-row" id="inspector-status-row"></div>
+      <div class="cross-section-box">
+        <div class="cross-section-label-row">
+          <span>Elevation Profile</span>
+          <span id="cross-section-dist-label">1.66 mi</span>
+        </div>
+        <svg id="cross-section-svg" class="cross-section-svg" viewBox="0 0 420 105" preserveAspectRatio="none" aria-label="Sightline elevation profile"></svg>
+      </div>
+      <div class="mini-stats-grid" id="inspector-meta-grid"></div>
+    </aside>
+
+    <!-- Side-by-Side Scientific Webcam Split-View Drawer (Only opens when requested from Lab) -->
+    <aside class="webcam-truth-card" id="webcam-truth-card" hidden aria-label="Scientific Camera Ground-Truth Verification">
+      <div class="inspector-header">
+        <div class="inspector-title-wrap">
+          <span class="eyebrow" id="webcam-card-eyebrow">SCIENTIFIC SKY CHROMATICITY</span>
+          <h4 class="inspector-title" id="webcam-card-title">Matched Camera</h4>
+        </div>
+        <button type="button" class="icon-btn icon-btn-xs" id="btn-close-webcam-card" aria-label="Close Camera Drawer">✕</button>
+      </div>
+      <div class="webcam-camera-tabs" id="webcam-camera-tabs" role="tablist" hidden></div>
+      <div class="webcam-frame-wrap" id="webcam-frame-wrap">
+        <img id="webcam-frame-img" class="webcam-frame-img" crossorigin="anonymous" alt="Matched scientific sky camera frame" />
+        <div class="webcam-sky-roi-band" id="webcam-sky-roi-band"><span>SKY ROI (4–22%)</span></div>
+        <div class="webcam-frame-badges">
+          <span class="webcam-ts-pill" id="webcam-ts-pill">--:--</span>
+          <span class="webcam-az-pill" id="webcam-az-pill">Az ---°</span>
+        </div>
+      </div>
+      <div class="webcam-timeline-chips" id="webcam-timeline-chips" role="group"></div>
+      <div class="mini-stats-grid" id="webcam-chroma-grid">
+        <div class="mini-stat"><span>R/B Warmth</span><strong id="val-wc-rb">--</strong></div>
+        <div class="mini-stat"><span>Cam / Sim K</span><strong id="val-wc-kelvin">-- / -- K</strong></div>
+        <div class="mini-stat"><span>Observed</span><strong id="val-wc-emp-score">-- / 100</strong></div>
+        <div class="mini-stat"><span>Simulated</span><strong id="val-wc-sim-score">-- / 100</strong></div>
+      </div>
+      <div class="webcam-snap-actions">
+        <button type="button" class="btn-accent btn-sm" id="btn-snap-webcam-camera">Snap 3D Camera</button>
+        <button type="button" class="btn-subtle btn-sm" id="btn-reset-webcam-snap" hidden>3D Orbit</button>
+      </div>
+      <div class="webcam-ghost-controls" id="webcam-ghost-controls">
+        <label class="check-inline"><input type="checkbox" id="toggle-webcam-ghost" /><span>3D Ghost Overlay</span></label>
+        <input type="range" id="webcam-ghost-opacity" class="thin-range" min="10" max="85" value="38" step="1" aria-label="Ghost Overlay Opacity" />
+        <span class="mono-dim" id="val-webcam-ghost-opacity">38%</span>
+      </div>
+      <p class="muted-note" id="webcam-snap-note">Matches Three.js horizontal FOV &amp; azimuth against scientific sky imagery.</p>
+    </aside>
+
+    <!-- =====================================================================
+         BOTTOM CENTER: Single Floating Hairline 24-Hour Timeline Pill
+         ===================================================================== -->
+    <div class="scrubber-dock" role="region" aria-label="24-Hour Light Timeline">
+      <div class="dock-row">
+        <button type="button" class="dock-play-btn" id="btn-play-sun" title="Play or pause 24-hour light animation" aria-label="Animate light">
+          ▶
+        </button>
+
+        <div class="dock-time-meta">
+          <output class="dock-time-output" id="time-scrubber-output" for="time-scrubber">17:18 · Sunset</output>
+          <span class="dock-angles">
+            Az <strong id="hud-sun-az">259°</strong> · El <strong id="hud-sun-el">+0.1°</strong> · <strong id="hud-cliff-lit">96%</strong>
+          </span>
+          <span id="hud-local-time" hidden>17:18</span>
+          <span id="hud-phase-badge" hidden>Sunset</span>
+        </div>
+
+        <div class="slider-field dock-slider-wrap">
+          <input
+            class="slider-input timeline-range"
+            id="time-scrubber"
+            type="range"
+            min="0"
+            max="1440"
+            value="1038"
+            step="1"
+            aria-label="24-Hour Solar and Astro Scrubber"
+          />
+        </div>
+
+        <div class="dock-quick-jumps" role="group" aria-label="Quick Light Jumps">
+          <button type="button" class="dock-jump-btn" id="btn-jump-sunrise" title="Jump to Sunrise Golden Hour">Rise</button>
+          <button type="button" class="dock-jump-btn is-active" id="btn-jump-sunset" title="Jump to Sunset Golden Hour">Set</button>
+          <button type="button" class="dock-jump-btn" id="btn-jump-night" title="Jump to Astro / Milky Way Peak">Astro</button>
+          <button type="button" id="btn-jump-dawn-astro" hidden>02:00</button>
+          <button type="button" id="btn-jump-bluehour" hidden>Blue</button>
+        </div>
+
+        <button type="button" class="dock-fog-chip" id="btn-cycle-fog-band" title="Cycle 3D probabilistic fog-sea lid (P10 / P50 / P90 / Off)">
+          <span id="hud-fog-alt-readout">Fog P50</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- =====================================================================
+         RIGHT SLIDE-OVER DRAWER: Opt-In Atmospheric Lab (Hidden by Default)
+         Holds all R&D meteorology, Fluid Lab sliders, Hindcasts & Webcams cleanly
+         ===================================================================== -->
+    <aside class="lab-drawer" id="lab-drawer" hidden aria-label="Atmospheric &amp; Verification Lab">
+      <div class="lab-header">
+        <div>
+          <span class="eyebrow">OPT-IN POWER TOOLS</span>
+          <h2 class="lab-title">Atmospheric Lab</h2>
+        </div>
+        <div class="lab-header-actions">
+          <button type="button" class="btn-subtle btn-xs" id="theme-toggle" aria-label="Toggle theme">
+            <span id="theme-toggle-icon" hidden>☀️</span>
+            <span id="theme-toggle-label">Light</span>
+          </button>
+          <button type="button" class="icon-btn icon-btn-xs" id="btn-close-lab" aria-label="Close Atmospheric Lab">✕</button>
+        </div>
+      </div>
+
+      <nav class="sheet-tabs lab-tabs" role="tablist" aria-label="Lab Sections">
+        <button type="button" class="sheet-tab is-active" data-lab-tab="physics" role="tab">Corridor &amp; Astro</button>
+        <button type="button" class="sheet-tab" data-lab-tab="fluid" role="tab">Fluid Lab</button>
+        <button type="button" class="sheet-tab" data-lab-tab="verify" role="tab">Verify &amp; Presets</button>
+      </nav>
+
+      <div class="lab-scroll">
+        <!-- Lab Tab 1: 380 km Corridor Physics, NWP Models & Astro -->
+        <div class="lab-panel is-active" id="lab-panel-physics" role="tabpanel">
+          <details class="lab-section" id="weather-disclosure" open>
+            <summary class="lab-section-summary">
+              <span>380 km Solar Corridor</span>
+              <span class="mono-pill" id="weather-score-badge">-- / 100</span>
+            </summary>
+            <div class="lab-section-body">
+              <div class="muted-note" id="weather-verdict">Evaluating 380 km corridor…</div>
+              <div class="muted-note" id="weather-summary-sub"></div>
+              <p class="lab-rec" id="weather-recommendation"></p>
+
+              <div class="diagram-card">
+                <div class="diagram-head">
+                  <span id="raypath-azimuth-label">Solar Corridor</span>
+                  <span id="raypath-trans-pill">--%</span>
+                </div>
+                <svg id="raypath-svg" class="raypath-svg" viewBox="0 0 360 92" preserveAspectRatio="none"></svg>
+              </div>
+
+              <div class="raypath-stations-grid" id="raypath-stations-grid"></div>
+
+              <div class="diagram-card">
+                <div class="diagram-head">
+                  <span>Radiative &amp; Inversion Metrics</span>
+                  <span id="corridor-nowcast-pill">6-Station</span>
+                </div>
+                <div class="mini-stats-grid">
+                  <div class="mini-stat"><span>Direct Beam</span><strong id="val-direct-beam-prob">--%</strong></div>
+                  <div class="mini-stat"><span>P10 · P50 · P90</span><strong id="val-bimodal-quantiles">--</strong></div>
+                  <div class="mini-stat"><span>Tint · Canvas</span><strong id="val-kelvin-canvas">--</strong></div>
+                  <div class="mini-stat"><span>Corridor Gate</span><strong id="val-dominant-blocker">Clear</strong></div>
+                  <div class="mini-stat"><span>Fog Base → Top</span><strong id="val-fog-band">--</strong></div>
+                  <div class="mini-stat"><span>Thermal Cap</span><strong id="val-inv-deltat">--</strong></div>
+                  <div class="mini-stat"><span>Cloud-Sea</span><strong id="val-cloud-sea-score">--</strong></div>
+                  <div class="mini-stat"><span>Under-Deck</span><strong id="val-under-deck-score">--</strong></div>
+                  <div class="mini-stat"><span>LCL Base</span><strong id="val-lcl-base">--</strong></div>
+                  <div class="mini-stat"><span>Visibility</span><strong id="val-visibility">--</strong></div>
+                  <div class="mini-stat"><span>Fog Chance</span><strong id="val-inversion">--</strong></div>
+                  <div class="mini-stat"><span>Temp &amp; Wind</span><strong id="val-temp-wind">--</strong></div>
+                </div>
+                <span id="inversion-header-label" hidden></span>
+                <span id="inversion-clearance-pill" hidden></span>
+              </div>
+
+              <div class="diagram-card">
+                <div class="diagram-head">
+                  <span>NWP Model Ensemble</span>
+                  <span id="ai-ensemble-agreement-pill">--%</span>
+                </div>
+                <div class="segmented segmented-sm" id="ai-engine-selector-bar" role="group">
+                  <button type="button" class="seg-btn is-active" data-weather-engine="ensemble">Hybrid</button>
+                  <button type="button" class="seg-btn" data-weather-engine="graphcast">AI</button>
+                  <button type="button" class="seg-btn" data-weather-engine="hrrr">HRRR</button>
+                  <button type="button" class="seg-btn" data-weather-engine="ecmwf">ECMWF</button>
+                  <button type="button" class="seg-btn" data-weather-engine="nowcast">Nowcast</button>
+                </div>
+                <div class="lab-note-box">
+                  <strong id="ai-feel-archetype">Evaluating…</strong>
+                  <span id="ai-feel-note"></span>
+                </div>
+                <div class="raypath-stations-grid" id="ai-models-comparison-grid"></div>
+              </div>
+
+              <div class="diagram-card">
+                <div class="diagram-head">
+                  <span>Spatial Cloud Transect (W → E)</span>
+                  <span id="spatial-transect-pill">64×64</span>
+                </div>
+                <div class="raypath-stations-grid" id="spatial-transect-grid"></div>
               </div>
             </div>
-            <button type="button" class="btn-ghost btn-sm webcam-open-btn" id="btn-sidebar-open-webcam">
-              📷 Split View
+          </details>
+
+          <details class="lab-section" id="astro-disclosure">
+            <summary class="lab-section-summary">
+              <span>Astrophotography &amp; Seeing</span>
+              <span class="mono-pill" id="astro-score-badge">-- / 100</span>
+            </summary>
+            <div class="lab-section-body">
+              <div class="muted-note" id="astro-verdict">Computing seeing &amp; dark sky…</div>
+              <div class="muted-note" id="astro-summary-sub"></div>
+              <p class="lab-rec" id="astro-recommendation"></p>
+              <div class="diagram-card">
+                <div class="diagram-head">
+                  <span id="astro-column-label">Vertical Column</span>
+                  <span id="astro-seeing-pill">Seeing --</span>
+                </div>
+                <svg id="astro-column-svg" class="raypath-svg" viewBox="0 0 360 104" preserveAspectRatio="none"></svg>
+              </div>
+              <div class="raypath-stations-grid" id="astro-pillars-grid"></div>
+              <div class="mini-stats-grid">
+                <div class="mini-stat"><span>Moon Phase</span><strong id="val-moon-phase">--</strong></div>
+                <div class="mini-stat"><span>Terrain Moonset</span><strong id="val-terrain-moonset">--</strong></div>
+                <div class="mini-stat"><span>Dark-Sky Window</span><strong id="val-dark-window">--</strong></div>
+                <div class="mini-stat"><span>Galactic Core</span><strong id="val-galactic-core">--</strong></div>
+              </div>
+            </div>
+          </details>
+        </div>
+
+        <!-- Lab Tab 2: Opt-In WebGL2 GPU Fluid Lab & 4-Layer Column -->
+        <div class="lab-panel" id="lab-panel-fluid" role="tabpanel" hidden>
+          <div class="lab-fluid-banner">
+            <div>
+              <strong>WebGL2 3D Fluid Clouds</strong>
+              <p class="muted-note">Off by default for fast mobile &amp; desktop terrain. Enable on desktop GPUs for live volumetric advection.</p>
+            </div>
+            <button type="button" class="pill-btn gpu-telemetry-pill" id="viewport-gpu-pill" aria-pressed="false">
+              Fluid Lab: Off
             </button>
           </div>
 
-          <!-- Altitude-Ordered 4-Layer Vertical Stack (High Ice -> Mid Ac/Wave -> Low Cu -> Sub-Inversion Fog) -->
-          <div class="atmo-layer-stack" id="unified-layer-stack" role="list" aria-label="Atmospheric Cloud Layers by Altitude">
-            <div class="atmo-layer-row" role="listitem">
-              <div class="atmo-layer-main">
-                <span class="atmo-layer-name">High Ice Cirrus</span>
-                <span class="atmo-layer-alt">25,600–34,100 ft ASL (7.8–10.4 km)</span>
-              </div>
-              <div class="atmo-layer-metrics">
-                <span class="atmo-layer-cov">--%</span>
-                <span class="conf-pill conf-moderate">--%</span>
-              </div>
-            </div>
-            <div class="atmo-layer-row" role="listitem">
-              <div class="atmo-layer-main">
-                <span class="atmo-layer-name">Mid Altocumulus / Wave</span>
-                <span class="atmo-layer-alt">10,500–15,100 ft ASL (3.2–4.6 km)</span>
-              </div>
-              <div class="atmo-layer-metrics">
-                <span class="atmo-layer-cov">--%</span>
-                <span class="conf-pill conf-moderate">--%</span>
-              </div>
-            </div>
-            <div class="atmo-layer-row" role="listitem">
-              <div class="atmo-layer-main">
-                <span class="atmo-layer-name">Low Cumulus / Sc</span>
-                <span class="atmo-layer-alt">3,100–6,100 ft ASL (0.9–1.9 km)</span>
-              </div>
-              <div class="atmo-layer-metrics">
-                <span class="atmo-layer-cov">--%</span>
-                <span class="conf-pill conf-moderate">--%</span>
-              </div>
-            </div>
-            <div class="atmo-layer-row" role="listitem">
-              <div class="atmo-layer-main">
-                <span class="atmo-layer-name">Marine Stratus / Fog</span>
-                <span class="atmo-layer-alt">400–1,400 ft ASL (0.1–0.4 km)</span>
-              </div>
-              <div class="atmo-layer-metrics">
-                <span class="atmo-layer-cov">--%</span>
-                <span class="conf-pill conf-moderate">--%</span>
-              </div>
-            </div>
-          </div>
-
-          <div class="metric-tiles-grid fluid-telemetry-grid" id="fluid-telemetry-grid">
-            <div class="metric-tile">
-              <span class="metric-tile-label">LCL / Freeze Alt</span>
-              <strong class="metric-tile-val" id="val-fluid-lcl">1,250 / 12,400 ft</strong>
-            </div>
-            <div class="metric-tile">
-              <span class="metric-tile-label">3D Cirrus Band</span>
-              <strong class="metric-tile-val" id="val-fluid-cirrus-base">8.4–12.2 km</strong>
-            </div>
-            <div class="metric-tile">
-              <span class="metric-tile-label">Updraft · Liquid</span>
-              <strong class="metric-tile-val" id="val-fluid-updraft">+1.4 m/s · 0.61 g/kg</strong>
-            </div>
-            <div class="metric-tile">
-              <span class="metric-tile-label">Froude · Shear</span>
-              <strong class="metric-tile-val" id="val-fluid-froude-shear">Fr 0.62 · 4.5/km</strong>
-            </div>
-            <div class="metric-tile">
-              <span class="metric-tile-label">Low / Mid Cover</span>
-              <strong class="metric-tile-val" id="val-fluid-low-mid">48% / 20%</strong>
-            </div>
-            <div class="metric-tile">
-              <span class="metric-tile-label">3D Cirrus · Ice</span>
-              <strong class="metric-tile-val" id="val-fluid-cirrus-cov">62% · 0.42 g/kg</strong>
-            </div>
-          </div>
-
-          <!-- Collapsed Simulation Quality & Gain Fine-Tuning Drawer -->
-          <details class="sim-tuning-drawer" id="sim-tuning-drawer">
-            <summary class="sim-tuning-summary">
-              <span>Simulation Quality &amp; Gain Fine-Tuning</span>
-              <span class="disclosure-chevron" aria-hidden="true">▾</span>
+          <details class="lab-section" id="fluid-physics-disclosure" open>
+            <summary class="lab-section-summary">
+              <span id="fluid-regime-title">4-Layer Atmospheric Column</span>
+              <span class="mono-pill" id="fluid-perf-badge">Fast Mode</span>
             </summary>
-            <div class="sim-tuning-body">
-              <div class="fluid-quality-row">
-                <div class="surface-segment-group fluid-quality-group" role="group" aria-label="GPU Raymarch Quality">
-                  <button type="button" class="mode-btn" data-fluid-quality="ultra">Ultra 1m</button>
-                  <button type="button" class="mode-btn is-active" data-fluid-quality="balanced">Balanced</button>
-                  <button type="button" class="mode-btn" data-fluid-quality="performance">Fast</button>
+            <div class="lab-section-body">
+              <div class="muted-note" id="fluid-summary-sub">Fast Terrain Mode Active</div>
+              <div class="lab-note-box">
+                <div class="diagram-head">
+                  <span id="atmo-pipeline-label">Loading sounding…</span>
+                  <span id="atmo-overall-conf-pill">--%</span>
                 </div>
-                <button type="button" class="btn-ghost btn-sm fluid-pause-btn" id="btn-toggle-fluid-evolve">▶ Resume</button>
-                <button type="button" class="btn-ghost btn-sm fluid-reset-btn" id="btn-reset-fluid-tuning" title="Reset manual cloud gain multipliers to physical 1:1">↺ Reset</button>
+                <span id="atmo-sim-disclosure"></span>
               </div>
 
-              <div class="fluid-sliders-grid">
-                <div class="slider-field fluid-slider-field">
-                  <div class="slider-header">
-                    <label class="slider-label" for="slider-fluid-speed">Evolution Speed</label>
-                    <output class="slider-output" id="out-fluid-speed" for="slider-fluid-speed">1.0×</output>
-                  </div>
-                  <input class="slider-input" id="slider-fluid-speed" type="range" min="0" max="4" step="0.1" value="1.0" />
+              <div class="atmo-layer-stack" id="unified-layer-stack"></div>
+
+              <div class="mini-stats-grid">
+                <div class="mini-stat"><span>LCL / Freeze</span><strong id="val-fluid-lcl">--</strong></div>
+                <div class="mini-stat"><span>Cirrus Band</span><strong id="val-fluid-cirrus-base">--</strong></div>
+                <div class="mini-stat"><span>Updraft · Liq</span><strong id="val-fluid-updraft">--</strong></div>
+                <div class="mini-stat"><span>Froude · Shear</span><strong id="val-fluid-froude-shear">--</strong></div>
+                <div class="mini-stat"><span>Low / Mid</span><strong id="val-fluid-low-mid">--</strong></div>
+                <div class="mini-stat"><span>Cirrus · Ice</span><strong id="val-fluid-cirrus-cov">--</strong></div>
+              </div>
+
+              <div class="fluid-controls-stack">
+                <div class="segmented segmented-sm" role="group" aria-label="GPU Raymarch Quality">
+                  <button type="button" class="seg-btn" data-fluid-quality="ultra">Ultra</button>
+                  <button type="button" class="seg-btn is-active" data-fluid-quality="balanced">Balanced</button>
+                  <button type="button" class="seg-btn" data-fluid-quality="performance">Fast</button>
+                </div>
+                <div class="fluid-btn-row">
+                  <button type="button" class="btn-subtle btn-xs" id="btn-toggle-fluid-evolve">▶ Resume</button>
+                  <button type="button" class="btn-subtle btn-xs" id="btn-reset-fluid-tuning">Reset Gains</button>
                 </div>
 
-                <div class="slider-field fluid-slider-field">
-                  <div class="slider-header">
-                    <label class="slider-label" for="slider-micro-detail">1m Micro Detail</label>
-                    <output class="slider-output" id="out-micro-detail" for="slider-micro-detail">100%</output>
-                  </div>
-                  <input class="slider-input" id="slider-micro-detail" type="range" min="0" max="200" step="5" value="100" />
+                <div class="slider-field lab-slider">
+                  <div class="diagram-head"><label for="slider-fluid-speed">Evolution Speed</label><output id="out-fluid-speed">1.0×</output></div>
+                  <input class="slider-input thin-range" id="slider-fluid-speed" type="range" min="0" max="4" step="0.1" value="1.0" />
                 </div>
-
-                <div class="slider-field fluid-slider-field">
-                  <div class="slider-header">
-                    <label class="slider-label" for="slider-cloud-density">Liquid Cloud Gain</label>
-                    <output class="slider-output" id="out-cloud-density" for="slider-cloud-density">100%</output>
-                  </div>
-                  <input class="slider-input" id="slider-cloud-density" type="range" min="15" max="200" step="5" value="100" />
+                <div class="slider-field lab-slider">
+                  <div class="diagram-head"><label for="slider-micro-detail">Micro Detail</label><output id="out-micro-detail">100%</output></div>
+                  <input class="slider-input thin-range" id="slider-micro-detail" type="range" min="0" max="200" step="5" value="100" />
                 </div>
-
-                <div class="slider-field fluid-slider-field">
-                  <div class="slider-header">
-                    <label class="slider-label" for="slider-cirrus-density">Upper Cirrus Gain</label>
-                    <output class="slider-output" id="out-cirrus-density" for="slider-cirrus-density">105%</output>
-                  </div>
-                  <input class="slider-input" id="slider-cirrus-density" type="range" min="0" max="220" step="5" value="105" />
+                <div class="slider-field lab-slider">
+                  <div class="diagram-head"><label for="slider-cloud-density">Liquid Gain</label><output id="out-cloud-density">100%</output></div>
+                  <input class="slider-input thin-range" id="slider-cloud-density" type="range" min="15" max="200" step="5" value="100" />
+                </div>
+                <div class="slider-field lab-slider">
+                  <div class="diagram-head"><label for="slider-cirrus-density">Cirrus Gain</label><output id="out-cirrus-density">105%</output></div>
+                  <input class="slider-input thin-range" id="slider-cirrus-density" type="range" min="0" max="220" step="5" value="105" />
                 </div>
               </div>
             </div>
           </details>
         </div>
-      </details>
 
-      <!-- Open by default: Calibrated 380 km Curved-Earth Solar Ray-Path & Alpenglow Forecast -->
-      <details class="card weather-card" id="weather-disclosure" open>
-        <summary class="weather-summary">
-          <div class="weather-summary-main">
-            <span class="eyebrow" id="weather-corridor-eyebrow">380 KM SOLAR RAY &amp; ALPENGLOW FORECAST</span>
-            <span class="weather-verdict" id="weather-verdict">Evaluating 380 km Corridor…</span>
-            <span class="weather-summary-sub" id="weather-summary-sub">
-              Click to inspect 380 km curved-Earth ray corridor &amp; live GOES/METAR telemetry
-            </span>
-          </div>
-          <div class="weather-summary-right">
-            <span class="alpenglow-score-badge" id="weather-score-badge">-- / 100</span>
-            <span class="disclosure-chevron" aria-hidden="true">▾</span>
-          </div>
-        </summary>
-
-        <div class="weather-expanded-body">
-          <!-- Sunset vs Sunrise Ray Corridor Switcher -->
-          <div class="corridor-phase-tabs" role="tablist" aria-label="Solar Ray Corridor Direction">
-            <button type="button" class="corridor-tab is-active" id="tab-corridor-sunset" data-phase="sunset">
-              🌇 Sunset Ray (WSW 380 km)
-            </button>
-            <button type="button" class="corridor-tab" id="tab-corridor-sunrise" data-phase="sunrise">
-              🌅 Sunrise Ray (ESE 380 km)
-            </button>
-          </div>
-
-          <p class="weather-rec" id="weather-recommendation">
-            Integrating 6-band spectral + stochastic cloud-chord extinction across the 0–380 km curved-Earth solar corridor…
-          </p>
-
-          <!-- SVG Multi-Station Atmospheric Ray-Path Cross-Section (190–320 km -> 15 km -> 0 km) -->
-          <div class="raypath-diagram-box">
-            <div class="raypath-diagram-header">
-              <span id="raypath-azimuth-label">Solar Beam Corridor: Az 259.1° W (El +0.4°)</span>
-              <span id="raypath-trans-pill" class="raypath-trans-pill">End-to-End Beam: --%</span>
+        <!-- Lab Tab 3: Historical Verification, Scientific Cameras & Curated Presets -->
+        <div class="lab-panel" id="lab-panel-verify" role="tabpanel" hidden>
+          <!-- Historical Replay (Visible on past dates) -->
+          <div class="diagram-card" id="historical-replay-panel" hidden>
+            <div class="diagram-head">
+              <span>Historical Hindcast Replay</span>
+              <span id="historical-replay-badge">Observed Truth</span>
             </div>
-            <svg id="raypath-svg" class="raypath-svg" viewBox="0 0 360 92" preserveAspectRatio="none" aria-label="380 km to 0 km Solar Ray Cross-Section"></svg>
+            <div class="segmented segmented-sm" id="historical-replay-btns" role="group">
+              <button type="button" class="seg-btn is-active" data-replay-mode="truth">Truth</button>
+              <button type="button" class="seg-btn" data-replay-mode="nowcast_1h">+1h</button>
+              <button type="button" class="seg-btn" data-replay-mode="hindcast_24h">+24h</button>
+              <button type="button" class="seg-btn" data-replay-mode="hindcast_72h">+72h</button>
+            </div>
+            <div class="muted-note" id="historical-delta-strip" hidden></div>
           </div>
 
-          <!-- 3-Station Representative Telemetry Grid (190 km Far Entry | 15 km Ridge Gate | 0 km Canvas) -->
-          <div class="raypath-stations-grid" id="raypath-stations-grid"></div>
-
-          <!-- Bimodal 380 km Radiative Distribution & Live GOES-18 / METAR Nowcast Telemetry -->
-          <div class="raypath-diagram-box" id="corridor-bimodal-box">
-            <div class="raypath-diagram-header">
-              <span id="corridor-nowcast-label">380 km Spectral &amp; Stochastic Cloud-Chord Telemetry</span>
-              <span id="corridor-nowcast-pill" class="raypath-trans-pill">6-Station NWP</span>
+          <!-- Matched Scientific Camera Strip -->
+          <div class="diagram-card">
+            <div class="diagram-head">
+              <span id="webcam-sidebar-title">Scientific Sky Camera</span>
+              <span class="webcam-swatch-dot" id="webcam-sidebar-swatch" aria-hidden="true"></span>
             </div>
-            <div class="metric-tiles-grid">
-              <div class="metric-tile">
-                <span class="metric-tile-label">Direct Sunbeam Odds</span>
-                <strong class="metric-tile-val" id="val-direct-beam-prob">--%</strong>
-              </div>
-              <div class="metric-tile">
-                <span class="metric-tile-label">P10 · P50 · P90 Beam</span>
-                <strong class="metric-tile-val" id="val-bimodal-quantiles">-- / -- / --%</strong>
-              </div>
-              <div class="metric-tile">
-                <span class="metric-tile-label">Chappuis Tint · Canvas</span>
-                <strong class="metric-tile-val" id="val-kelvin-canvas">2400 K · --/100</strong>
-              </div>
-              <div class="metric-tile">
-                <span class="metric-tile-label">Primary Corridor Gate</span>
-                <strong class="metric-tile-val" id="val-dominant-blocker">Clear 380 km</strong>
-              </div>
+            <p class="muted-note" id="webcam-sidebar-sub">PhenoCam / NEON Scientific Sky Chromaticity</p>
+            <div class="fluid-btn-row">
+              <button type="button" class="btn-subtle btn-xs" id="btn-sidebar-open-webcam">Open Split View</button>
+              <button type="button" class="btn-subtle btn-xs" id="btn-toggle-webcam-drawer" hidden>Toggle</button>
             </div>
           </div>
 
-          <!-- Fog / Marine Layer Inversion & Dual Sunset Quality Profile -->
-          <div class="raypath-diagram-box" id="inversion-profile-box">
-            <div class="raypath-diagram-header">
-              <span id="inversion-header-label">Fog &amp; Thermal Inversion Profile (2m → 925hPa)</span>
-              <span id="inversion-clearance-pill" class="raypath-trans-pill">+558 ft Above Fog</span>
+          <!-- Curated Benchmark Scenarios -->
+          <div class="diagram-card" id="scenarios-popover">
+            <div class="diagram-head">
+              <span>Curated Atmospheric Benchmarks</span>
             </div>
-            <div class="metric-tiles-grid" id="inversion-metrics-grid">
-              <div class="metric-tile">
-                <span class="metric-tile-label">Fog Base → Top</span>
-                <strong class="metric-tile-val" id="val-fog-band">320 → 1,340 ft</strong>
-              </div>
-              <div class="metric-tile">
-                <span class="metric-tile-label">Thermal Cap (ΔT)</span>
-                <strong class="metric-tile-val" id="val-inv-deltat">+10.1°F (925hPa)</strong>
-              </div>
-              <div class="metric-tile">
-                <span class="metric-tile-label">Cloud-Sea Score</span>
-                <strong class="metric-tile-val" id="val-cloud-sea-score">94 / 100</strong>
-              </div>
-              <div class="metric-tile">
-                <span class="metric-tile-label">Under-Deck Sunset</span>
-                <strong class="metric-tile-val" id="val-under-deck-score">78 / 100</strong>
-              </div>
+            <div class="preset-list">
+              <button type="button" class="preset-row" id="btn-vp-yesterday-pedro"><strong>Pedro Point Yesterday</strong><span>GOES-18 + KHAF + KOAK</span></button>
+              <button type="button" class="preset-row" id="btn-vp-today-sf"><strong>Montara Mountain Today</strong><span>Live Coastal Column</span></button>
+              <button type="button" class="preset-row" id="btn-vp-fog-sea"><strong>Montara Cloud-Sea ('25)</strong><span>Jun 5, 2025 · 2,020 ft Lid</span></button>
+              <button type="button" class="preset-row" id="btn-vp-clear-slot"><strong>Pedro Crimson Cirrus ('25)</strong><span>May 16, 2025 · Horizon Slot</span></button>
+              <button type="button" class="preset-row" id="btn-vp-halfdome-alpenglow"><strong>Half Dome Alpenglow ('25)</strong><span>May 25, 2025 · Sierra Cumulus</span></button>
+              <button type="button" class="preset-row" id="btn-vp-clouds-rest-wave"><strong>Clouds Rest Sierra Wave ('25)</strong><span>Jun 7, 2025 · Lee-Wave Ice</span></button>
             </div>
-          </div>
-
-          <!-- AI Prediction Engines (ECMWF AIFS, NOAA 3km HRRR, ECMWF IFS, GOES-18 Nowcast) & 3D Atmospheric Feel Synthesizer -->
-          <div class="raypath-diagram-box ai-ensemble-box" id="ai-ensemble-box">
-            <div class="raypath-diagram-header">
-              <span id="ai-ensemble-header">🧠 Multi-Model Weather &amp; GOES Nowcast Engine</span>
-              <span id="ai-ensemble-agreement-pill" class="raypath-trans-pill ai-agreement-pill">92% Agreement</span>
-            </div>
-            <div class="corridor-phase-tabs ai-engine-tabs" role="group" id="ai-engine-selector-bar" aria-label="Select 3D Weather Prediction Engine">
-              <button type="button" class="corridor-tab is-active" data-weather-engine="ensemble" title="Lead-Time-Weighted Hybrid: GOES-18 + METAR Nowcast (0–4h) + NOAA 3km HRRR + ECMWF IFS/AIFS">
-                ⚡ Hybrid
-              </button>
-              <button type="button" class="corridor-tab" data-weather-engine="graphcast" title="ECMWF AIFS 0.25° Neural Forecast + 3D Sub-Grid Cellular Billows">
-                🧠 AI Forecast
-              </button>
-              <button type="button" class="corridor-tab" data-weather-engine="hrrr" title="NOAA NCEP 3km HRRR Radar-Assimilated Mesoscale Column">
-                🛰️ HRRR
-              </button>
-              <button type="button" class="corridor-tab" data-weather-engine="ecmwf" title="ECMWF 0.25° IFS Synoptic &amp; Upper-Tropospheric Cirrus">
-                🌍 ECMWF
-              </button>
-              <button type="button" class="corridor-tab" data-weather-engine="nowcast" title="Live NOAA GOES-18/19 ABI Multi-Spectral + Optical-Flow Advection + NWS METAR">
-                📡 Nowcast
-              </button>
-            </div>
-            <div class="ai-feel-banner" id="ai-feel-banner">
-              <strong id="ai-feel-archetype" class="ai-feel-archetype">Evaluating 380 km Atmospheric Corridor…</strong>
-              <span id="ai-feel-note" class="ai-feel-note">Coupling 24-hour pressure-level soundings and 180×32 curved-Earth radiative LUT into WebGL2.</span>
-            </div>
-            <div class="raypath-stations-grid ai-models-grid" id="ai-models-comparison-grid"></div>
-          </div>
-
-          <!-- Positional 3D Cloud, Fog Damming & Radar Transect (West -> East) -->
-          <div class="raypath-diagram-box" id="spatial-transect-box">
-            <div class="raypath-diagram-header">
-              <span id="spatial-transect-label">3D Positional Cloud &amp; Fog Transect (W → E)</span>
-              <span id="spatial-transect-pill" class="raypath-trans-pill">64×64 Multi-Layer (1.75 km)</span>
-            </div>
-            <div class="raypath-stations-grid spatial-transect-grid" id="spatial-transect-grid"></div>
-          </div>
-
-          <!-- Live & Historical Weather Backtesting Quick-Load Bar -->
-          <div class="corridor-phase-tabs corridor-preset-grid" role="group" aria-label="Live and Historical Weather Presets">
-            <button type="button" class="corridor-tab" id="btn-yesterday-pedro" title="Yesterday's Pedro Point Sunset Backtest (Archived HRRR + 380 km Pacific Corridor)">
-              🌅 Yesterday Pedro
-            </button>
-            <button type="button" class="corridor-tab" id="btn-live-today-sf" title="Today's Live GOES-18 + METAR + 4-Model Sunset Forecast for SF Coast / Montara">
-              🔥 Today SF Live
-            </button>
-            <button type="button" class="corridor-tab" id="btn-hist-fog-sea" title="Jun 5, 2025: Marine Inversion Stratus Sea below Montara Peak + Upper Cirrus">
-              ☁️ Cloud-Sea '25
-            </button>
-            <button type="button" class="corridor-tab" id="btn-hist-clear-slot" title="May 16, 2025: Pedro Point Clear Horizon Slot + High Cirrus">
-              ✨ Cirrus '25
-            </button>
-          </div>
-
-          <div class="metric-tiles-grid">
-            <div class="metric-tile">
-              <span class="metric-tile-label">LCL Cloud Base</span>
-              <strong class="metric-tile-val" id="val-lcl-base">6,920 ft ASL</strong>
-            </div>
-            <div class="metric-tile">
-              <span class="metric-tile-label">Visibility</span>
-              <strong class="metric-tile-val" id="val-visibility">26.0 mi</strong>
-            </div>
-            <div class="metric-tile">
-              <span class="metric-tile-label">Fog / Inv Chance</span>
-              <strong class="metric-tile-val" id="val-inversion">28%</strong>
-            </div>
-            <div class="metric-tile">
-              <span class="metric-tile-label">Temp &amp; Wind</span>
-              <strong class="metric-tile-val" id="val-temp-wind">54°F • 6 mph</strong>
-            </div>
-          </div>
-        </div>
-      </details>
-
-      <!-- On-Demand Disclosure: Astrophotography, Upper-Air Seeing (250hPa), CAMS Haze & 3D Lunar Horizon -->
-      <details class="card weather-card astro-card" id="astro-disclosure">
-        <summary class="weather-summary">
-          <div class="weather-summary-main">
-            <span class="eyebrow astro-eyebrow" id="astro-eyebrow">ASTROPHOTOGRAPHY &amp; UPPER ATMOSPHERE</span>
-            <span class="weather-verdict" id="astro-verdict">Prime Dark-Sky Galactic Core + Calm Seeing</span>
-            <span class="weather-summary-sub" id="astro-summary-sub">
-              250hPa Jet Stream • AOD Haze • 3D Terrain Moonset
-            </span>
-          </div>
-          <div class="weather-summary-right">
-            <span class="alpenglow-score-badge astro-score-badge" id="astro-score-badge">86 / 100</span>
-            <span class="disclosure-chevron" aria-hidden="true">▾</span>
-          </div>
-        </summary>
-
-        <div class="weather-expanded-body">
-          <p class="weather-rec" id="astro-recommendation">
-            Computing 250hPa jet stream seeing, CAMS aerosol optical depth (550nm), and 3D DEM-occluded lunar &amp; Galactic Core windows…
-          </p>
-
-          <!-- SVG Vertical Atmospheric Column Cross-Section -->
-          <div class="raypath-diagram-box astro-diagram-box">
-            <div class="raypath-diagram-header">
-              <span id="astro-column-label">Vertical Column: 34k ft Jet Stream → 9k ft Crest Haze → 4k ft Valley</span>
-              <span id="astro-seeing-pill" class="raypath-trans-pill astro-trans-pill">Seeing: 86/100</span>
-            </div>
-            <svg id="astro-column-svg" class="raypath-svg astro-column-svg" viewBox="0 0 360 104" preserveAspectRatio="none" aria-label="Vertical Atmospheric Column and 3D Lunar Horizon Cross-Section"></svg>
-          </div>
-
-          <!-- 3-Column Astro Physics Telemetry Grid (Seeing | Haze/AOD | 3D Moon/Core) -->
-          <div class="raypath-stations-grid" id="astro-pillars-grid"></div>
-
-          <div class="metric-tiles-grid astro-metrics-footer">
-            <div class="metric-tile">
-              <span class="metric-tile-label">Moon Phase</span>
-              <strong class="metric-tile-val" id="val-moon-phase">Waxing Crescent (24%)</strong>
-            </div>
-            <div class="metric-tile">
-              <span class="metric-tile-label">Terrain Moonset</span>
-              <strong class="metric-tile-val" id="val-terrain-moonset">21:42 (-36m vs flat)</strong>
-            </div>
-            <div class="metric-tile">
-              <span class="metric-tile-label">Dark-Sky Window</span>
-              <strong class="metric-tile-val" id="val-dark-window">21:42 – 05:15</strong>
-            </div>
-            <div class="metric-tile">
-              <span class="metric-tile-label">Galactic Core</span>
-              <strong class="metric-tile-val" id="val-galactic-core">Peak 20:30 (+14.2°)</strong>
-            </div>
-          </div>
-        </div>
-      </details>
-
-      <!-- Top 3 Viewpoints Accordion (Click a viewpoint to highlight & inspect) -->
-      <section class="vp-section" aria-label="Top 3 Viewpoints">
-        <div class="section-header-row">
-          <h3 class="section-title">Top Viewpoints</h3>
-          <span class="section-hint">Click card to focus &amp; expand</span>
-        </div>
-        <div id="vp-cards-container" class="vp-cards-list"></div>
-      </section>
-    </aside>
-
-    <!-- 3D WebGL Topographic Viewport + Intrinsic 3-Row Studio HUD Grid (Zero Collisions) -->
-    <section class="viewport-stage" id="viewport-stage" aria-label="Interactive 3D Topographic Sun-Ray Map">
-      <div id="canvas-container" class="canvas-container"></div>
-      <img id="webcam-ghost-overlay" class="webcam-ghost-overlay" alt="" hidden />
-
-      <!-- Floating 3D Cloud Hover Provenance & Confidence Tooltip (pointer-events: none) -->
-      <div id="cloud-hover-tooltip" class="cloud-hover-tooltip" role="status" aria-live="polite" hidden></div>
-
-      <div class="viewport-hud-shell">
-        <!-- Row 1: Single Consolidated Floating Top HUD Row -->
-        <div class="viewport-toolbar" role="toolbar" aria-label="3D Viewport Controls and Telemetry">
-          <div class="hud-cluster-left">
-            <button
-              type="button"
-              class="toolbar-pill-btn btn-exit-vf"
-              id="btn-orbit-mode"
-              data-mode="orbit"
-              hidden
-            >
-              ← 3D Orbit <kbd class="hud-kbd">Esc</kbd>
-            </button>
-
-            <button
-              type="button"
-              class="toolbar-pill-btn btn-enter-vf-quick"
-              id="btn-enter-vp-vf"
-              title="Enter first-person camera lens viewfinder from active viewpoint (16–200 mm)"
-            >
-              📷 Viewfinder
-            </button>
-
-            <div class="mode-group" id="hud-click-mode-group" aria-label="Terrain Click Action">
-              <button
-                type="button"
-                class="mode-btn is-active-emerald"
-                id="btn-click-tripod"
-                data-click-mode="tripod"
-                title="Click any point on 3D terrain to inspect sightline and elevation profile"
-              >
-                📍 Inspect
-              </button>
-              <button
-                type="button"
-                class="mode-btn"
-                id="btn-click-target"
-                data-click-mode="target"
-                title="Click any summit or cliff to make it the new target subject"
-              >
-                🎯 Target
-              </button>
-            </div>
-
-            <button
-              type="button"
-              class="toolbar-pill-btn"
-              id="btn-open-layers"
-              popovertarget="map-layers-popover"
-            >
-              🗺️ Layers
-            </button>
-
-            <button
-              type="button"
-              class="toolbar-pill-btn"
-              id="btn-open-scenarios"
-              popovertarget="scenarios-popover"
-            >
-              ✨ Scenarios
-            </button>
-
-            <button
-              type="button"
-              class="toolbar-pill-btn webcam-toolbar-pill"
-              id="btn-toggle-webcam-drawer"
-              aria-expanded="false"
-              title="Side-by-side scientific webcam ground truth &amp; 3D camera snap"
-            >
-              🔭 Camera
-            </button>
-          </div>
-
-          <div class="hud-cluster-right">
-            <div class="mode-group fog-band-hud" id="hud-fog-band-group" role="group" aria-label="Fog-Sea Elevation Slice Band">
-              <span class="fog-band-hud-label" id="hud-fog-alt-readout" title="Probabilistic 3D fog-sea elevation slice (ft ASL)">Fog P50</span>
-              <button type="button" class="mode-btn" data-fog-band="p10" title="Optimistic P10 fog-sea lid">P10</button>
-              <button type="button" class="mode-btn is-active" data-fog-band="p50" title="Expected P50 fog-sea lid">P50</button>
-              <button type="button" class="mode-btn" data-fog-band="p90" title="Conservative P90 fog-sea lid">P90</button>
-              <button type="button" class="mode-btn" data-fog-band="off" title="Hide 3D fog-sea slice">Off</button>
-            </div>
-
-            <button
-              type="button"
-              class="toolbar-pill-btn hud-weather-pill"
-              id="viewport-weather-pill"
-              title="Inspect 380 km Solar Ray Corridor &amp; Calibrated Light Odds"
-            >
-              🌤️ Loading Sounding…
-            </button>
-
-            <button
-              type="button"
-              class="toolbar-pill-btn gpu-telemetry-pill"
-              id="viewport-gpu-pill"
-              aria-pressed="false"
-              title="Toggle optional heavy WebGL2 3D Navier-Stokes Fluid Lab (off by default for fast mobile &amp; desktop terrain)"
-            >
-              🧪 Fluid Lab: Off
-            </button>
-          </div>
-        </div>
-
-        <!-- Row 2: Elastic Middle Framing Stage (Viewfinder Reticle, Lens Bar, Sightline Inspector, Webcam Split-View, Coords) -->
-        <div class="viewport-hud-middle">
-          <!-- First-Person Camera Viewfinder Reticle Overlay + Full-Frame Focal-Length Switcher -->
-          <div class="viewfinder-overlay" id="viewfinder-overlay" hidden>
-            <div class="vf-corner vf-tl"></div>
-            <div class="vf-corner vf-tr"></div>
-            <div class="vf-corner vf-bl"></div>
-            <div class="vf-corner vf-br"></div>
-            <div class="vf-grid">
-              <div class="vf-line vf-v1"></div>
-              <div class="vf-line vf-v2"></div>
-              <div class="vf-line vf-h1"></div>
-              <div class="vf-line vf-h2"></div>
-              <div class="vf-center-cross"></div>
-            </div>
-            <div class="vf-top-lens-bar" id="vf-lens-bar" role="group" aria-label="Full-Frame Camera Focal Length">
-              <span class="vf-lens-label">35mm FF</span>
-              <button type="button" class="vf-lens-btn" data-focal-mm="16">16mm</button>
-              <button type="button" class="vf-lens-btn" data-focal-mm="24">24mm</button>
-              <button type="button" class="vf-lens-btn is-active" data-focal-mm="35">35mm</button>
-              <button type="button" class="vf-lens-btn" data-focal-mm="50">50mm</button>
-              <button type="button" class="vf-lens-btn" data-focal-mm="70">70mm</button>
-              <button type="button" class="vf-lens-btn" data-focal-mm="200">200mm</button>
-              <span class="vf-fov-pill" id="vf-fov-readout">54° × 38°</span>
-              <button type="button" class="vf-lens-btn vf-fieldcard-btn" id="btn-vf-export-field-card" title="Export Offline Backcountry Field Card">📋 Card</button>
-            </div>
-            <div class="vf-bottom-hud" id="vf-hud-readout">
-              VP1 VIEWFINDER • 35mm FF • Bearing 117.9° (ESE) • 1.66 mi
-            </div>
-          </div>
-
-          <!-- Side-by-Side Mountain / Coastal Webcam Ground-Truth Verification Drawer -->
-          <aside class="webcam-truth-card" id="webcam-truth-card" hidden aria-label="Mountain Webcam Ground-Truth Verification">
-            <div class="inspector-header webcam-card-header">
-              <div class="inspector-title-wrap">
-                <span class="inspector-eyebrow webcam-eyebrow" id="webcam-card-eyebrow">WEBCAM GROUND TRUTH • SKY CHROMATICITY</span>
-                <h4 class="inspector-title" id="webcam-card-title">Matched Mountain Camera</h4>
-              </div>
-              <div class="inspector-header-actions">
-                <button type="button" class="btn-ghost btn-sm" id="btn-close-webcam-card" aria-label="Close Webcam Ground Truth">
-                  ✕
-                </button>
-              </div>
-            </div>
-
-            <div class="webcam-camera-tabs" id="webcam-camera-tabs" role="tablist" aria-label="Matched Webcams" hidden></div>
-
-            <div class="webcam-frame-wrap" id="webcam-frame-wrap">
-              <img
-                id="webcam-frame-img"
-                class="webcam-frame-img"
-                crossorigin="anonymous"
-                alt="Matched timestamped mountain or coastal webcam photograph"
-              />
-              <div class="webcam-sky-roi-band" id="webcam-sky-roi-band" title="Calibrated sky chromaticity sampling band (y = 4%–22%, canopy-filtered)">
-                <span>SKY CHROMATICITY ROI (4–22%)</span>
-              </div>
-              <div class="webcam-frame-badges">
-                <span class="webcam-ts-pill" id="webcam-ts-pill">--:-- Local</span>
-                <span class="webcam-az-pill" id="webcam-az-pill">Az ---° • FOV 62°</span>
-              </div>
-            </div>
-
-            <div class="webcam-timeline-chips" id="webcam-timeline-chips" role="group" aria-label="Golden-Hour Archive Timeline"></div>
-
-            <div class="metric-tiles-grid webcam-chroma-grid" id="webcam-chroma-grid">
-              <div class="metric-tile">
-                <span class="metric-tile-label">Sky R/B Warmth</span>
-                <strong class="metric-tile-val" id="val-wc-rb">--</strong>
-              </div>
-              <div class="metric-tile">
-                <span class="metric-tile-label">Webcam / Sim K</span>
-                <strong class="metric-tile-val" id="val-wc-kelvin">-- / -- K</strong>
-              </div>
-              <div class="metric-tile">
-                <span class="metric-tile-label">Observed Glow</span>
-                <strong class="metric-tile-val" id="val-wc-emp-score">-- / 100</strong>
-              </div>
-              <div class="metric-tile">
-                <span class="metric-tile-label">3D Engine Glow</span>
-                <strong class="metric-tile-val" id="val-wc-sim-score">-- / 100</strong>
-              </div>
-            </div>
-
-            <div class="webcam-snap-actions">
-              <button type="button" class="btn-primary webcam-snap-btn" id="btn-snap-webcam-camera">
-                🎯 Snap 3D Camera to Webcam Azimuth / FOV
-              </button>
-              <button type="button" class="btn-ghost btn-sm" id="btn-reset-webcam-snap" hidden>
-                ↺ 3D Orbit
-              </button>
-            </div>
-
-            <div class="webcam-ghost-controls" id="webcam-ghost-controls">
-              <label class="webcam-ghost-toggle">
-                <input type="checkbox" id="toggle-webcam-ghost" />
-                <span>👻 3D Ghost Overlay</span>
-              </label>
-              <input
-                type="range"
-                id="webcam-ghost-opacity"
-                class="webcam-ghost-slider"
-                min="10"
-                max="85"
-                value="38"
-                step="1"
-                aria-label="3D Webcam Ghost Overlay Opacity"
-              />
-              <span class="webcam-ghost-pct" id="val-webcam-ghost-opacity">38%</span>
-            </div>
-
-            <p class="webcam-snap-note" id="webcam-snap-note">
-              Matches Three.js horizontal FOV &amp; compass azimuth so you can compare simulated terrain, fog &amp; Chappuis glow side-by-side or via 3D Ghost Overlay.
-            </p>
-          </aside>
-
-          <!-- Contextual Clicked Tripod & Sightline Cross-Section Inspector -->
-          <aside class="tripod-inspector-card" id="tripod-inspector-card" hidden aria-label="Custom Tripod Line-of-Sight Inspector">
-            <div class="inspector-header">
-              <div class="inspector-title-wrap">
-                <span class="inspector-eyebrow" id="inspector-eyebrow">CUSTOM POINT SIGHTLINE</span>
-                <h4 class="inspector-title" id="inspector-title">Clicked Vantage Point</h4>
-              </div>
-              <div class="inspector-header-actions">
-                <button type="button" class="btn-ghost btn-sm inspector-vf-btn" id="btn-enter-custom-vf">
-                  📷 Viewfinder
-                </button>
-                <button type="button" class="btn-ghost btn-sm" id="btn-close-inspector" aria-label="Close Sightline Inspector">
-                  ✕
-                </button>
-              </div>
-            </div>
-
-            <div class="inspector-status-row" id="inspector-status-row"></div>
-
-            <!-- 64-Sample Sightline vs. Terrain Elevation Cross-Section SVG Chart -->
-            <div class="cross-section-box">
-              <div class="cross-section-label-row">
-                <span>Sightline Profile (Tripod → Target)</span>
-                <span id="cross-section-dist-label">1.66 mi</span>
-              </div>
-              <svg id="cross-section-svg" class="cross-section-svg" viewBox="0 0 420 105" preserveAspectRatio="none" aria-label="Sightline elevation profile"></svg>
-            </div>
-
-            <div class="metric-tiles-grid inspector-meta-grid" id="inspector-meta-grid"></div>
-          </aside>
-
-          <!-- Loading Banner Overlay -->
-          <div class="viewport-loading" id="viewport-loading">
-            <div class="spinner"></div>
-            <span id="loading-text">Loading 1m USGS 3DEP LiDAR &amp; Ray-Casting Solar Vectors…</span>
-          </div>
-
-          <!-- Subtle Terrain Hover Coordinate Readout -->
-          <div class="cursor-coords-pill" id="cursor-coords-bar">
-            Click any terrain point or 3D pin to inspect sightline
-          </div>
-        </div>
-
-        <!-- Row 3: Studio 2-Tier Bottom Solar & Astro 24-Hour Timeline Transport Dock -->
-        <div class="scrubber-dock">
-          <div class="scrubber-header-row">
-            <div class="scrubber-time-cluster">
-              <label class="slider-label" for="time-scrubber">24h Sky</label>
-              <output class="slider-output" id="time-scrubber-output" for="time-scrubber">
-                17:18 • Sunset Golden Hour
-              </output>
-              <!-- Legacy hooks kept for compatibility -->
-              <span id="hud-local-time" hidden>17:18 Local</span>
-              <span id="hud-phase-badge" hidden>Sunset Golden Hour</span>
-            </div>
-
-            <div class="scrubber-telemetry-pills" aria-label="Live Solar Angles">
-              <span class="telemetry-chip">Az <strong id="hud-sun-az">259.1° W</strong></span>
-              <span class="telemetry-chip">El <strong id="hud-sun-el">+0.1°</strong></span>
-              <span class="telemetry-chip telemetry-chip-lit"><strong id="hud-cliff-lit">96% Alpenglow</strong></span>
-            </div>
-
-            <div class="preset-buttons">
-              <button type="button" class="btn-preset" id="btn-jump-dawn-astro" title="Pre-dawn Astro / Milky Way (02:00)">
-                ✨ 02:00
-              </button>
-              <button type="button" class="btn-preset" id="btn-jump-sunrise">
-                🌅 Sunrise
-              </button>
-              <button type="button" class="btn-preset is-active" id="btn-jump-sunset">
-                🌇 Sunset
-              </button>
-              <button type="button" class="btn-preset" id="btn-jump-bluehour" title="Evening Blue Hour / Belt of Venus">
-                🌆 Blue Hr
-              </button>
-              <button type="button" class="btn-preset" id="btn-jump-night">
-                🌌 Astro
-              </button>
-              <button type="button" class="btn-preset btn-preset-play" id="btn-play-sun">
-                ▶ Animate
-              </button>
-            </div>
-          </div>
-
-          <div class="slider-field scrubber-slider-field">
-            <input
-              class="slider-input"
-              id="time-scrubber"
-              type="range"
-              min="0"
-              max="1440"
-              value="1038"
-              step="1"
-              aria-label="Full 24-Hour Solar and Astro Timeline Scrubber"
-            />
-            <div class="scrubber-ticks" aria-hidden="true">
-              <span>00:00</span>
-              <span>04:00</span>
-              <span>08:00</span>
-              <span>12:00</span>
-              <span>16:00</span>
-              <span>20:00</span>
-              <span>24:00</span>
-            </div>
+            <!-- Hidden legacy scenario hooks -->
+            <button type="button" id="btn-yesterday-pedro" hidden></button>
+            <button type="button" id="btn-live-today-sf" hidden></button>
+            <button type="button" id="btn-hist-fog-sea" hidden></button>
+            <button type="button" id="btn-hist-clear-slot" hidden></button>
+            <button type="button" id="viewport-weather-pill" hidden></button>
           </div>
         </div>
       </div>
-    </section>
+    </aside>
+
+    <!-- =====================================================================
+         POPOVERS: Map Layers & 365-Day Keyhole Calendar (Native Popover API)
+         ===================================================================== -->
+    <div id="map-layers-popover" class="clean-popover" popover>
+      <div class="popover-head">
+        <h3>Map &amp; 3D Overlays</h3>
+        <button type="button" class="icon-btn icon-btn-xs" popovertarget="map-layers-popover" popovertargetaction="hide" aria-label="Close">✕</button>
+      </div>
+
+      <div class="popover-block">
+        <div class="block-caption">Terrain Surface</div>
+        <div class="segmented" role="group" aria-label="Terrain Surface Style">
+          <button type="button" class="seg-btn is-active" id="btn-surf-granite" data-surface="0">Relief</button>
+          <button type="button" class="seg-btn" id="btn-surf-aerial" data-surface="1">Satellite</button>
+          <button type="button" class="seg-btn" id="btn-surf-topo" data-surface="2">Topo</button>
+        </div>
+      </div>
+
+      <div class="popover-block">
+        <div class="block-caption">Probabilistic Fog-Sea Lid</div>
+        <div class="segmented" id="layers-fog-band-group" role="group" aria-label="Fog-Sea Elevation Band">
+          <button type="button" class="seg-btn" data-fog-band="p10">P10</button>
+          <button type="button" class="seg-btn is-active" data-fog-band="p50">P50</button>
+          <button type="button" class="seg-btn" data-fog-band="p90">P90</button>
+          <button type="button" class="seg-btn" data-fog-band="off">Off</button>
+        </div>
+      </div>
+
+      <div class="popover-block">
+        <div class="block-caption">3D Layers</div>
+        <div class="check-list">
+          <label class="check-row"><input type="checkbox" id="toggle-sightlines" checked /><span>Trails &amp; Sightlines</span></label>
+          <label class="check-row"><input type="checkbox" id="toggle-alpenglow-zone" checked /><span>Alpenglow Landing Zone</span></label>
+          <label class="check-row"><input type="checkbox" id="toggle-viewshed" /><span>Unobstructed Viewshed</span></label>
+          <label class="check-row"><input type="checkbox" id="toggle-sun-beams" /><span>Grazing Light Vectors</span></label>
+          <label class="check-row"><input type="checkbox" id="toggle-light-field" /><span>Valley Ray Lattice</span></label>
+          <label class="check-row"><input type="checkbox" id="toggle-atmosphere" /><span>GPU Fluid Lab (Opt-In)</span></label>
+        </div>
+      </div>
+    </div>
+
+    <div id="annual-calendar-popover" class="clean-popover calendar-popover" popover>
+      <div class="popover-head">
+        <div>
+          <span class="eyebrow">365-DAY HORIZON SOLVER</span>
+          <h3 id="calendar-popover-title">Annual Keyhole Light Alignments</h3>
+        </div>
+        <button type="button" class="icon-btn icon-btn-xs" popovertarget="annual-calendar-popover" popovertargetaction="hide" aria-label="Close">✕</button>
+      </div>
+      <p class="muted-note">
+        Exact dates when the rising or setting sun aligns through narrow mountain V-notches from <strong id="calendar-vp-name">VP1</strong>:
+      </p>
+      <div id="calendar-alignments-list" class="calendar-alignments-list">
+        <div class="muted-note">Scanning 365-day solar ephemeris…</div>
+      </div>
+    </div>
   </main>
 
-  <script type="module" src="/app.js?v=20261120a"></script>
+  <script type="module" src="/app.js?v=20261120b"></script>
 </body>
 </html>

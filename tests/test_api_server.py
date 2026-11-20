@@ -178,6 +178,12 @@ class TestApiServerAndGridCache(unittest.TestCase):
         self.assertIn('min="0"', html)
         self.assertIn('max="1440"', html)
         self.assertIn('id="btn-export-field-card"', html)
+        # Proposal A Canvas-First Floating Sheet, Hero Verdict, Regional Hunt, GPX Upload & Opt-In Lab Drawer
+        self.assertIn('id="planner-sheet"', html)
+        self.assertIn('id="brief-verdict-badge"', html)
+        self.assertIn('id="regional-hunt-results"', html)
+        self.assertIn('id="gpx-file-input"', html)
+        self.assertIn('id="lab-drawer" hidden', html)
 
         st_js, _, body_js = _call_asgi("GET", "/app.js")
         self.assertEqual(st_js, 200)
@@ -185,6 +191,7 @@ class TestApiServerAndGridCache(unittest.TestCase):
         self.assertIn("showAtmosphere: false", js)
         self.assertIn("function focalLengthToFov(", js)
         self.assertIn("function exportOfflineFieldCard(", js)
+        self.assertIn("function syncBriefVerdictHero(", js)
         self.assertIn("fogSeaSliceMesh", js)
 
 
