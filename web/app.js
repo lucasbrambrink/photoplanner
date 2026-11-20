@@ -36,8 +36,10 @@ const initialCustomCoord =
   Number.isFinite(paramLat) && Number.isFinite(paramLon)
     ? { lat: paramLat, lon: paramLon, name: paramLandmark || `GPS (${paramLat.toFixed(4)}, ${paramLon.toFixed(4)})` }
     : null;
-const savedLandmark = paramLandmark || localStorage.getItem("pp_landmark_v2") || "Pedro Point Headlands";
-const savedDate = (paramDate && /^\d{4}-\d{2}-\d{2}$/.test(paramDate) ? paramDate : null) || localStorage.getItem("pp_date_v3") || todayIso;
+const DEFAULT_BENCHMARK_LANDMARK = "Montara Mountain";
+const DEFAULT_BENCHMARK_DATE = "2025-06-05";
+const savedLandmark = paramLandmark || localStorage.getItem("pp_landmark_v4") || DEFAULT_BENCHMARK_LANDMARK;
+const savedDate = (paramDate && /^\d{4}-\d{2}-\d{2}$/.test(paramDate) ? paramDate : null) || localStorage.getItem("pp_date_v4") || DEFAULT_BENCHMARK_DATE;
 
 const state = {
   landmark: savedLandmark,
@@ -66,7 +68,7 @@ const state = {
   isPlayingSun: false,
   showSunBeams: false,
   showLightField: false,
-  showAtmosphere: false, // Opt-in heavy GPU Fluid Lab (off by default for fast mobile & desktop 3D terrain)
+  showAtmosphere: true, // WebGL2 3D Volumetric Fluid Lab enabled by default
   fogSliceBand: "p50", // "p10" | "p50" | "p90" | "off" (lightweight 3D fog-sea elevation slice)
   focalLengthMm: 35, // 16 | 24 | 35 | 50 | 70 | 200 (full-frame 35mm camera lens viewfinder)
   showSightlines: true,
@@ -751,10 +753,10 @@ overlayScene.add(lightFieldGroup);
 overlayScene.add(sunBeamsGroup);
 overlayScene.add(customPinGroup);
 
-// Initialize optional GPU WebGL2 Volumetric Atmosphere (frozen by default; opt-in via Fluid Lab toggle)
+// Initialize GPU WebGL2 Volumetric Atmosphere (enabled & evolving by default)
 const volumetricEngine = new VolumetricAtmosphereEngine(renderer, camera);
 volumetricEngine.setQualityMode("balanced");
-volumetricEngine.evolveFluid = false;
+volumetricEngine.evolveFluid = state.showAtmosphere;
 
 // ============================================================================
 // Lightweight 3D Probabilistic Fog-Sea Elevation Slice (P10 / P50 / P90 Band)
@@ -6867,16 +6869,18 @@ async function loadLandmarkScenario(customCoord = null) {
   _lastRibbonRenderKey = "";
   _lastHybridGodRaysKey = "";
 
+  const label = customCoord ? customCoord.name : state.landmark;
   const lmSel = document.getElementById("landmark-select");
   const dtInp = document.getElementById("shoot-date");
+  const spotInp = document.getElementById("spot-search-input");
   if (lmSel && !customCoord) lmSel.value = state.landmark;
+  if (spotInp) spotInp.value = label;
   if (dtInp) dtInp.value = state.date;
   try {
-    if (!customCoord) localStorage.setItem("pp_landmark_v2", state.landmark);
-    localStorage.setItem("pp_date_v3", state.date);
+    if (!customCoord) localStorage.setItem("pp_landmark_v4", state.landmark);
+    localStorage.setItem("pp_date_v4", state.date);
   } catch (_) {}
 
-  const label = customCoord ? customCoord.name : state.landmark;
   loadingTextEl.textContent = `Loading 3D terrain & sightlines for ${label}…`;
 
   const modeEl = document.getElementById("archetype-mode-label");
@@ -6938,6 +6942,7 @@ async function loadLandmarkScenario(customCoord = null) {
     renderSidebar();
     setCameraMode("orbit");
     updateSunRaysAndShader();
+    wakeRenderLoop(true);
     loadingEl.hidden = true;
 
     // Stream weather corridor asynchronously with full error isolation
@@ -6960,9 +6965,10 @@ async function loadLandmarkScenario(customCoord = null) {
           console.warn("Volumetric weather sync warning:", veErr);
         }
         renderWeatherCard(state.weatherReport);
+        renderWebcamChromaComparison();
         updateSunRaysAndShader();
         updateViewfinderReadout();
-        fetchWebcamTruthForScenario("sunset");
+        wakeRenderLoop(true);
       })
       .catch((wErr) => {
         if (reqSeq !== scenarioLoadSeq) return;
@@ -6970,6 +6976,8 @@ async function loadLandmarkScenario(customCoord = null) {
         if (modeEl) modeEl.textContent = "AUTO · GEOMETRY READY";
         if (leverEl) leverEl.textContent = "3D terrain & solar geometry ready; atmospheric corridor forecast temporarily unavailable.";
       });
+
+    fetchWebcamTruthForScenario("sunset");
   } catch (err) {
     console.error("Failed to load scenario:", err);
     document.getElementById("summary-subtitle").textContent = `Error loading scenario: ${err.message}`;

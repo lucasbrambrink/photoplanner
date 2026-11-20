@@ -106,7 +106,7 @@
               type="search"
               id="spot-search-input"
               class="input-search"
-              value="Pedro Point Headlands"
+              value="Montara Mountain"
               placeholder="Search any US peak, lake, or GPS…"
               autocomplete="off"
               aria-label="Search any US photography peak, lake, or GPS coordinates"
@@ -118,8 +118,8 @@
 
           <!-- Hidden legacy preset select kept in sync for quick benchmarks -->
           <select id="landmark-select" name="landmark" hidden>
-            <option value="Pedro Point Headlands" selected>Pedro Point Headlands</option>
-            <option value="Montara Mountain">Montara Mountain</option>
+            <option value="Montara Mountain" selected>Montara Mountain</option>
+            <option value="Pedro Point Headlands">Pedro Point Headlands</option>
             <option value="Half Dome">Half Dome</option>
             <option value="Clouds Rest">Clouds Rest</option>
             <option value="Upper Yosemite Fall">Upper Yosemite Fall</option>
@@ -131,7 +131,7 @@
           </select>
 
           <div class="sheet-date-phase-row">
-            <input type="date" id="shoot-date" class="input-date" name="date" aria-label="Shoot Date" />
+            <input type="date" id="shoot-date" class="input-date" name="date" value="2025-06-05" aria-label="Shoot Date" />
             <div class="phase-switch" role="tablist" aria-label="Light Phase">
               <button type="button" class="phase-btn" id="tab-corridor-sunrise" data-phase="sunrise">Sunrise</button>
               <button type="button" class="phase-btn is-active" id="tab-corridor-sunset" data-phase="sunset">Sunset</button>
@@ -639,10 +639,10 @@
           <div class="lab-fluid-banner">
             <div>
               <strong>WebGL2 3D Fluid Clouds</strong>
-              <p class="muted-note">Off by default for fast mobile &amp; desktop terrain. Enable on desktop GPUs for live volumetric advection.</p>
+              <p class="muted-note">Live WebGL2 3D volumetric advection &amp; multi-layer cloud column.</p>
             </div>
-            <button type="button" class="pill-btn gpu-telemetry-pill" id="viewport-gpu-pill" aria-pressed="false">
-              Fluid Lab: Off
+            <button type="button" class="pill-btn gpu-telemetry-pill is-fluid-active" id="viewport-gpu-pill" aria-pressed="true">
+              Fluid Lab: On
             </button>
           </div>
 
@@ -679,7 +679,7 @@
                   <button type="button" class="seg-btn" data-fluid-quality="performance">Fast</button>
                 </div>
                 <div class="fluid-btn-row">
-                  <button type="button" class="btn-subtle btn-xs" id="btn-toggle-fluid-evolve">▶ Resume</button>
+                  <button type="button" class="btn-subtle btn-xs is-active" id="btn-toggle-fluid-evolve">⏸ Pause</button>
                   <button type="button" class="btn-subtle btn-xs" id="btn-reset-fluid-tuning">Reset Gains</button>
                 </div>
 
@@ -803,7 +803,7 @@
           <label class="check-row"><input type="checkbox" id="toggle-viewshed" /><span>Unobstructed Viewshed</span></label>
           <label class="check-row"><input type="checkbox" id="toggle-sun-beams" /><span>Grazing Light Vectors</span></label>
           <label class="check-row"><input type="checkbox" id="toggle-light-field" /><span>Valley Ray Lattice</span></label>
-          <label class="check-row"><input type="checkbox" id="toggle-atmosphere" /><span>GPU Fluid Lab (Opt-In)</span></label>
+          <label class="check-row"><input type="checkbox" id="toggle-atmosphere" checked /><span>GPU Fluid Lab</span></label>
         </div>
       </div>
     </div>

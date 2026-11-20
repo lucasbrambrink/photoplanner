@@ -491,7 +491,16 @@ def _blend_nowcast_into_station(
         is_space_occluded = upper_shield > 0.22 and raw_sat_low_pct < 38.0
         w_asos_used = 0.0
 
-        if station_obs is not None and dist_km <= 45.0:
+        has_valid_sky_obs = bool(
+            station_obs is not None
+            and (
+                station_obs.get("cloud_layers")
+                or station_obs.get("visibility_m") is not None
+                or (station_obs.get("text_description") or "").strip().lower()
+                in ("clear", "sunny", "fair", "mostly clear", "few clouds")
+            )
+        )
+        if station_obs is not None and has_valid_sky_obs and dist_km <= 45.0:
             obs_low_pct = float(station_obs.get("low_cloud_fraction", 0.0)) * 100.0
             obs_fog_pct = float(
                 station_obs.get("fog_cloud_fraction", station_obs.get("low_cloud_fraction", 0.0) * 0.65)
@@ -768,7 +777,14 @@ def _build_fluid_params_from_sounding(
         low_base_m = round(float(low_band["base_asl_m"]), 1)
         low_top_m = round(max(low_base_m + 280.0, float(low_band["top_asl_m"])), 1)
     else:
-        cu_pct = 0.0 if fog_band is not None else float(st0["cloud_low_pct"])
+        is_deep_frontal = float(st0.get("precip_mm", 0.0)) >= 0.2 or (
+            float(st0.get("cloud_mid_pct", 0.0)) >= 70.0 and float(st0.get("cloud_low_pct", 0.0)) >= 50.0
+        )
+        cu_pct = (
+            (round(float(st0["cloud_low_pct"]) * 0.78, 1) if is_deep_frontal else 0.0)
+            if fog_band is not None
+            else float(st0["cloud_low_pct"])
+        )
         min_cu_base = max(fog_top_m + 180.0, elev_m + 180.0) if fog_band is not None else (elev_m + 220.0)
         low_base_m = round(max(min_cu_base, float(st0.get("lcl_asl_m", 1100.0))), 1)
         conv_boost_m = min(1600.0, math.sqrt(max(0.0, float(st0.get("cape_j_kg", 0.0)))) * 40.0)
@@ -1905,7 +1921,16 @@ def solve_weather_and_corridor(
             st0_base["wind_250_uv_ms"],
         )
         nowcast_low = int(round(adv0["low_cf"] * 100.0))
-        if station_obs is not None and float(station_obs.get("distance_km", 999.0)) <= 45.0:
+        has_valid_asos0 = bool(
+            station_obs is not None
+            and (
+                station_obs.get("cloud_layers")
+                or station_obs.get("visibility_m") is not None
+                or (station_obs.get("text_description") or "").strip().lower()
+                in ("clear", "sunny", "fair", "mostly clear", "few clouds")
+            )
+        )
+        if station_obs is not None and has_valid_asos0 and float(station_obs.get("distance_km", 999.0)) <= 45.0:
             obs_low = float(station_obs.get("low_cloud_fraction", 0.0)) * 100.0
             up_sh0 = max(0.0, min(1.0, ((adv0["high_cf"] + 0.75 * adv0["mid_cf"]) * 100.0 - 45.0) / 40.0))
             if up_sh0 > 0.22 and adv0["low_cf"] < 0.38:

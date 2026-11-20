@@ -2562,6 +2562,8 @@ export class VolumetricAtmosphereEngine {
     this._pendingProbeReq = null;
     this._inflightProbeMeta = null;
     this._probeCancelled = false;
+    this._pendingScrubFluidStep = false;
+    this._lastScrubStepWallMs = 0;
 
     this._init3DTextures();
     this._initRenderTargetsAndPasses();
@@ -2644,14 +2646,14 @@ export class VolumetricAtmosphereEngine {
     this.mesoscaleCloudTex.unpackAlignment = 1;
     this.mesoscaleCloudTex.needsUpdate = true;
 
-    const altInitBytes = new Uint8Array(16 * 16 * 4);
+    const mesoAltBytes = new Uint8Array(16 * 16 * 4);
     for (let i = 0; i < 16 * 16; i++) {
-      altInitBytes[i * 4 + 0] = 51;  // ~510m default fog top
-      altInitBytes[i * 4 + 1] = 12;
-      altInitBytes[i * 4 + 2] = 12;  // ~200m default surface elev
-      altInitBytes[i * 4 + 3] = 64;
+      mesoAltBytes[i * 4 + 0] = 51; // ~510m default fog top
+      mesoAltBytes[i * 4 + 1] = 13;
+      mesoAltBytes[i * 4 + 2] = 13; // ~200m default surface elev
+      mesoAltBytes[i * 4 + 3] = 64;
     }
-    this.mesoscaleAltTex = new THREE.DataTexture(altInitBytes, 16, 16, THREE.RGBAFormat, THREE.UnsignedByteType);
+    this.mesoscaleAltTex = new THREE.DataTexture(mesoAltBytes, 16, 16, THREE.RGBAFormat, THREE.UnsignedByteType);
     this.mesoscaleAltTex.minFilter = THREE.LinearFilter;
     this.mesoscaleAltTex.magFilter = THREE.LinearFilter;
     this.mesoscaleAltTex.wrapS = THREE.ClampToEdgeWrapping;
@@ -2664,7 +2666,6 @@ export class VolumetricAtmosphereEngine {
     this._hasCorridorAtmoData = false;
     this._hasLoadedMesoscaleGrid = false;
     this._hasLoadedMesoscaleAlt = false;
-    this._pendingScrubFluidStep = false;
     this._mesoscaleMeta = null;
 
     this.corridorUniforms = {
@@ -2686,10 +2687,10 @@ export class VolumetricAtmosphereEngine {
       uScrubDeltaSec: { value: 0.0 },
       uScrubLayerScale: { value: new THREE.Vector4(1.0, 1.0, 1.0, 1.0) },
       uScrubLayerAdd: { value: new THREE.Vector4(0.0, 0.0, 0.0, 0.0) },
-      uMesoWindSfc: { value: new THREE.Vector2(3.5, 0.0) },
-      uMesoWind850: { value: new THREE.Vector2(5.5, 0.0) },
-      uMesoWind500: { value: new THREE.Vector2(12.0, 0.0) },
-      uMesoWind250: { value: new THREE.Vector2(24.0, 0.0) },
+      uMesoWindSfc: { value: new THREE.Vector2(5.2, -3.4) },
+      uMesoWind850: { value: new THREE.Vector2(8.0, -2.0) },
+      uMesoWind500: { value: new THREE.Vector2(18.0, 4.5) },
+      uMesoWind250: { value: new THREE.Vector2(36.0, 14.0) },
       uScrubRelaxBoost: { value: 0.0 },
     };
 
@@ -3950,6 +3951,10 @@ export class VolumetricAtmosphereEngine {
       this._hasLoadedCorridorLut && this._hasCorridorAtmoData ? 1.0 : 0.0;
     this.mesoscaleUniforms.uHasMesoscaleGrid.value =
       this._hasLoadedMesoscaleGrid ? 1.0 : 0.0;
+    this.mesoscaleUniforms.uHasMesoscaleAlt.value =
+      this._hasLoadedMesoscaleAlt ? 1.0 : 0.0;
+    this.mesoscaleUniforms.uUseSpatialInCore.value =
+      this._hasLoadedMesoscaleGrid && this.activePreset === 'live' ? 1.0 : 0.0;
 
     const p = this.getEffectiveParams();
     const invBaseM = p.inversionBaseM ?? 380.0;

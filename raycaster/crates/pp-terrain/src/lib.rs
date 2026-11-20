@@ -900,7 +900,12 @@ impl MaxMipmapGrid1m {
                 "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage?bbox={:.6},{:.6},{:.6},{:.6}&bboxSR=4326&size={},{}&imageSR=4326&format=tiff&pixelType=F32&interpolation=+RSP_BilinearInterpolation&f=image",
                 origin_lon, origin_lat, max_lon, max_lat, w, h
             );
-            if let Ok(resp) = ureq::get(&url)
+            let agent = ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(4))
+                .timeout_read(Duration::from_secs(10))
+                .build();
+            if let Ok(resp) = agent
+                .get(&url)
                 .set("User-Agent", "PhotoPlanner-Rust-Engine/0.1")
                 .call()
             {

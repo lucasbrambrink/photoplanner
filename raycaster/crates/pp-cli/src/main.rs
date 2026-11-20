@@ -443,7 +443,7 @@ fn load_hybrid_terrain(
         center_lat,
         center_lon,
         near_grid_m,
-        165.0,
+        50.0,
         None,
     )
 }
