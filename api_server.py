@@ -34,6 +34,16 @@ from pydantic import BaseModel, Field
 
 from planner.gpx_trail_analyzer import analyze_uploaded_trail
 from planner.rust_worker import get_rust_worker, shutdown_rust_worker
+from planner.seo_guides import (
+    REGION_LABELS,
+    build_spot_guide_payload,
+    is_b2b_api_key_valid,
+    list_seo_guides,
+    render_guides_directory_html,
+    render_robots_txt,
+    render_sitemap_xml,
+    render_spot_guide_html,
+)
 from planner.weather import (
     BENCHMARK_REPORT_JSON_PATH,
     EXPERIMENTS_DIR,
@@ -557,6 +567,164 @@ def api_annual_calendar(
     resolved_year = year or dt.datetime.now(ZoneInfo("America/Los_Angeles")).year
     payload = legacy_server.run_annual_notch_calendar(lat, lon, resolved_year)
     return Response(content=payload, media_type="application/json")
+
+
+def _request_base_url(request: Request) -> str:
+    scheme = request.headers.get("x-forwarded-proto") or request.url.scheme or "https"
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    return f"{scheme}://{host}" if host else "https://photoplanner.app"
+
+
+@app.get("/api/v1/guides")
+def api_v1_list_guides(
+    request: Request,
+    region: str | None = None,
+) -> JSONResponse:
+    """Versioned B2B API listing all dynamic regional Light Guides & supported regions."""
+    ok, tier = is_b2b_api_key_valid(request.headers.get("x-api-key") or request.query_params.get("api_key"))
+    if not ok:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key for B2B Light Guides API.")
+    items = list_seo_guides(region=region)
+    return JSONResponse(
+        content={
+            "schema_version": "b2b_guides_v1",
+            "tier": tier,
+            "count": len(items),
+            "regions": REGION_LABELS,
+            "guides": items,
+        },
+        headers={
+            "Cache-Control": "public, max-age=1800",
+            "X-PhotoPlanner-Tier": tier,
+            "X-RateLimit-Policy": "b2b-v1",
+        },
+    )
+
+
+@app.get("/api/v1/guides/{slug}")
+def api_v1_get_guide(
+    slug: str,
+    request: Request,
+    date: str | None = None,
+    phase: str | None = None,
+    live: bool = True,
+) -> JSONResponse:
+    """Versioned B2B JSON Light Guide endpoint for photo workshops, lodges, and outdoor apps."""
+    ok, tier = is_b2b_api_key_valid(request.headers.get("x-api-key") or request.query_params.get("api_key"))
+    if not ok:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key for B2B Light Guides API.")
+    base_url = _request_base_url(request)
+    cache_key = f"seo_guide_json|{slug.lower()}|{date or 'today'}|{phase or 'default'}|{int(live)}"
+    cached = FORECAST_CACHE.get(cache_key)
+    if cached is not None:
+        return JSONResponse(
+            content=json.loads(cached.decode("utf-8")),
+            headers={
+                "Cache-Control": "public, max-age=1800, stale-while-revalidate=3600",
+                "X-PhotoPlanner-Cache": "HIT",
+                "X-PhotoPlanner-Tier": tier,
+            },
+        )
+    try:
+        payload = build_spot_guide_payload(
+            slug,
+            date_str=date,
+            phase=phase,
+            include_live_forecast=live,
+            base_url=base_url,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    FORECAST_CACHE.set(cache_key, json.dumps(payload).encode("utf-8"), ttl_sec=1800.0)
+    return JSONResponse(
+        content=payload,
+        headers={
+            "Cache-Control": "public, max-age=1800, stale-while-revalidate=3600",
+            "X-PhotoPlanner-Cache": "MISS",
+            "X-PhotoPlanner-Tier": tier,
+        },
+    )
+
+
+@app.get("/guides", response_class=HTMLResponse)
+def serve_guides_directory(
+    request: Request,
+    region: str | None = None,
+    date: str | None = None,
+) -> HTMLResponse:
+    html_body = render_guides_directory_html(
+        region=region,
+        date_str=date,
+        base_url=_request_base_url(request),
+    )
+    return HTMLResponse(
+        content=html_body,
+        headers={"Cache-Control": "public, max-age=1800, stale-while-revalidate=3600"},
+    )
+
+
+@app.get("/guides/{slug}", response_class=HTMLResponse)
+def serve_spot_guide(
+    slug: str,
+    request: Request,
+    date: str | None = None,
+    phase: str | None = None,
+    live: bool = True,
+) -> HTMLResponse:
+    base_url = _request_base_url(request)
+    cache_key = f"seo_guide_html|{slug.lower()}|{date or 'today'}|{phase or 'default'}|{int(live)}"
+    cached = FORECAST_CACHE.get(cache_key)
+    if cached is not None:
+        return HTMLResponse(
+            content=cached.decode("utf-8"),
+            headers={
+                "Cache-Control": "public, max-age=1800, stale-while-revalidate=3600",
+                "X-PhotoPlanner-Cache": "HIT",
+            },
+        )
+    try:
+        payload = build_spot_guide_payload(
+            slug,
+            date_str=date,
+            phase=phase,
+            include_live_forecast=live,
+            base_url=base_url,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    html_body = render_spot_guide_html(payload)
+    FORECAST_CACHE.set(cache_key, html_body.encode("utf-8"), ttl_sec=1800.0)
+    return HTMLResponse(
+        content=html_body,
+        headers={
+            "Cache-Control": "public, max-age=1800, stale-while-revalidate=3600",
+            "X-PhotoPlanner-Cache": "MISS",
+        },
+    )
+
+
+@app.get("/sitemap.xml")
+def serve_sitemap(request: Request) -> Response:
+    xml_body = render_sitemap_xml(base_url=_request_base_url(request))
+    return Response(
+        content=xml_body,
+        media_type="application/xml",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+@app.get("/robots.txt")
+def serve_robots(request: Request) -> Response:
+    txt_body = render_robots_txt(base_url=_request_base_url(request))
+    return Response(
+        content=txt_body,
+        media_type="text/plain",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
 
 
 @app.get("/")

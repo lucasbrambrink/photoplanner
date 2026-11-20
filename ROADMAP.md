@@ -92,18 +92,18 @@
 
 ---
 
-### Phase 4: 3D Regional "Light-Hunting" Engine (Inverse Raycasting) & Launch
+### Phase 4: 3D Regional "Light-Hunting" Engine (Inverse Raycasting) & Launch *(Completed)*
 **Goal:** Differentiate decisively from flat-grid sunset radars by answering *"Where within driving distance are terrain + light + atmosphere aligning tonight?"*
 
 - [x] **Task 4.1 — Regional Inverse-Raycasting Pre-Solver (Core Engine)**
-  - Precompute/solve regional corridor transmittance + calibrated probabilities + fog-lid breakout odds + lake Mirror Index across a curated multi-region catalog (`planner/weather/regional_hunter.py`, `/api/regional-hunt`), ready to scale to 200–500 spots per region.
+  - Precompute/solve regional corridor transmittance + calibrated probabilities + fog-lid breakout odds + lake Mirror Index across a curated 40-spot multi-region catalog (`planner/weather/regional_hunter.py`, `/api/regional-hunt`), ready to scale to 200–500 spots per region.
 - [x] **Task 4.2 — Ranked Phenomenon Discovery & Causal Bust Explanations (Core Engine)**
   - Rank tonight / sunrise opportunities by specific photographic phenomenon (*Cloud-Sea Breakout*, *Direct Alpine Alpenglow*, *Open-Horizon Cirrus Burner*, *Alpine Mirror Reflection*, *Moody Storm-Break Shafts*, *Clear Dark-Sky Astro*) with plain-English causal bust attributions (`classify_spot_phenomena_and_attribution`).
 - [x] **Task 4.3 — Proactive Calibrated Alerts & Public Accuracy Scoreboard**
   - User saved spots & regional watchlists persisted in SQLite triggering 24h / 3h calibrated `TRIGGER` / `WATCH` / `SUPPRESS` alerts only when calibrated probability exceeds user thresholds, with plain-English bust reasons (`planner/weather/alert_engine.py`, `/api/watchlists`, `/api/alerts/evaluate`).
   - Publish a live, transparent **Verification Scoreboard** grading hits and misses against independent NOAA SURFRAD pyrheliometers, 2 km NSRDB GOES irradiance, and NWS RAOB soundings to build trust (`/api/backtest-report`, `data/weather_benchmarks/verification_report.html`).
-- [ ] **Task 4.4 — Dynamic SEO Light Guides (Organic Growth Engine)**
-  - Daily-updated landing pages for top 100 regional peaks & trails (*"Mt. Tamalpais Cloud-Sea & Sunset Forecast"*, *"Half Dome Alpenglow Forecast"*) plus optional B2B API tier for photo workshops and outdoor apps.
+- [x] **Task 4.4 — Dynamic SEO Light Guides (Organic Growth Engine) & B2B API Tier**
+  - Daily-updated server-rendered SEO landing pages (`/guides`, `/guides/{slug}`) across 40 iconic US destinations in 7 regions with Schema.org JSON-LD (`TouristAttraction` + `FAQPage`), OpenGraph/Twitter tags, `/sitemap.xml`, `/robots.txt`, deep links into the 3D Lens Viewfinder, static CDN pre-generator (`scripts/generate_seo_guides.py`), and versioned B2B JSON API (`/api/v1/guides`, `/api/v1/guides/{slug}`) with `PHOTOPLANNER_B2B_API_KEYS` tier gating (`planner/seo_guides.py`, `api_server.py`).
 
 ---
 

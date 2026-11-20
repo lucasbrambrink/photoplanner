@@ -22,8 +22,11 @@ const todayIso = formatLocalDateISO(nowLocalDate);
 const yesterdayDateObj = new Date(nowLocalDate.getTime() - 86400 * 1000);
 const yesterdayIso = formatLocalDateISO(yesterdayDateObj);
 
-const savedLandmark = localStorage.getItem("pp_landmark_v2") || "Pedro Point Headlands";
-const savedDate = localStorage.getItem("pp_date_v3") || todayIso;
+const urlParams = new URLSearchParams(window.location.search);
+const paramLandmark = urlParams.get("landmark")?.trim();
+const paramDate = urlParams.get("date")?.trim();
+const savedLandmark = paramLandmark || localStorage.getItem("pp_landmark_v2") || "Pedro Point Headlands";
+const savedDate = (paramDate && /^\d{4}-\d{2}-\d{2}$/.test(paramDate) ? paramDate : null) || localStorage.getItem("pp_date_v3") || todayIso;
 
 const state = {
   landmark: savedLandmark,
