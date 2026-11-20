@@ -1,0 +1,105 @@
+name: Daily Weather Backtest & Calibration Refresh
+
+on:
+  schedule:
+    # 11:00 UTC daily (03:00–04:00 Pacific) — stays cleanly inside Open-Meteo's free 10k/day quota
+    - cron: "0 11 * * *"
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Benchmark suite to advance (cross_year, surfrad, ca24, conus_multi, all)"
+        required: false
+        default: "cross_year"
+      max_uncached:
+        description: "Maximum uncached events to fetch in this batch (keep <= 50 on free Open-Meteo tier)"
+        required: false
+        default: "45"
+      save_calibration:
+        description: "Re-fit and persist calibration_model_v1.json after scoring"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-backtest
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: raycaster -> target
+
+      - name: Restore incremental weather benchmark cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/weather_cache/benchmark_suite_v1
+            data/srtm_cache
+          key: weather-bench-multi92-v3-${{ github.run_id }}
+          restore-keys: |
+            weather-bench-multi92-v3-
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build Rust photoplanner release binary
+        run: cargo build --release --manifest-path raycaster/Cargo.toml --bin photoplanner
+
+      - name: Advance incremental cross-year verification & calibration
+        env:
+          OPEN_METEO_API_KEY: ${{ secrets.OPEN_METEO_API_KEY }}
+        run: |
+          SUITE="${{ inputs.suite || 'cross_year' }}"
+          MAX_UNCACHED="${{ inputs.max_uncached || '45' }}"
+          SAVE_FLAG="--save-calibration"
+          if [ "${{ inputs.save_calibration }}" = "false" ]; then
+            SAVE_FLAG=""
+          fi
+          python scripts/run_weather_backtest.py \
+            --suite "$SUITE" \
+            --cache-tag multi92_v3 \
+            --max-uncached "$MAX_UNCACHED" \
+            --workers 3 \
+            $SAVE_FLAG \
+            --run-name "gha_daily_${GITHUB_RUN_NUMBER}"
+
+      - name: Upload verification scoreboard HTML artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-report-${{ github.run_number }}
+          path: data/weather_benchmarks/verification_report.html
+          retention-days: 30
+
+      - name: Commit updated calibration model & scoreboard (if changed)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/weather_benchmarks/calibration_model_v1.json data/weather_benchmarks/verification_report.html
+          if git diff --cached --quiet; then
+            echo "No calibration or scoreboard changes to commit."
+          else
+            git commit -m "chore(backtest): daily verification & cal_v2 calibration refresh [skip ci]"
+            git push origin HEAD:main
+          fi
