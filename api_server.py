@@ -20,6 +20,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 import datetime as dt
+import html
 import json
 import os
 import threading
@@ -29,9 +30,11 @@ from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
+from planner.field_reports import submit_field_report, summarize_field_reports
 from planner.gpx_trail_analyzer import analyze_uploaded_trail
 from planner.rust_worker import get_rust_worker, shutdown_rust_worker
 from planner.seo_guides import (
@@ -44,6 +47,7 @@ from planner.seo_guides import (
     render_sitemap_xml,
     render_spot_guide_html,
 )
+from planner.spot_search import search_photography_spots
 from planner.weather import (
     BENCHMARK_REPORT_JSON_PATH,
     EXPERIMENTS_DIR,
@@ -57,6 +61,7 @@ from planner.weather import (
     run_full_backtest_suite,
     solve_weather_and_corridor,
 )
+from planner.weather.alert_delivery import dispatch_due_alerts
 from planner.weather.calibration import load_calibration_bundle
 import server as legacy_server
 
@@ -116,6 +121,39 @@ FORECAST_CACHE = GridTTLCache(max_entries=int(os.environ.get("PHOTOPLANNER_CACHE
 HUNT_CACHE = GridTTLCache(max_entries=128)
 
 
+class IPRateLimiter:
+    """Thread-safe fixed-window per-IP rate limiter for public `/api/*` protection."""
+
+    def __init__(self, max_rpm: int = 120) -> None:
+        self.max_rpm = max(1, int(max_rpm))
+        self._lock = threading.Lock()
+        self._buckets: OrderedDict[str, tuple[float, int]] = OrderedDict()
+
+    def check(self, client_ip: str) -> tuple[bool, int, int]:
+        """Returns `(allowed, remaining, retry_after_sec)`."""
+        now = time.monotonic()
+        with self._lock:
+            win_start, count = self._buckets.get(client_ip, (now, 0))
+            if now - win_start >= 60.0:
+                win_start, count = now, 0
+            if count >= self.max_rpm:
+                retry = max(1, int(60.0 - (now - win_start)))
+                return False, 0, retry
+            count += 1
+            self._buckets[client_ip] = (win_start, count)
+            self._buckets.move_to_end(client_ip)
+            while len(self._buckets) > 4096:
+                self._buckets.popitem(last=False)
+            return True, max(0, self.max_rpm - count), 0
+
+    def reset(self) -> None:
+        with self._lock:
+            self._buckets.clear()
+
+
+RATE_LIMITER = IPRateLimiter(max_rpm=int(os.environ.get("PHOTOPLANNER_RATE_LIMIT_RPM", "120")))
+
+
 def _today_pacific() -> str:
     return dt.datetime.now(ZoneInfo("America/Los_Angeles")).date().isoformat()
 
@@ -134,10 +172,26 @@ class WatchlistCreateRequest(BaseModel):
     min_mirror_index: float = 0.0
     min_opportunity_score: float = 65.0
     lead_window: str = "24h"
+    notify_email: str | None = None
+    notify_webhook_url: str | None = None
 
 
 class WatchlistDeleteRequest(BaseModel):
     id: str
+
+
+class FieldReportCreateRequest(BaseModel):
+    spot_name: str = Field(..., min_length=1, max_length=120)
+    lat: float
+    lon: float
+    date: str
+    phase: str = "sunset"
+    outcome: str = Field(..., description="epic | partial | bust")
+    phenomenon: str = "other"
+    predicted_p50_pct: float | None = None
+    predicted_alpenglow_score: float | None = None
+    predicted_fog_top_ft: float | None = None
+    note: str | None = None
 
 
 @asynccontextmanager
@@ -158,12 +212,37 @@ app = FastAPI(
     lifespan=_lifespan,
 )
 
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _rate_limit_middleware(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/api/") and path not in ("/api/health", "/api/ready"):
+        fwd = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        client_ip = fwd or (request.client.host if request.client else "127.0.0.1")
+        allowed, remaining, retry_after = RATE_LIMITER.check(client_ip)
+        if not allowed:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Rate limit exceeded. Please retry shortly."},
+                headers={
+                    "X-RateLimit-Limit": str(RATE_LIMITER.max_rpm),
+                    "X-RateLimit-Remaining": "0",
+                    "Retry-After": str(retry_after),
+                },
+            )
+        response = await call_next(request)
+        response.headers["X-RateLimit-Limit"] = str(RATE_LIMITER.max_rpm)
+        response.headers["X-RateLimit-Remaining"] = str(remaining)
+        return response
+    return await call_next(request)
 
 
 @app.get("/api/health")
@@ -181,9 +260,38 @@ def api_health() -> dict[str, Any]:
         "calibration_loaded": cal_bundle is not None,
         "calibration_training_events": int(cal_bundle[0].n_unique_events) if cal_bundle else 0,
         "open_meteo_commercial_key": bool(os.environ.get("OPEN_METEO_API_KEY")),
+        "rate_limit_rpm": RATE_LIMITER.max_rpm,
         "forecast_grid_cache": FORECAST_CACHE.stats(),
         "regional_hunt_cache": HUNT_CACHE.stats(),
     }
+
+
+@app.get("/api/ready")
+def api_ready() -> JSONResponse:
+    """Kubernetes / Fly.io readiness probe verifying Rust binary & calibration artifact."""
+    rust_ok = legacy_server.RUST_BIN.exists()
+    cal_ok = load_calibration_bundle() is not None
+    ready = rust_ok and cal_ok
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={"ready": ready, "rust_binary_ready": rust_ok, "calibration_loaded": cal_ok},
+    )
+
+
+@app.get("/api/search-spots")
+def api_search_spots(
+    q: str = "",
+    limit: int = Query(default=12, ge=1, le=50),
+    remote: bool = True,
+    country_code: str = "US",
+) -> dict[str, Any]:
+    """Nationwide photography spot search (GPS paste + 44 curated CONUS spots + Open-Meteo Geocoding)."""
+    return search_photography_spots(
+        q,
+        limit=limit,
+        allow_remote=remote,
+        country_code=country_code,
+    )
 
 
 @app.get("/api/landmarks")
@@ -511,6 +619,43 @@ def api_evaluate_alerts(
     }
 
 
+@app.post("/api/alerts/dispatch")
+def api_dispatch_alerts(
+    request: Request,
+    date: str | None = None,
+    include_watch: bool = False,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Dispatches due calibrated watchlist alerts via Resend/SMTP/Webhook (optional admin token gate)."""
+    admin_token = os.environ.get("PHOTOPLANNER_ADMIN_TOKEN", "").strip()
+    if admin_token:
+        provided = (request.headers.get("x-admin-token") or "").strip()
+        if provided != admin_token:
+            raise HTTPException(status_code=401, detail="Invalid or missing X-Admin-Token.")
+    resolved_date = (date or _today_pacific()).strip()
+    return dispatch_due_alerts(
+        date_str=resolved_date,
+        include_watch=include_watch,
+        dry_run=dry_run,
+        base_url=_request_base_url(request),
+    )
+
+
+@app.post("/api/field-reports", status_code=201)
+def api_submit_field_report(req: FieldReportCreateRequest) -> dict[str, Any]:
+    """Logs a 1-tap post-shoot photographer ground-truth outcome (epic | partial | bust)."""
+    try:
+        return submit_field_report(**req.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/field-reports/summary")
+def api_field_reports_summary(spot_name: str | None = None) -> dict[str, Any]:
+    """Returns crowd ground-truth verification counts and hit-rate vs predicted P50 odds."""
+    return summarize_field_reports(spot_name=spot_name)
+
+
 @app.get("/api/weather-backtest")
 def api_weather_backtest(refresh: bool = False) -> Response:
     if (not refresh) and SUMMARY_JSON_PATH.exists():
@@ -728,8 +873,44 @@ def serve_robots(request: Request) -> Response:
 
 
 @app.get("/")
-def serve_index() -> FileResponse:
-    return FileResponse(legacy_server.WEB_DIR / "index.html")
+def serve_index(
+    request: Request,
+    name: str | None = None,
+    landmark: str | None = None,
+    date: str | None = None,
+    phase: str | None = None,
+    mm: int | None = None,
+) -> Response:
+    index_path = legacy_server.WEB_DIR / "index.html"
+    spot_label = (name or landmark or "").strip()
+    if not spot_label:
+        return FileResponse(index_path)
+
+    raw_html = index_path.read_text(encoding="utf-8")
+    phase_txt = "Sunrise" if (phase or "").strip().lower() == "sunrise" else "Sunset"
+    date_txt = (date or _today_pacific()).strip()
+    lens_txt = f" · {int(mm)}mm FF" if mm else ""
+    og_title = f"{spot_label} — {phase_txt} Light & 3D Viewfinder ({date_txt}){lens_txt} | PhotoPlanner"
+    og_desc = (
+        f"3D raycasted terrain, calibrated P10–P90 light odds, and probabilistic fog-sea lid forecast "
+        f"for {spot_label} ({date_txt} {phase_txt.lower()})."
+    )
+    share_url = str(request.url)
+    og_block = (
+        f'  <meta property="og:type" content="website" />\n'
+        f'  <meta property="og:title" content="{html.escape(og_title)}" />\n'
+        f'  <meta property="og:description" content="{html.escape(og_desc)}" />\n'
+        f'  <meta property="og:url" content="{html.escape(share_url)}" />\n'
+        f'  <meta name="twitter:card" content="summary_large_image" />\n'
+        f'  <meta name="twitter:title" content="{html.escape(og_title)}" />\n'
+        f'  <meta name="twitter:description" content="{html.escape(og_desc)}" />\n'
+    )
+    patched = raw_html.replace(
+        "<title>PhotoPlanner — 3D Light &amp; Lens Viewfinder</title>",
+        f"<title>{html.escape(og_title)}</title>\n{og_block}",
+        1,
+    )
+    return HTMLResponse(content=patched)
 
 
 @app.get("/{file_path:path}")

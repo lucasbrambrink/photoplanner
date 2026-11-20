@@ -1,0 +1,31 @@
+services:
+  photoplanner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: photoplanner
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8420}:8420"
+    environment:
+      PORT: "8420"
+      PHOTOPLANNER_WORKERS: "${PHOTOPLANNER_WORKERS:-2}"
+      PHOTOPLANNER_RATE_LIMIT_RPM: "${PHOTOPLANNER_RATE_LIMIT_RPM:-120}"
+      PHOTOPLANNER_SRTM_MAX_TILES: "${PHOTOPLANNER_SRTM_MAX_TILES:-20}"
+      # Commercial & Alert keys (pass via .env on host — never commit secrets)
+      OPEN_METEO_API_KEY: "${OPEN_METEO_API_KEY:-}"
+      RESEND_API_KEY: "${RESEND_API_KEY:-}"
+      PHOTOPLANNER_FROM_EMAIL: "${PHOTOPLANNER_FROM_EMAIL:-alerts@photoplanner.app}"
+      PHOTOPLANNER_B2B_API_KEYS: "${PHOTOPLANNER_B2B_API_KEYS:-}"
+      PHOTOPLANNER_ADMIN_TOKEN: "${PHOTOPLANNER_ADMIN_TOKEN:-}"
+    volumes:
+      - photoplanner_data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8420/api/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  photoplanner_data:

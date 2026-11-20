@@ -23,8 +23,15 @@ const yesterdayDateObj = new Date(nowLocalDate.getTime() - 86400 * 1000);
 const yesterdayIso = formatLocalDateISO(yesterdayDateObj);
 
 const urlParams = new URLSearchParams(window.location.search);
-const paramLandmark = urlParams.get("landmark")?.trim();
+const paramLandmark = (urlParams.get("landmark") || urlParams.get("name") || "").trim();
 const paramDate = urlParams.get("date")?.trim();
+const paramLat = parseFloat(urlParams.get("lat") || "");
+const paramLon = parseFloat(urlParams.get("lon") || "");
+const paramMm = parseInt(urlParams.get("mm") || "", 10);
+const initialCustomCoord =
+  Number.isFinite(paramLat) && Number.isFinite(paramLon)
+    ? { lat: paramLat, lon: paramLon, name: paramLandmark || `GPS (${paramLat.toFixed(4)}, ${paramLon.toFixed(4)})` }
+    : null;
 const savedLandmark = paramLandmark || localStorage.getItem("pp_landmark_v2") || "Pedro Point Headlands";
 const savedDate = (paramDate && /^\d{4}-\d{2}-\d{2}$/.test(paramDate) ? paramDate : null) || localStorage.getItem("pp_date_v3") || todayIso;
 
@@ -6469,8 +6476,277 @@ function animate(nowMs = performance.now()) {
       gpxOut.innerHTML = `<span class="muted-note">Upload error: ${escapeFieldCardHtml(err.message)}</span>`;
     }
   });
+  // 7. Nationwide US Spot & GPS Search Combobox (/api/search-spots)
+  const searchInput = document.getElementById("spot-search-input");
+  const searchDropdown = document.getElementById("spot-search-results");
+  let searchDebounce = 0;
+  let searchResults = [];
+  let searchActiveIdx = -1;
+
+  function hideSearchDropdown() {
+    if (searchDropdown) searchDropdown.hidden = true;
+    searchActiveIdx = -1;
+  }
+
+  function selectSearchSpot(spot) {
+    if (!spot) return;
+    hideSearchDropdown();
+    if (searchInput) searchInput.value = spot.name;
+    const lmSelect = document.getElementById("landmark-select");
+    if (spot.preset_landmark && lmSelect) {
+      lmSelect.value = spot.preset_landmark;
+      state.landmark = spot.preset_landmark;
+      loadLandmarkScenario();
+    } else {
+      state.landmark = spot.name;
+      loadLandmarkScenario({ lat: spot.lat, lon: spot.lon, name: spot.name });
+    }
+  }
+
+  function renderSearchDropdown(items) {
+    searchResults = items || [];
+    searchActiveIdx = -1;
+    if (!searchDropdown) return;
+    if (!searchResults.length) {
+      searchDropdown.innerHTML = `<div class="muted-note" style="padding:8px 10px;">No matching US peak or GPS found.</div>`;
+      searchDropdown.hidden = false;
+      return;
+    }
+    searchDropdown.innerHTML = "";
+    searchResults.forEach((spot, idx) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "spot-result-item";
+      btn.setAttribute("role", "option");
+      const tag = spot.source === "gps" ? "GPS" : spot.source === "geocoder" ? "US Map" : spot.state || "Peak";
+      btn.innerHTML = `
+        <span class="spot-result-name">
+          <span>${escapeFieldCardHtml(spot.name)}</span>
+          <span class="spot-result-tag">${escapeFieldCardHtml(tag)}</span>
+        </span>
+        <span class="spot-result-sub">${escapeFieldCardHtml(spot.subtitle || "")}</span>
+      `;
+      btn.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        selectSearchSpot(spot);
+      });
+      btn.addEventListener("mouseenter", () => {
+        searchActiveIdx = idx;
+      });
+      searchDropdown.appendChild(btn);
+    });
+    searchDropdown.hidden = false;
+  }
+
+  async function fetchSpotSuggestions(query) {
+    try {
+      const qs = new URLSearchParams({ q: query, limit: "10" });
+      const res = await fetch(`/api/search-spots?${qs.toString()}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      renderSearchDropdown(data.results || []);
+    } catch (_) {
+      // Ignore transient network errors while typing
+    }
+  }
+
+  searchInput?.addEventListener("focus", () => {
+    searchInput.select();
+    fetchSpotSuggestions("");
+  });
+
+  searchInput?.addEventListener("input", () => {
+    clearTimeout(searchDebounce);
+    const q = searchInput.value.trim();
+    searchDebounce = setTimeout(() => fetchSpotSuggestions(q), 140);
+  });
+
+  searchInput?.addEventListener("keydown", (e) => {
+    if (!searchDropdown || searchDropdown.hidden) return;
+    const items = searchDropdown.querySelectorAll(".spot-result-item");
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      searchActiveIdx = Math.min(items.length - 1, searchActiveIdx + 1);
+      items.forEach((el, i) => el.classList.toggle("is-highlighted", i === searchActiveIdx));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      searchActiveIdx = Math.max(0, searchActiveIdx - 1);
+      items.forEach((el, i) => el.classList.toggle("is-highlighted", i === searchActiveIdx));
+    } else if (e.key === "Enter" && searchResults.length > 0) {
+      e.preventDefault();
+      selectSearchSpot(searchResults[Math.max(0, searchActiveIdx)]);
+    } else if (e.key === "Escape") {
+      hideSearchDropdown();
+    }
+  });
+
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest("#spot-search-wrap")) {
+      hideSearchDropdown();
+    }
+  });
+
+  // Sync search input value whenever a landmark finishes loading
+  const origSummaryEl = document.getElementById("summary-title");
+  if (origSummaryEl && searchInput && typeof MutationObserver !== "undefined") {
+    new MutationObserver(() => {
+      if (document.activeElement !== searchInput && origSummaryEl.textContent) {
+        searchInput.value = origSummaryEl.textContent.trim();
+      }
+    }).observe(origSummaryEl, { childList: true, characterData: true, subtree: true });
+  }
+
+  // 8. Calibrated "Alert Me" Watchlist Popover (/api/watchlists)
+  const alertPopover = document.getElementById("alert-popover");
+  const alertTitle = document.getElementById("alert-popover-title");
+  const alertForm = document.getElementById("alert-create-form");
+  const alertStatus = document.getElementById("alert-form-status");
+  const alertSavedList = document.getElementById("alert-saved-list");
+
+  async function refreshSavedWatchlists() {
+    if (!alertSavedList) return;
+    try {
+      const res = await fetch("/api/watchlists");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const rules = data.watchlists || [];
+      if (!rules.length) {
+        alertSavedList.innerHTML = `<span class="muted-note">No saved alerts yet. Save this spot above to get notified when light clears your odds.</span>`;
+        return;
+      }
+      alertSavedList.innerHTML = "";
+      rules.forEach((r) => {
+        const row = document.createElement("div");
+        row.className = "alert-saved-row";
+        const dest = r.notify_email || (r.notify_webhook_url ? "Webhook" : "In-App");
+        row.innerHTML = `
+          <div class="alert-saved-meta">
+            <strong>${escapeFieldCardHtml(r.name)}</strong>
+            <span>${escapeFieldCardHtml(r.phase)} · ≥${Math.round(r.min_calibrated_p50_pct)}% P50 · ${escapeFieldCardHtml(dest)}</span>
+          </div>
+          <button type="button" class="icon-btn icon-btn-xs" data-del-rule="${escapeFieldCardHtml(r.id)}" title="Delete alert">✕</button>
+        `;
+        row.querySelector("[data-del-rule]")?.addEventListener("click", async () => {
+          await fetch(`/api/watchlists/${encodeURIComponent(r.id)}`, { method: "DELETE" });
+          refreshSavedWatchlists();
+        });
+        alertSavedList.appendChild(row);
+      });
+    } catch (err) {
+      alertSavedList.innerHTML = `<span class="muted-note">Could not load alerts: ${escapeFieldCardHtml(err.message)}</span>`;
+    }
+  }
+
+  document.getElementById("btn-open-alert-popover")?.addEventListener("click", () => {
+    const lmName = state.shootReport?.target_landmark?.name || state.landmark;
+    if (alertTitle) alertTitle.textContent = `Alert for ${lmName}`;
+    if (alertStatus) alertStatus.hidden = true;
+    refreshSavedWatchlists();
+  });
+
+  alertForm?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const lm = state.shootReport?.target_landmark;
+    const spotName = lm?.name || state.landmark;
+    const payload = {
+      name: spotName,
+      lat: lm?.summit_lat ?? 37.5945,
+      lon: lm?.summit_lon ?? -122.5028,
+      elev_m: lm?.summit_elevation_m ?? null,
+      phase: document.getElementById("alert-phase-select")?.value || "sunset",
+      min_calibrated_p50_pct: Number(document.getElementById("alert-min-p50")?.value || 65),
+      notify_email: document.getElementById("alert-email-input")?.value?.trim() || null,
+      notify_webhook_url: document.getElementById("alert-webhook-input")?.value?.trim() || null,
+    };
+    if (alertStatus) {
+      alertStatus.hidden = false;
+      alertStatus.textContent = "Saving alert…";
+    }
+    try {
+      const res = await fetch("/api/watchlists", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) {
+        const errDoc = await res.json().catch(() => ({}));
+        throw new Error(errDoc.detail || `HTTP ${res.status}`);
+      }
+      if (alertStatus) alertStatus.textContent = `Saved calibrated alert for ${spotName}.`;
+      refreshSavedWatchlists();
+    } catch (err) {
+      if (alertStatus) alertStatus.textContent = `Error: ${err.message}`;
+    }
+  });
+
+  // 9. Shareable Deep-Link Copy (#btn-share-shoot)
+  document.getElementById("btn-share-shoot")?.addEventListener("click", async () => {
+    const lm = state.shootReport?.target_landmark;
+    const isSunrise = document.getElementById("tab-corridor-sunrise")?.classList.contains("is-active");
+    const qs = new URLSearchParams({
+      name: lm?.name || state.landmark,
+      date: state.date,
+      phase: isSunrise ? "sunrise" : "sunset",
+      mm: String(state.focalLengthMm || 35),
+    });
+    if (lm?.summit_lat != null && lm?.summit_lon != null) {
+      qs.set("lat", Number(lm.summit_lat).toFixed(5));
+      qs.set("lon", Number(lm.summit_lon).toFixed(5));
+    }
+    const shareUrl = `${window.location.origin}/?${qs.toString()}`;
+    window.history.replaceState({}, "", `/?${qs.toString()}`);
+    const lbl = document.getElementById("share-btn-label");
+    try {
+      await navigator.clipboard.writeText(shareUrl);
+      if (lbl) lbl.textContent = "Link Copied";
+    } catch (_) {
+      if (lbl) lbl.textContent = "URL Ready";
+    }
+    setTimeout(() => {
+      if (lbl) lbl.textContent = "Share";
+    }, 1800);
+  });
+
+  // 10. 1-Tap Post-Shoot Crowd Ground-Truth Feedback (/api/field-reports)
+  document.querySelectorAll("[data-report-outcome]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const outcome = btn.dataset.reportOutcome;
+      const lm = state.shootReport?.target_landmark;
+      const wr = state.weatherReport;
+      const cal = wr?.calibrated_probabilities || {};
+      const inv = wr?.inversion_model || {};
+      const isSunrise = document.getElementById("tab-corridor-sunrise")?.classList.contains("is-active");
+      const statusEl = document.getElementById("feedback-status-label");
+      document.querySelectorAll("[data-report-outcome]").forEach((b) => b.classList.toggle("is-active", b === btn));
+      if (statusEl) statusEl.textContent = "Logging…";
+      try {
+        const res = await fetch("/api/field-reports", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            spot_name: lm?.name || state.landmark,
+            lat: lm?.summit_lat ?? 37.5945,
+            lon: lm?.summit_lon ?? -122.5028,
+            date: state.date,
+            phase: isSunrise ? "sunrise" : "sunset",
+            outcome,
+            predicted_p50_pct: cal.transmittance_p50_pct ?? wr?.ray_transmittance_pct ?? null,
+            predicted_alpenglow_score: wr?.alpenglow_score ?? null,
+            predicted_fog_top_ft: inv.fog_top_p50_ft ?? inv.fog_top_ft ?? null,
+          }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (statusEl) statusEl.textContent = `Logged (${outcome}) · Thanks`;
+      } catch (_) {
+        if (statusEl) statusEl.textContent = "Did it happen?";
+      }
+    });
+  });
 })();
 
+if (Number.isFinite(paramMm) && paramMm >= 14 && paramMm <= 300) {
+  state.focalLengthMm = paramMm;
+}
 syncFluidLabButtons();
 ensureRenderLoopRunning();
-loadLandmarkScenario();
+loadLandmarkScenario(initialCustomCoord);

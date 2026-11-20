@@ -1,0 +1,37 @@
+# Fly.io production deployment config (~$10-15/mo for 2 GB RAM + persistent SRTM/SQLite volume)
+# Deploy: fly launch --no-deploy && fly volumes create pp_data --size 10 --region sjc && fly deploy
+
+app = "photoplanner-3d"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8420"
+  PHOTOPLANNER_WORKERS = "2"
+  PHOTOPLANNER_RATE_LIMIT_RPM = "120"
+  PHOTOPLANNER_SRTM_MAX_TILES = "20"
+
+[mounts]
+  source = "pp_data"
+  destination = "/app/data"
+
+[http_service]
+  internal_port = 8420
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "15s"
+    method = "GET"
+    path = "/api/ready"
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "2gb"

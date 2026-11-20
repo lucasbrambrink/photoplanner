@@ -52,10 +52,24 @@ def _init_db(db_path: Path = DEFAULT_WATCHLIST_DB) -> sqlite3.Connection:
             min_opportunity_score REAL NOT NULL DEFAULT 65.0,
             lead_window TEXT NOT NULL DEFAULT '24h',
             enabled INTEGER NOT NULL DEFAULT 1,
+            notify_email TEXT,
+            notify_webhook_url TEXT,
+            last_notified_date TEXT,
+            last_notified_phase TEXT,
             created_at_utc TEXT NOT NULL
         )
         """
     )
+    # Safe additive migration for existing SQLite watchlists created before delivery fields existed
+    existing_cols = {r["name"] for r in conn.execute("PRAGMA table_info(watchlists)").fetchall()}
+    for col_name, col_type in (
+        ("notify_email", "TEXT"),
+        ("notify_webhook_url", "TEXT"),
+        ("last_notified_date", "TEXT"),
+        ("last_notified_phase", "TEXT"),
+    ):
+        if col_name not in existing_cols:
+            conn.execute(f"ALTER TABLE watchlists ADD COLUMN {col_name} {col_type}")
     conn.commit()
     return conn
 
@@ -75,6 +89,8 @@ def create_watchlist_rule(
     min_mirror_index: float = 0.0,
     min_opportunity_score: float = 65.0,
     lead_window: str = "24h",
+    notify_email: str | None = None,
+    notify_webhook_url: str | None = None,
     db_path: Path = DEFAULT_WATCHLIST_DB,
 ) -> dict[str, Any]:
     """Creates and persists a calibrated alert watchlist rule."""
@@ -100,6 +116,12 @@ def create_watchlist_rule(
     if lw not in ("3h", "24h", "72h"):
         lw = "24h"
     phen_list = [str(p).strip() for p in (target_phenomena or []) if str(p).strip()]
+    clean_email = notify_email.strip() if notify_email and notify_email.strip() else None
+    clean_webhook = notify_webhook_url.strip() if notify_webhook_url and notify_webhook_url.strip() else None
+    if clean_email and "@" not in clean_email:
+        raise ValueError("`notify_email` must be a valid email address.")
+    if clean_webhook and not clean_webhook.startswith(("http://", "https://")):
+        raise ValueError("`notify_webhook_url` must start with http:// or https://.")
 
     with _init_db(db_path) as conn:
         conn.execute(
@@ -107,8 +129,9 @@ def create_watchlist_rule(
             INSERT INTO watchlists (
                 id, name, spot_id, region, lat, lon, elev_m, phase,
                 target_phenomena_json, min_calibrated_p50_pct, min_above_fog_prob_pct,
-                min_mirror_index, min_opportunity_score, lead_window, enabled, created_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                min_mirror_index, min_opportunity_score, lead_window, enabled,
+                notify_email, notify_webhook_url, created_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
             """,
             (
                 rule_id,
@@ -125,6 +148,8 @@ def create_watchlist_rule(
                 float(min_mirror_index),
                 float(min_opportunity_score),
                 lw,
+                clean_email,
+                clean_webhook,
                 now_iso,
             ),
         )
@@ -133,6 +158,7 @@ def create_watchlist_rule(
 
 
 def _row_to_rule(row: sqlite3.Row) -> dict[str, Any]:
+    cols = set(row.keys())
     return {
         "id": row["id"],
         "name": row["name"],
@@ -149,6 +175,10 @@ def _row_to_rule(row: sqlite3.Row) -> dict[str, Any]:
         "min_opportunity_score": float(row["min_opportunity_score"]),
         "lead_window": row["lead_window"],
         "enabled": bool(row["enabled"]),
+        "notify_email": row["notify_email"] if "notify_email" in cols else None,
+        "notify_webhook_url": row["notify_webhook_url"] if "notify_webhook_url" in cols else None,
+        "last_notified_date": row["last_notified_date"] if "last_notified_date" in cols else None,
+        "last_notified_phase": row["last_notified_phase"] if "last_notified_phase" in cols else None,
         "created_at_utc": row["created_at_utc"],
     }
 
@@ -170,6 +200,21 @@ def delete_watchlist_rule(rule_id: str, db_path: Path = DEFAULT_WATCHLIST_DB) ->
         cur = conn.execute("DELETE FROM watchlists WHERE id = ?", (rule_id,))
         conn.commit()
         return cur.rowcount > 0
+
+
+def mark_watchlist_notified(
+    rule_id: str,
+    date_str: str,
+    phase: str,
+    db_path: Path = DEFAULT_WATCHLIST_DB,
+) -> None:
+    """Marks a watchlist rule as delivered for `(date_str, phase)` to prevent duplicate alerts."""
+    with _init_db(db_path) as conn:
+        conn.execute(
+            "UPDATE watchlists SET last_notified_date = ?, last_notified_phase = ? WHERE id = ?",
+            (date_str, phase.strip().lower(), rule_id),
+        )
+        conn.commit()
 
 
 def evaluate_alert_gate(rule: dict[str, Any], scored_spot: dict[str, Any]) -> dict[str, Any]:

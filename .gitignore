@@ -26,5 +26,6 @@ ENV/
 
 # Runtime SQLite databases & ephemeral benchmark experiment logs
 /data/watchlists.sqlite3
+/data/field_reports.sqlite3
 /data/weather_benchmarks/experiments/
 

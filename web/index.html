@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="color-scheme" content="dark light" />
   <title>PhotoPlanner — 3D Light &amp; Lens Viewfinder</title>
-  <link rel="stylesheet" href="/styles.css?v=20261120b" />
+  <link rel="stylesheet" href="/styles.css?v=20261120c" />
   <script type="importmap">
     {
       "imports": {
@@ -89,21 +89,37 @@
         </div>
 
         <form id="query-form" class="sheet-controls" aria-label="Subject and Date">
-          <select id="landmark-select" class="input-select" name="landmark" aria-label="Photography Subject">
-            <optgroup label="SF Peninsula &amp; Pacific Coast">
-              <option value="Pedro Point Headlands" selected>Pedro Point Headlands</option>
-              <option value="Montara Mountain">Montara Mountain</option>
-            </optgroup>
-            <optgroup label="Yosemite National Park">
-              <option value="Half Dome">Half Dome</option>
-              <option value="Clouds Rest">Clouds Rest</option>
-              <option value="Upper Yosemite Fall">Upper Yosemite Fall</option>
-              <option value="Sentinel Dome">Sentinel Dome</option>
-              <option value="Bridalveil Fall">Bridalveil Fall</option>
-              <option value="North Dome">North Dome</option>
-              <option value="Cathedral Peak">Cathedral Peak</option>
-              <option value="Tenaya Lake">Tenaya Lake</option>
-            </optgroup>
+          <div class="spot-search-wrap" id="spot-search-wrap">
+            <svg class="spot-search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="11" cy="11" r="8" />
+              <line x1="21" y1="21" x2="16.65" y2="16.65" />
+            </svg>
+            <input
+              type="search"
+              id="spot-search-input"
+              class="input-search"
+              value="Pedro Point Headlands"
+              placeholder="Search any US peak, lake, or GPS…"
+              autocomplete="off"
+              aria-label="Search any US photography peak, lake, or GPS coordinates"
+              aria-autocomplete="list"
+              aria-controls="spot-search-results"
+            />
+            <div class="spot-search-dropdown" id="spot-search-results" role="listbox" hidden></div>
+          </div>
+
+          <!-- Hidden legacy preset select kept in sync for quick benchmarks -->
+          <select id="landmark-select" name="landmark" hidden>
+            <option value="Pedro Point Headlands" selected>Pedro Point Headlands</option>
+            <option value="Montara Mountain">Montara Mountain</option>
+            <option value="Half Dome">Half Dome</option>
+            <option value="Clouds Rest">Clouds Rest</option>
+            <option value="Upper Yosemite Fall">Upper Yosemite Fall</option>
+            <option value="Sentinel Dome">Sentinel Dome</option>
+            <option value="Bridalveil Fall">Bridalveil Fall</option>
+            <option value="North Dome">North Dome</option>
+            <option value="Cathedral Peak">Cathedral Peak</option>
+            <option value="Tenaya Lake">Tenaya Lake</option>
           </select>
 
           <div class="sheet-date-phase-row">
@@ -170,6 +186,23 @@
               <strong class="tri-val" id="brief-temp-wind">--</strong>
             </div>
           </div>
+
+          <div class="hero-action-row">
+            <button type="button" class="btn-subtle btn-xs hero-alert-btn" id="btn-open-alert-popover" popovertarget="alert-popover">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" />
+                <path d="M13.73 21a2 2 0 0 1-3.46 0" />
+              </svg>
+              <span>Alert Me</span>
+            </button>
+            <button type="button" class="btn-subtle btn-xs" id="btn-share-shoot" title="Copy shareable deep link for this spot, date &amp; lens">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="18" cy="5" r="3" /><circle cx="6" cy="12" r="3" /><circle cx="18" cy="19" r="3" />
+                <line x1="8.59" y1="13.51" x2="15.42" y2="17.49" /><line x1="15.41" y1="6.51" x2="8.59" y2="10.49" />
+              </svg>
+              <span id="share-btn-label">Share</span>
+            </button>
+          </div>
         </section>
 
         <!-- 3 Clean Tabs: Brief (Viewpoints) | Hunt (Regional) | Trail (GPX & Pin) -->
@@ -188,6 +221,17 @@
         <!-- Tab 1: Recommended Viewpoints -->
         <div class="sheet-panel is-active" id="panel-brief" role="tabpanel">
           <div id="vp-cards-container" class="vp-cards-list"></div>
+
+          <!-- 1-Tap Post-Shoot Crowd Ground-Truth Verification Strip -->
+          <div class="feedback-strip" id="field-feedback-strip">
+            <span class="feedback-label" id="feedback-status-label">Did it happen?</span>
+            <div class="feedback-btns" role="group" aria-label="Log observed light outcome">
+              <button type="button" class="feedback-btn" data-report-outcome="epic">Epic</button>
+              <button type="button" class="feedback-btn" data-report-outcome="partial">Partial</button>
+              <button type="button" class="feedback-btn" data-report-outcome="bust">Bust</button>
+            </div>
+          </div>
+
           <div class="sheet-footer-links">
             <button type="button" class="link-btn" id="btn-open-calendar" popovertarget="annual-calendar-popover">
               365-Day Keyhole Dates
@@ -711,8 +755,58 @@
         <div class="muted-note">Scanning 365-day solar ephemeris…</div>
       </div>
     </div>
+
+    <div id="alert-popover" class="clean-popover alert-popover" popover>
+      <div class="popover-head">
+        <div>
+          <span class="eyebrow">CALIBRATED LIGHT ALERTS</span>
+          <h3 id="alert-popover-title">Don't Miss This Spot</h3>
+        </div>
+        <button type="button" class="icon-btn icon-btn-xs" popovertarget="alert-popover" popovertargetaction="hide" aria-label="Close">✕</button>
+      </div>
+      <p class="muted-note">
+        Get alerted only when calibrated <strong>P50 light odds</strong> clear your threshold — zero flat-grid spam.
+      </p>
+      <form id="alert-create-form" class="alert-form">
+        <div class="alert-form-row">
+          <label class="block-caption" for="alert-phase-select">Phase</label>
+          <select id="alert-phase-select" class="input-select input-select-sm">
+            <option value="sunset" selected>Sunset</option>
+            <option value="sunrise">Sunrise</option>
+            <option value="both">Sunrise &amp; Sunset</option>
+          </select>
+        </div>
+        <div class="alert-form-row">
+          <label class="block-caption" for="alert-min-p50">Min Calibrated Odds</label>
+          <select id="alert-min-p50" class="input-select input-select-sm">
+            <option value="55">55% (Balanced)</option>
+            <option value="65" selected>65% (High Confidence)</option>
+            <option value="75">75% (Rare Burners Only)</option>
+          </select>
+        </div>
+        <div class="alert-form-row">
+          <label class="block-caption" for="alert-email-input">Email (Optional)</label>
+          <input type="email" id="alert-email-input" class="input-text" placeholder="you@example.com" />
+        </div>
+        <div class="alert-form-row">
+          <label class="block-caption" for="alert-webhook-input">Push / Webhook URL (ntfy / Discord / Slack)</label>
+          <input type="url" id="alert-webhook-input" class="input-text" placeholder="https://ntfy.sh/my-photo-alerts" />
+        </div>
+        <button type="submit" class="btn-accent btn-sm alert-submit-btn" id="btn-save-alert">
+          Save Calibrated Alert
+        </button>
+        <div class="muted-note" id="alert-form-status" hidden></div>
+      </form>
+
+      <div class="alert-saved-section">
+        <div class="block-caption">Saved Watchlists</div>
+        <div id="alert-saved-list" class="alert-saved-list">
+          <span class="muted-note">Loading saved alerts…</span>
+        </div>
+      </div>
+    </div>
   </main>
 
-  <script type="module" src="/app.js?v=20261120b"></script>
+  <script type="module" src="/app.js?v=20261120c"></script>
 </body>
 </html>
