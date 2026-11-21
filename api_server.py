@@ -913,6 +913,17 @@ def serve_index(
     return HTMLResponse(content=patched)
 
 
+@app.get("/favicon.ico", include_in_schema=False)
+def serve_favicon() -> Response:
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" '
+        'stroke="#f59e0b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+        '<circle cx="12" cy="8" r="3.5"/>'
+        '<path d="M3 20l6-8 4 5 3-4 5 7H3z"/></svg>'
+    )
+    return Response(content=svg, media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=86400"})
+
+
 @app.get("/{file_path:path}")
 def serve_static(file_path: str) -> FileResponse:
     candidate = (legacy_server.WEB_DIR / file_path).resolve()

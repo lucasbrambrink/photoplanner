@@ -2644,9 +2644,28 @@ export class VolumetricAtmosphereEngine {
     this.mesoscaleCloudTex.unpackAlignment = 1;
     this.mesoscaleCloudTex.needsUpdate = true;
 
+    const altInitBytes = new Uint8Array(16 * 16 * 4);
+    for (let i = 0; i < 16 * 16; i++) {
+      altInitBytes[i * 4 + 0] = 51;  // ~510m default fog top
+      altInitBytes[i * 4 + 1] = 12;
+      altInitBytes[i * 4 + 2] = 12;  // ~200m default surface elev
+      altInitBytes[i * 4 + 3] = 64;
+    }
+    this.mesoscaleAltTex = new THREE.DataTexture(altInitBytes, 16, 16, THREE.RGBAFormat, THREE.UnsignedByteType);
+    this.mesoscaleAltTex.minFilter = THREE.LinearFilter;
+    this.mesoscaleAltTex.magFilter = THREE.LinearFilter;
+    this.mesoscaleAltTex.wrapS = THREE.ClampToEdgeWrapping;
+    this.mesoscaleAltTex.wrapT = THREE.ClampToEdgeWrapping;
+    this.mesoscaleAltTex.flipY = false;
+    this.mesoscaleAltTex.unpackAlignment = 1;
+    this.mesoscaleAltTex.needsUpdate = true;
+
     this._hasLoadedCorridorLut = false;
     this._hasCorridorAtmoData = false;
     this._hasLoadedMesoscaleGrid = false;
+    this._hasLoadedMesoscaleAlt = false;
+    this._pendingScrubFluidStep = false;
+    this._mesoscaleMeta = null;
 
     this.corridorUniforms = {
       uCorridorLutTex: { value: this.corridorLutTex },
@@ -2659,8 +2678,19 @@ export class VolumetricAtmosphereEngine {
 
     this.mesoscaleUniforms = {
       uMesoscaleCloudTex: { value: this.mesoscaleCloudTex },
-      uMesoscaleSpanM: { value: 160000.0 },
+      uMesoscaleAltTex: { value: this.mesoscaleAltTex },
+      uMesoscaleSpanM: { value: 112000.0 },
       uHasMesoscaleGrid: { value: 0.0 },
+      uHasMesoscaleAlt: { value: 0.0 },
+      uUseSpatialInCore: { value: 0.0 },
+      uScrubDeltaSec: { value: 0.0 },
+      uScrubLayerScale: { value: new THREE.Vector4(1.0, 1.0, 1.0, 1.0) },
+      uScrubLayerAdd: { value: new THREE.Vector4(0.0, 0.0, 0.0, 0.0) },
+      uMesoWindSfc: { value: new THREE.Vector2(3.5, 0.0) },
+      uMesoWind850: { value: new THREE.Vector2(5.5, 0.0) },
+      uMesoWind500: { value: new THREE.Vector2(12.0, 0.0) },
+      uMesoWind250: { value: new THREE.Vector2(24.0, 0.0) },
+      uScrubRelaxBoost: { value: 0.0 },
     };
 
     // Shared 4-layer physical altitude envelope uniforms across Fluid Solver, Shadow Map, Raymarcher & Hover Probe

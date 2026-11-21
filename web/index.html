@@ -5,7 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="color-scheme" content="dark light" />
   <title>PhotoPlanner — 3D Light &amp; Lens Viewfinder</title>
-  <link rel="stylesheet" href="/styles.css?v=20261120c" />
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23f59e0b' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='8' r='3.5'/%3E%3Cpath d='M3 20l6-8 4 5 3-4 5 7H3z'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/styles.css?v=20261121a" />
   <script type="importmap">
     {
       "imports": {
@@ -38,8 +39,14 @@
         <div class="vf-center-cross"></div>
       </div>
 
-      <!-- Optical Full-Frame Camera Focal-Length Dial -->
-      <div class="vf-top-lens-bar" id="vf-lens-bar" role="group" aria-label="Full-Frame Camera Focal Length">
+      <!-- Optical Full-Frame Camera Focal-Length & Tripod Dial -->
+      <div class="vf-top-lens-bar" id="vf-lens-bar" role="group" aria-label="Tripod &amp; Full-Frame Camera Focal Length">
+        <div class="vf-vp-group" id="vf-vp-switcher" role="group" aria-label="Switch Tripod Viewpoint">
+          <button type="button" class="vf-lens-btn is-active" data-vf-vp="0">VP1</button>
+          <button type="button" class="vf-lens-btn" data-vf-vp="1">VP2</button>
+          <button type="button" class="vf-lens-btn" data-vf-vp="2">VP3</button>
+        </div>
+        <span class="vf-divider" aria-hidden="true"></span>
         <span class="vf-lens-label">35mm</span>
         <button type="button" class="vf-lens-btn" data-focal-mm="16">16</button>
         <button type="button" class="vf-lens-btn" data-focal-mm="24">24</button>
@@ -299,22 +306,21 @@
     </aside>
 
     <!-- =====================================================================
-         TOP-RIGHT: Quiet Monochrome Utility Icons (4 controls total)
+         TOP-RIGHT: Persistent Camera Mode Toggle + Monochrome Utility Icons
          ===================================================================== -->
     <div class="top-right-controls" role="toolbar" aria-label="Viewport Tools">
-      <button type="button" class="pill-btn pill-btn-accent btn-exit-vf" id="btn-orbit-mode" data-mode="orbit" hidden>
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="19" y1="12" x2="5" y2="12" /><polyline points="12 19 5 12 12 5" /></svg>
-        <span>3D Orbit</span>
-        <kbd class="kbd-hint">Esc</kbd>
-      </button>
-
-      <button type="button" class="pill-btn btn-enter-vf-quick" id="btn-enter-vp-vf" title="Enter first-person camera lens viewfinder (16–200 mm)">
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
-          <circle cx="12" cy="13" r="4" />
-        </svg>
-        <span>Viewfinder</span>
-      </button>
+      <div class="camera-mode-switch" role="group" aria-label="Camera Perspective">
+        <button type="button" class="cam-mode-btn is-active" id="btn-orbit-mode" data-mode="orbit" title="Aerial 3D terrain overview — orbit trails, ridges &amp; drop pins (Esc)">
+          <span>3D Map</span>
+        </button>
+        <button type="button" class="cam-mode-btn" id="btn-enter-vp-vf" title="Stand at your tripod viewpoint &amp; preview 16–200 mm lenses">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
+            <circle cx="12" cy="13" r="4" />
+          </svg>
+          <span>Tripod</span>
+        </button>
+      </div>
 
       <button type="button" class="icon-btn" id="btn-open-layers" popovertarget="map-layers-popover" title="Map surface, Fog-Sea band &amp; 3D overlays" aria-label="Map Layers">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -807,6 +813,6 @@
     </div>
   </main>
 
-  <script type="module" src="/app.js?v=20261120c"></script>
+  <script type="module" src="/app.js?v=20261121a"></script>
 </body>
 </html>

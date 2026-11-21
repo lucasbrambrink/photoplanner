@@ -90,6 +90,30 @@ button {
   display: none !important;
 }
 
+/* Sleek glass-matched scrollbars (prevents jarring white native scrollbars on dark obsidian) */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.28) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.26);
+  border-radius: 999px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.44);
+}
+
 /* ==========================================================================
    Full-Bleed 3D Stage
    ========================================================================== */
@@ -145,12 +169,17 @@ button {
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-float);
   z-index: 20;
-  overflow: hidden;
+  overflow: visible;
   transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease;
 }
 
 .floating-sheet.is-collapsed .sheet-body {
   display: none;
+}
+
+.floating-sheet.is-collapsed .sheet-header {
+  border-bottom: 0;
+  border-radius: var(--radius-lg);
 }
 
 .floating-sheet.is-collapsed #btn-toggle-sheet svg {
@@ -165,8 +194,11 @@ button {
 }
 
 .sheet-header {
+  position: relative;
+  z-index: 3;
   padding: 12px 14px 10px;
   border-bottom: 1px solid var(--hairline);
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
   display: flex;
   flex-direction: column;
   gap: 9px;
@@ -691,6 +723,9 @@ button {
 .hunt-pill.is-gamble { background: rgba(245, 158, 11, 0.16); color: var(--accent-text); }
 .hunt-pill.is-bust { background: rgba(239, 68, 68, 0.16); color: #fca5a5; }
 
+:root[data-theme="light"] .hunt-pill.is-go { background: rgba(22, 163, 74, 0.14); color: #15803d; }
+:root[data-theme="light"] .hunt-pill.is-bust { background: rgba(220, 38, 38, 0.14); color: #b91c1c; }
+
 .trail-mode-block,
 .gpx-drop-block {
   display: flex;
@@ -847,8 +882,45 @@ button {
   background: rgba(255, 255, 255, 0.1);
 }
 
-.viewport-stage.is-viewfinder .btn-enter-vf-quick {
-  display: none;
+/* Persistent 3D Map | Tripod Camera Perspective Toggle */
+.camera-mode-switch {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  height: 34px;
+  border-radius: var(--radius-pill);
+  background: var(--glass);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--hairline);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.28);
+  gap: 2px;
+}
+
+.cam-mode-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 11px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  transition: background-color 130ms ease, color 130ms ease, border-color 130ms ease;
+}
+
+.cam-mode-btn:hover {
+  color: var(--text);
+}
+
+.cam-mode-btn.is-active {
+  background: var(--accent-soft);
+  border-color: rgba(245, 158, 11, 0.5);
+  color: var(--accent-text);
 }
 
 /* ==========================================================================
@@ -860,8 +932,8 @@ button {
   left: 50%;
   bottom: 16px;
   transform: translateX(-50%);
-  width: min(720px, calc(100vw - 32px));
-  padding: 8px 12px;
+  width: min(760px, calc(100vw - 32px));
+  padding: 6px 12px;
   border-radius: var(--radius-pill);
   background: var(--glass);
   backdrop-filter: blur(20px) saturate(135%);
@@ -869,6 +941,13 @@ button {
   border: 1px solid var(--hairline);
   box-shadow: var(--shadow-float);
   z-index: 21;
+  transition: left 200ms cubic-bezier(0.22, 1, 0.36, 1), width 200ms ease;
+}
+
+/* Shift dock cleanly out of the way when the right-side Atmospheric Lab Drawer is open */
+.viewport-stage.is-lab-open .scrubber-dock {
+  left: calc((100vw - 422px) * 0.5);
+  width: min(680px, calc(100vw - 454px));
 }
 
 .dock-row {
@@ -891,16 +970,20 @@ button {
   flex-shrink: 0;
 }
 
-.dock-play-btn:hover {
+.dock-play-btn:hover,
+.dock-play-btn.is-active {
   border-color: var(--accent);
+  background: var(--accent-soft);
   color: var(--accent-text);
 }
 
 .dock-time-meta {
   display: flex;
   flex-direction: column;
-  min-width: 112px;
+  width: 152px;
+  max-width: 152px;
   flex-shrink: 0;
+  overflow: hidden;
 }
 
 .dock-time-output {
@@ -908,6 +991,8 @@ button {
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .dock-angles {
@@ -915,6 +1000,8 @@ button {
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .dock-angles strong {
@@ -926,14 +1013,24 @@ button {
   flex: 1 1 auto;
   display: flex;
   align-items: center;
-  min-width: 110px;
+  min-width: 140px;
 }
 
-/* Hairline Physical Twilight Gradient Timeline Track */
+/* Generous 28px interactive hitbox with hairline physical twilight gradient track */
 .timeline-range {
   -webkit-appearance: none;
   appearance: none;
   width: 100%;
+  height: 28px;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  outline: none;
+  cursor: pointer;
+  touch-action: none;
+}
+
+.timeline-range::-webkit-slider-runnable-track {
   height: 4px;
   border-radius: var(--radius-pill);
   background: linear-gradient(
@@ -948,28 +1045,50 @@ button {
     #312e81 82%,
     #111827 100%
   );
-  outline: none;
-  cursor: pointer;
+}
+
+.timeline-range::-moz-range-track {
+  height: 4px;
+  border-radius: var(--radius-pill);
+  background: linear-gradient(
+    90deg,
+    #111827 0%,
+    #1e293b 18%,
+    #d97706 26%,
+    #93c5fd 38%,
+    #cbd5e1 50%,
+    #93c5fd 62%,
+    #f59e0b 74%,
+    #312e81 82%,
+    #111827 100%
+  );
 }
 
 .timeline-range::-webkit-slider-thumb {
   -webkit-appearance: none;
-  width: 14px;
-  height: 14px;
+  width: 16px;
+  height: 16px;
+  margin-top: -6px;
   border-radius: 50%;
   background: #ffffff;
   border: 2px solid var(--accent);
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.55);
   cursor: grab;
+  transition: transform 110ms ease;
+}
+
+.timeline-range:active::-webkit-slider-thumb {
+  cursor: grabbing;
+  transform: scale(1.15);
 }
 
 .timeline-range::-moz-range-thumb {
-  width: 14px;
-  height: 14px;
+  width: 16px;
+  height: 16px;
   border-radius: 50%;
   background: #ffffff;
   border: 2px solid var(--accent);
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.55);
   cursor: grab;
 }
 
@@ -1082,7 +1201,7 @@ button {
   align-items: center;
   gap: 2px;
   max-width: calc(100% - 24px);
-  padding: 3px 5px;
+  padding: 3px 6px;
   border-radius: var(--radius-pill);
   background: rgba(9, 12, 18, 0.84);
   backdrop-filter: blur(14px);
@@ -1092,20 +1211,34 @@ button {
   scrollbar-width: none;
 }
 
+.vf-vp-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.vf-divider {
+  width: 1px;
+  height: 16px;
+  background: rgba(255, 255, 255, 0.16);
+  margin: 0 4px;
+  flex-shrink: 0;
+}
+
 .vf-lens-label {
-  padding: 0 6px;
+  padding: 0 5px;
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--text-muted);
+  color: #94a3b8;
 }
 
 .vf-lens-btn {
   border: 1px solid transparent;
   background: transparent;
   color: #e2e8f0;
-  padding: 4px 9px;
+  padding: 4px 8px;
   border-radius: var(--radius-pill);
   font-size: 11.5px;
   font-weight: 600;
@@ -1114,13 +1247,13 @@ button {
 }
 
 .vf-lens-btn:hover {
-  background: rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.1);
 }
 
 .vf-lens-btn.is-active {
-  background: var(--accent-soft);
+  background: rgba(245, 158, 11, 0.22);
   border-color: rgba(245, 158, 11, 0.65);
-  color: var(--accent-text);
+  color: #fde68a;
 }
 
 .vf-unit {

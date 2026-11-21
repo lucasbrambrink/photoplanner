@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { VolumetricAtmosphereEngine } from "./volumetric-engine.js?v=20261117c";
+import { VolumetricAtmosphereEngine } from "./volumetric-engine.js?v=20261121a";
 
 // Conditional Popover API polyfill loader (content-first-noise-reduction)
 if (!Object.hasOwn(HTMLElement.prototype, "popover")) {
@@ -225,10 +225,10 @@ const fogSeaSliceMat = new THREE.ShaderMaterial({
     void main() {
       vec2 centered = (vUv - 0.5) * 2.0;
       float r = length(centered);
-      float edgeFade = 1.0 - smoothstep(0.68, 1.0, r);
-      float contourGrid = abs(fract(vUv.x * 16.0) - 0.5) < 0.015 || abs(fract(vUv.y * 16.0) - 0.5) < 0.015 ? 0.08 : 0.0;
-      vec3 col = mix(uColor, uRimColor, 0.14 + contourGrid);
-      float alpha = clamp((uOpacity + contourGrid * 0.45) * edgeFade, 0.0, 0.72);
+      float edgeFade = 1.0 - smoothstep(0.55, 1.0, r);
+      float subtleRipple = 0.04 * sin(vUv.x * 24.0) * cos(vUv.y * 24.0);
+      vec3 col = mix(uColor, uRimColor, 0.12 + 0.08 * (1.0 - edgeFade));
+      float alpha = clamp((uOpacity + subtleRipple) * edgeFade, 0.0, 0.62);
       if (alpha < 0.01) discard;
       gl_FragColor = vec4(col, alpha);
     }
@@ -2752,8 +2752,26 @@ function updateSunRaysAndShader() {
 
     update3DPositionalClouds(sunDirWorld, elevationDeg, minElevM, fogBaseM, fogTopM, mistCov);
 
-    // Lightweight translucent 3D Fog-Sea Elevation Slice (renders in Fast Mode & Fluid Lab Mode)
-    const fogSliceVisible = band !== "off" && activeFogTopFt > (minElevM * 3.28084 + 35);
+    volumetricEngine.setScrubberKinematics?.({
+      minutesLocal: state.currentMinutes,
+      lowPct: hourlyMet?.cloudLowPct ?? wr?.cloud_low_pct,
+      midPct: wr?.cloud_mid_pct,
+      highPct: wr?.cloud_high_pct,
+      fogPct: wr?.valley_inversion_fog_pct,
+      isScrubbing: isScrubbingTime || state.isPlayingSun,
+    });
+
+    // Lightweight translucent 3D Fog-Sea Elevation Slice — only show when fog top is a true
+    // low-level valley/marine layer near terrain elevations (not a 6,500+ ft mid-level rain deck!)
+    const maxElevM =
+      state.terrainPatch.max_elevation_m ??
+      state.shootReport?.target_landmark?.summit_elevation_m ??
+      (minElevM + 800);
+    const isLowInversionLayer = fogTopM <= maxElevM + 260.0;
+    const fogSliceVisible =
+      band !== "off" &&
+      isLowInversionLayer &&
+      activeFogTopFt > (minElevM * 3.28084 + 35);
     const spanM = state.terrainPatch.span_m || 16000;
     fogSeaSliceMesh.visible = fogSliceVisible;
     if (fogSliceVisible) {
@@ -2769,13 +2787,18 @@ function updateSunRaysAndShader() {
       );
       fogSeaSliceMat.uniforms.uBandTint.value = band === "p10" ? 0.0 : band === "p90" ? 1.0 : 0.5;
       fogSeaSliceMat.uniforms.uOpacity.value = state.showAtmosphere
-        ? 0.16
-        : Math.max(0.22, Math.min(0.56, mistCov * 0.72));
+        ? 0.14
+        : Math.max(0.20, Math.min(0.48, mistCov * 0.65));
     }
 
     const hudFogLabel = document.getElementById("hud-fog-alt-readout");
     if (hudFogLabel) {
-      const bandLabel = band === "off" ? "Fog Off" : `Fog ${band.toUpperCase()} · ${Math.round(activeFogTopFt).toLocaleString()} ft`;
+      const bandLabel =
+        band === "off"
+          ? "Fog Off"
+          : isLowInversionLayer
+            ? `Fog ${band.toUpperCase()} · ${Math.round(activeFogTopFt).toLocaleString()} ft`
+            : `Fog ${band.toUpperCase()} · High`;
       setTextIfChanged(hudFogLabel, "hudFogAlt", bandLabel);
     }
 
@@ -2784,7 +2807,7 @@ function updateSunRaysAndShader() {
       terrainShaderMaterial.uniforms.uFogTopM.value = fogTopM;
       terrainShaderMaterial.uniforms.uFogStrength.value = state.showAtmosphere
         ? Math.min(0.92, mistCov * 1.1)
-        : band !== "off"
+        : fogSliceVisible
           ? Math.min(0.62, mistCov * 0.78)
           : 0.0;
     }
@@ -2823,9 +2846,13 @@ function updateSunRaysAndShader() {
     sunBeamsDynamicExtrasGroup.add(customPinRaySubGroup);
   }
 
+  const labDrawerVisible = Boolean(
+    document.getElementById("lab-drawer") && !document.getElementById("lab-drawer").hidden
+  );
   const astroDisclosureEl = document.getElementById("astro-disclosure");
   const shouldBuildSunBeams =
-    state.showSunBeams || Boolean(weatherDisclosure?.open) || Boolean(astroDisclosureEl?.open);
+    state.showSunBeams ||
+    (labDrawerVisible && (Boolean(weatherDisclosure?.open) || Boolean(astroDisclosureEl?.open)));
 
   const hasDaySunBeams = Boolean(
     shouldBuildSunBeams && state.shootReport && state.terrainPatch && elevationDeg > -1.0
@@ -3119,15 +3146,14 @@ function updateSunRaysAndShader() {
 
   sunBeamsGroup.visible = shouldBuildSunBeams && state.cameraMode === "orbit";
 
-  // Update unified bottom Scrubber & telemetry readouts (diff-guarded against unnecessary DOM layout)
+  // Update unified bottom Scrubber & telemetry readouts (concise so slider width never squishes)
   const hhmm = formatMinutesToHHMM(state.currentMinutes);
   const comp = compassLabel(azimuthDeg);
   const elSign = elevationDeg >= 0 ? "+" : "";
 
   let phaseLabel = "Daylight High Sun";
-  let cliffLitLabel = hourlyMet
-    ? `${hourlyMet.expBeamPct}% Beam · P90 ${hourlyMet.p90Pct}% (${hourlyMet.kelvin}K)`
-    : "82% Direct Light";
+  let shortPhase = "Daylight";
+  let cliffLitLabel = hourlyMet ? `${hourlyMet.expBeamPct}%` : "82%";
   if (elevationDeg < -0.5) {
     const astro = state.shootReport?.astro_night_summary;
     const track = astro?.nightly_celestial_track || [];
@@ -3138,36 +3164,46 @@ function updateSunRaysAndShader() {
       }
     }
     if (elevationDeg >= -5.5 && hourlyMet) {
-      phaseLabel = state.currentMinutes >= 720 ? "Civil Twilight / Cirrus Afterglow" : "Pre-Dawn Civil Twilight";
-      cliffLitLabel = `Afterglow ${hourlyMet.canvasGlow}/100`;
+      phaseLabel = state.currentMinutes >= 720 ? "Civil Twilight / Afterglow" : "Pre-Dawn Twilight";
+      shortPhase = state.currentMinutes >= 720 ? "Twilight" : "Dawn";
+      cliffLitLabel = `Glow ${hourlyMet.canvasGlow}`;
     } else if (bestCel && astro) {
       const [, moonAz, moonEl, gcAz, gcEl] = bestCel;
       if (astro.galactic_core_visible && gcEl > 2.0) {
-        phaseLabel = `Nightscape • Galactic Core Az ${gcAz.toFixed(1)}° (El +${gcEl.toFixed(1)}°)`;
+        phaseLabel = `Nightscape · Galactic Core Az ${gcAz.toFixed(0)}°`;
+        shortPhase = "Milky Way";
       } else if (moonEl > 0.0) {
-        phaseLabel = `Nightscape • ${astro.moon_phase_name} (${astro.moon_illumination_pct}%) Az ${moonAz.toFixed(1)}°`;
+        phaseLabel = `Nightscape · ${astro.moon_phase_name} (${astro.moon_illumination_pct}%)`;
+        shortPhase = "Moonlit";
       } else {
-        phaseLabel = "Deep Alpine Dark-Sky Window";
+        phaseLabel = "Deep Alpine Dark Sky";
+        shortPhase = "Dark Sky";
       }
-      cliffLitLabel = moonEl > 2.0 ? `${astro.moon_illumination_pct}% Moonlit` : "Dark Sky (Stars)";
+      cliffLitLabel = moonEl > 2.0 ? `${astro.moon_illumination_pct}% Moon` : "Stars";
     } else {
-      phaseLabel = "Blue Hour / Night Shadow";
-      cliffLitLabel = "0% (Below Horizon)";
+      phaseLabel = "Blue Hour / Night";
+      shortPhase = "Night";
+      cliffLitLabel = "Night";
     }
   } else if (elevationDeg <= 13.5 && state.currentMinutes >= 900) {
-    phaseLabel = "Sunset Golden Hour / Alpenglow";
-    if (!hourlyMet) cliffLitLabel = "96% Alpenglow";
+    phaseLabel = "Sunset Golden Hour";
+    shortPhase = "Sunset";
+    if (!hourlyMet) cliffLitLabel = "96%";
   } else if (elevationDeg <= 13.5 && state.currentMinutes < 720) {
     phaseLabel = "Sunrise Golden Hour";
-    if (!hourlyMet) cliffLitLabel = "88% Rim Light";
+    shortPhase = "Sunrise";
+    if (!hourlyMet) cliffLitLabel = "88%";
   }
 
   setTextIfChanged(document.getElementById("hud-local-time"), "localTime", `${hhmm} Local`);
   setTextIfChanged(document.getElementById("hud-phase-badge"), "phaseBadge", phaseLabel);
-  setTextIfChanged(document.getElementById("hud-sun-az"), "sunAz", `${azimuthDeg.toFixed(1)}° ${comp}`);
+  setTextIfChanged(document.getElementById("hud-sun-az"), "sunAz", `${Math.round(azimuthDeg)}° ${comp}`);
   setTextIfChanged(document.getElementById("hud-sun-el"), "sunEl", `${elSign}${elevationDeg.toFixed(1)}°`);
   setTextIfChanged(document.getElementById("hud-cliff-lit"), "cliffLit", cliffLitLabel);
-  setTextIfChanged(timeOutput, "scrubberOut", `${hhmm} • ${phaseLabel}`);
+  setTextIfChanged(timeOutput, "scrubberOut", `${hhmm} · ${shortPhase}`);
+  if (timeOutput && timeOutput.title !== `${hhmm} · ${phaseLabel}`) {
+    timeOutput.title = `${hhmm} · ${phaseLabel}`;
+  }
   wakeRenderLoop(false);
 }
 
@@ -3275,8 +3311,84 @@ function applyViewfinderFocalLength(focalMm, refreshReadout = true) {
 }
 
 // ============================================================================
-// Camera Mode Switching (3D Valley Orbit vs. VP1..VP3 or Custom Tripod Viewfinder)
+// Camera Mode Switching (3D Map Aerial Overview vs. Ground-Level Tripod Lens)
 // ============================================================================
+const btnEnterVpVf = document.getElementById("btn-enter-vp-vf");
+
+function configureControlsForMode(isTripod) {
+  if (isTripod) {
+    // Tripod-head pan/tilt: camera pivots smoothly in place instead of orbiting 2 miles away
+    controls.enablePan = false;
+    controls.enableZoom = false;
+    controls.rotateSpeed = -0.35;
+    controls.minDistance = 1.0;
+    controls.maxDistance = 3.0;
+    controls.minPolarAngle = 0.08;
+    controls.maxPolarAngle = Math.PI - 0.08;
+  } else {
+    // Full aerial 3D map exploration
+    controls.enablePan = true;
+    controls.enableZoom = true;
+    controls.rotateSpeed = 0.85;
+    controls.minDistance = 2.5;
+    controls.maxDistance = 68000;
+    controls.minPolarAngle = 0.04;
+    controls.maxPolarAngle = Math.PI * 0.495;
+  }
+}
+
+function aimTripodCamera(eyeWorld, targetOrDir, isDirection = false) {
+  const dir = isDirection
+    ? targetOrDir.clone().normalize()
+    : targetOrDir.clone().sub(eyeWorld).normalize();
+  if (dir.lengthSq() < 1e-6) dir.set(0, 0, -1);
+  configureControlsForMode(true);
+  camera.position.copy(eyeWorld);
+  // Place orbit pivot 2.0m ahead along sightline so dragging smoothly pans/tilts the tripod head
+  controls.target.copy(eyeWorld).addScaledVector(dir, 2.0);
+  controls.update();
+}
+
+function syncCameraModeButtons() {
+  const isOrbit = state.cameraMode === "orbit";
+  if (btnOrbitMode) {
+    btnOrbitMode.hidden = false;
+    btnOrbitMode.classList.toggle("is-active", isOrbit);
+    btnOrbitMode.setAttribute("aria-pressed", String(isOrbit));
+  }
+  if (btnEnterVpVf) {
+    btnEnterVpVf.classList.toggle("is-active", !isOrbit);
+    btnEnterVpVf.setAttribute("aria-pressed", String(!isOrbit));
+  }
+  const vpCount = state.shootReport?.top_viewpoints?.length || 0;
+  document.querySelectorAll("#vf-vp-switcher [data-vf-vp]").forEach((btn) => {
+    const idx = Number(btn.dataset.vfVp);
+    btn.hidden = idx >= vpCount;
+    btn.classList.toggle("is-active", state.cameraMode === `vp-${idx}`);
+  });
+}
+
+// Step through full-frame focal lengths on mouse wheel while standing at a Tripod Viewfinder
+let _lastVfWheelMs = 0;
+renderer.domElement.addEventListener(
+  "wheel",
+  (e) => {
+    if (state.cameraMode === "orbit" || state.cameraMode === "webcam-snap") return;
+    e.preventDefault();
+    const now = performance.now();
+    if (now - _lastVfWheelMs < 130) return;
+    _lastVfWheelMs = now;
+    const curIdx = FULL_FRAME_FOCAL_LENGTHS.indexOf(state.focalLengthMm);
+    const baseIdx = curIdx >= 0 ? curIdx : 2;
+    const delta = e.deltaY < 0 ? 1 : -1; // Scroll up = zoom in (longer focal length)
+    const nextIdx = Math.max(0, Math.min(FULL_FRAME_FOCAL_LENGTHS.length - 1, baseIdx + delta));
+    if (nextIdx !== baseIdx) {
+      applyViewfinderFocalLength(FULL_FRAME_FOCAL_LENGTHS[nextIdx], true);
+    }
+  },
+  { passive: false }
+);
+
 function setCameraMode(mode) {
   state.cameraMode = mode;
   volumetricEngine.invalidateTemporalHistory();
@@ -3286,7 +3398,7 @@ function setCameraMode(mode) {
   syncWebcamGhostOverlay();
 
   if (mode === "orbit") {
-    if (btnOrbitMode) btnOrbitMode.hidden = true;
+    configureControlsForMode(false);
     if (hudClickModeGroup) hudClickModeGroup.hidden = false;
     viewportStageEl?.classList.remove("is-viewfinder", "is-webcam-snap");
     vfOverlay.hidden = true;
@@ -3302,12 +3414,12 @@ function setCameraMode(mode) {
       camera.position.copy(targetPos).add(new THREE.Vector3(-3400, 1520, -3100));
       controls.update();
     }
+    syncCameraModeButtons();
     updateSunRaysAndShader();
     wakeRenderLoop(true);
     return;
   }
 
-  if (btnOrbitMode) btnOrbitMode.hidden = false;
   if (hudClickModeGroup) hudClickModeGroup.hidden = true;
   viewportStageEl?.classList.add("is-viewfinder");
   viewportStageEl?.classList.toggle("is-webcam-snap", mode === "webcam-snap");
@@ -3316,7 +3428,10 @@ function setCameraMode(mode) {
   sunBeamsGroup.visible = false;
 
   const lm = state.shootReport?.target_landmark;
-  if (!lm) return;
+  if (!lm) {
+    syncCameraModeButtons();
+    return;
+  }
 
   if (mode === "webcam-snap") {
     const cam =
@@ -3368,9 +3483,7 @@ function setCameraMode(mode) {
       -Math.cos(azRad) * cosT
     ).normalize();
 
-    camera.position.copy(camWorld);
-    controls.target.copy(camWorld).addScaledVector(dirWorld, 2600.0);
-    controls.update();
+    aimTripodCamera(camWorld, dirWorld, true);
 
     // Sync solar timeline to the active webcam frame timestamp on historical replays
     const frames = cam.timeline_frames || [];
@@ -3382,6 +3495,7 @@ function setCameraMode(mode) {
       timeScrubber.value = String(Math.round(state.currentMinutes));
       syncSliderValue(timeScrubber);
     }
+    syncCameraModeButtons();
     updateSunRaysAndShader();
 
     const posTag = insidePatch ? "EXACT WEBCAM GPS" : "MATCHED AZIMUTH/FOV";
@@ -3398,11 +3512,10 @@ function setCameraMode(mode) {
     vpWorld.y = Math.max(vpWorld.y, meshY) + 14;
 
     const targetWorld = latLonElevToWorld(lm.upper_face_lat, lm.upper_face_lon, lm.upper_face_z_m);
-    camera.position.copy(vpWorld);
-    controls.target.copy(targetWorld);
-    controls.update();
+    aimTripodCamera(vpWorld, targetWorld, false);
 
     vfOverlay.hidden = false;
+    syncCameraModeButtons();
     applyViewfinderFocalLength(pickRecommendedPrimeMm(rep.sightline.recommended_focal_length_mm), true);
     return;
   }
@@ -3413,7 +3526,10 @@ function setCameraMode(mode) {
   highlightSelectedVpCard();
 
   const vp = state.shootReport?.top_viewpoints?.[vpIdx];
-  if (!vp) return;
+  if (!vp) {
+    syncCameraModeButtons();
+    return;
+  }
 
   const vpWorld = latLonElevToWorld(
     vp.viewpoint_lat,
@@ -3429,11 +3545,10 @@ function setCameraMode(mode) {
     lm.upper_face_z_m
   );
 
-  camera.position.copy(vpWorld);
-  controls.target.copy(targetWorld);
-  controls.update();
+  aimTripodCamera(vpWorld, targetWorld, false);
 
   vfOverlay.hidden = false;
+  syncCameraModeButtons();
   applyViewfinderFocalLength(pickRecommendedPrimeMm(vp.sightline.recommended_focal_length_mm), true);
   buildTrailsAndSightlines();
 }
@@ -3450,7 +3565,7 @@ function selectViewpoint(idx, focusOrbit = true) {
   if (focusOrbit && vp && lm) {
     volumetricEngine.invalidateTemporalHistory();
     state.cameraMode = "orbit";
-    if (btnOrbitMode) btnOrbitMode.hidden = true;
+    configureControlsForMode(false);
     if (hudClickModeGroup) hudClickModeGroup.hidden = false;
     viewportStageEl?.classList.remove("is-viewfinder");
     vfOverlay.hidden = true;
@@ -3469,6 +3584,7 @@ function selectViewpoint(idx, focusOrbit = true) {
     controls.target.copy(midPoint);
     camera.position.copy(vpWorld).add(new THREE.Vector3(-900, 1450, 1200));
     controls.update();
+    syncCameraModeButtons();
     updateSunRaysAndShader();
   }
 }
@@ -3488,11 +3604,11 @@ function renderWeatherCard(w) {
   if (!w) return;
   document.getElementById("weather-verdict").textContent = w.verdict;
   document.getElementById("weather-score-badge").textContent = `${w.alpenglow_score} / 100`;
-  document.getElementById("weather-recommendation").textContent = w.recommendation;
+  document.getElementById("weather-recommendation").textContent = String(w.recommendation || "").replace(/`([^`]+)`/g, "$1");
 
   const summarySub = document.getElementById("weather-summary-sub");
   if (summarySub) {
-    summarySub.textContent = `${w.ray_transmittance_pct}% Beam • ${w.temp_sunset_f}°F • Click to inspect 380 km ray corridor`;
+    summarySub.textContent = `${w.ray_transmittance_pct}% Beam • ${w.temp_sunset_f}°F • 380 km ray corridor`;
   }
 
   document.getElementById("raypath-azimuth-label").textContent =
@@ -3506,17 +3622,17 @@ function renderWeatherCard(w) {
     if (w.historical_replay?.is_observed_truth && w.nowcast_status?.active) {
       const stId = w.nowcast_status.metar_station?.id || "ABI";
       const raobId = w.nowcast_status.raob_station?.id ? `+${w.nowcast_status.raob_station.id}` : "";
-      nowcastPillEl.textContent = `📡 Observed Truth (${stId}${raobId})`;
+      nowcastPillEl.textContent = `Observed Truth (${stId}${raobId})`;
     } else if ((w.historical_replay?.hindcast_lead_days || 0) > 0) {
-      nowcastPillEl.textContent = `⏪ +${w.historical_replay.hindcast_lead_days * 24}h Hindcast`;
+      nowcastPillEl.textContent = `+${w.historical_replay.hindcast_lead_days * 24}h Hindcast`;
     } else if (w.nowcast_status?.active) {
       const stId = w.nowcast_status.metar_station?.id || "ABI";
       const wtPct = Math.round((w.nowcast_status.nowcast_blend_weight || 0) * 100);
-      nowcastPillEl.textContent = `📡 GOES-18 + ${stId} (${wtPct}%)`;
+      nowcastPillEl.textContent = `GOES-18 + ${stId} (${wtPct}%)`;
     } else if (w.inversion_model?.is_historical) {
-      nowcastPillEl.textContent = "📚 Historical Archive";
+      nowcastPillEl.textContent = "Historical Archive";
     } else {
-      nowcastPillEl.textContent = "🛰️ 6-Station 380 km";
+      nowcastPillEl.textContent = "6-Station 380 km";
     }
   }
   const directProbEl = document.getElementById("val-direct-beam-prob");
@@ -3833,7 +3949,9 @@ function syncBriefVerdictHero(w) {
 
   const noteEl = document.getElementById("brief-causal-note");
   if (noteEl) {
-    const rawRec = String(w.recommendation || w.verdict || "").trim();
+    const rawRec = String(w.recommendation || w.verdict || "")
+      .replace(/`([^`]+)`/g, "$1")
+      .trim();
     const shortSentence = rawRec.split(/(?<=[.!?])\s+/)[0] || rawRec;
     noteEl.textContent = shortSentence;
   }
@@ -3851,7 +3969,13 @@ function syncBriefVerdictHero(w) {
     const lmElevFt = Math.round(state.shootReport?.target_landmark?.summit_elevation_ft ?? 0);
     if (fogP50 > 0 && lmElevFt > 0) {
       const diff = lmElevFt - fogP50;
-      fogEl.textContent = `${fogP50.toLocaleString()} ft (${diff >= 0 ? "+" : ""}${diff.toLocaleString()})`;
+      if (diff >= 0) {
+        fogEl.textContent = `${fogP50.toLocaleString()} ft (+${diff.toLocaleString()})`;
+      } else if (diff < -1500) {
+        fogEl.textContent = `High Deck (${fogP50.toLocaleString()} ft)`;
+      } else {
+        fogEl.textContent = `${fogP50.toLocaleString()} ft (over)`;
+      }
     } else if (fogP50 > 0) {
       fogEl.textContent = `${fogP50.toLocaleString()} ft`;
     } else {
@@ -4647,25 +4771,25 @@ function renderSidebar() {
 
         <div class="vp-schedule-box">
           <div class="vp-schedule-row">
-            <span>🥾 Depart <strong>${vp.trailhead_name}</strong>:</span>
+            <span>Depart <strong>${vp.trailhead_name}</strong></span>
             <strong>${primarySched.recommended_trailhead_departure_local}</strong>
           </div>
           <div class="vp-schedule-row">
-            <span>📍 Arrive <strong>VP${vp.viewpoint_rank}</strong>:</span>
+            <span>Arrive <strong>VP${vp.viewpoint_rank}</strong></span>
             <strong>${primarySched.target_viewpoint_arrival_local}</strong>
           </div>
           <div class="vp-schedule-row">
-            <span>☀️ Peak Window (${primarySched.phase.split(" ")[0]}):</span>
+            <span>Peak (${primarySched.phase.split(" ")[0]})</span>
             <strong>${primarySched.shooting_window_local}</strong>
           </div>
         </div>
 
         <div class="vp-actions">
           <button type="button" class="vp-btn" data-action="orbit-vp" data-idx="${idx}">
-            Focus in 3D Map
+            Focus on Map
           </button>
           <button type="button" class="vp-btn" data-action="tripod-vp" data-idx="${idx}">
-            📷 Enter Viewfinder
+            Tripod Lens
           </button>
         </div>
       </div>
@@ -4699,8 +4823,10 @@ function renderSidebar() {
 }
 
 // ============================================================================
-// Load Landmark Shoot Plan, 340x340 Terrain Patch & Weather Forecast
+// Load Landmark Shoot Plan, Terrain Patch & Weather Forecast (Non-Blocking)
 // ============================================================================
+let scenarioLoadSeq = 0;
+
 async function fetchBinaryOrJsonTerrainPatch(lat, lon, spanM = 9200, gridSize = 600) {
   try {
     const binRes = await fetch(
@@ -4725,6 +4851,7 @@ async function fetchBinaryOrJsonTerrainPatch(lat, lon, spanM = 9200, gridSize = 
 }
 
 async function loadLandmarkScenario(customCoord = null) {
+  const reqSeq = ++scenarioLoadSeq;
   loadingEl.hidden = false;
   inspectorCard.hidden = true;
   window.getSelection?.()?.removeAllRanges?.();
@@ -4733,6 +4860,7 @@ async function loadLandmarkScenario(customCoord = null) {
   state.replayMode = "truth";
   state.cachedTruthReport = null;
   state.cachedTruthKey = "";
+  state.weatherReport = null;
 
   const lmSel = document.getElementById("landmark-select");
   const dtInp = document.getElementById("shoot-date");
@@ -4744,7 +4872,14 @@ async function loadLandmarkScenario(customCoord = null) {
   } catch (_) {}
 
   const label = customCoord ? customCoord.name : state.landmark;
-  loadingTextEl.textContent = `Ray-casting 1m USGS 3DEP LiDAR & trail sightlines for ${label}…`;
+  loadingTextEl.textContent = `Loading 3D terrain & sightlines for ${label}…`;
+
+  const badgeEl = document.getElementById("brief-verdict-badge");
+  const oddsEl = document.getElementById("brief-light-odds");
+  const noteEl = document.getElementById("brief-causal-note");
+  if (badgeEl) badgeEl.textContent = "SOLVING CORRIDOR";
+  if (oddsEl) oddsEl.textContent = "--%";
+  if (noteEl) noteEl.textContent = "Solving 380 km curved-Earth solar corridor and local inversion height…";
 
   try {
     let planUrl;
@@ -4757,6 +4892,7 @@ async function loadLandmarkScenario(customCoord = null) {
     const planRes = await fetch(planUrl);
     if (!planRes.ok) throw new Error(`API error ${planRes.status}`);
     const report = await planRes.json();
+    if (reqSeq !== scenarioLoadSeq) return;
     state.shootReport = report;
 
     const lm = report.target_landmark;
@@ -4767,24 +4903,14 @@ async function loadLandmarkScenario(customCoord = null) {
     const initReplay = isPast ? "truth" : "auto";
     const truthKey = buildTruthCacheKey(lm.summit_lat, lm.summit_lon, state.date, "sunset");
 
-    const [terrainPatchData, weatherRes] = await Promise.all([
-      fetchBinaryOrJsonTerrainPatch(lm.summit_lat, lm.summit_lon, 9200, 600),
-      fetch(`/api/weather-forecast?lat=${lm.summit_lat}&lon=${lm.summit_lon}&date=${encodeURIComponent(state.date)}&phase=sunset&sun_az=${initAz}&sun_el=${initEl}&elev_m=${lm.summit_elevation_m}&engine=${encodeURIComponent(state.weatherEngine)}&replay_mode=${initReplay}`),
-    ]);
+    // Start weather corridor request in parallel, but render 3D terrain immediately when DEM arrives!
+    const weatherPromise = fetch(
+      `/api/weather-forecast?lat=${lm.summit_lat}&lon=${lm.summit_lon}&date=${encodeURIComponent(state.date)}&phase=sunset&sun_az=${initAz}&sun_el=${initEl}&elev_m=${lm.summit_elevation_m}&engine=${encodeURIComponent(state.weatherEngine)}&replay_mode=${initReplay}`
+    );
 
+    const terrainPatchData = await fetchBinaryOrJsonTerrainPatch(lm.summit_lat, lm.summit_lon, 9200, 600);
+    if (reqSeq !== scenarioLoadSeq) return;
     state.terrainPatch = terrainPatchData;
-
-    if (weatherRes.ok) {
-      state.weatherReport = await weatherRes.json();
-      if (isPast) {
-        state.cachedTruthReport = state.weatherReport;
-        state.cachedTruthKey = truthKey;
-      }
-      _activeCorridorLutSector = null;
-      _lastSyncedFluidMinutes = -999;
-      volumetricEngine.setLiveWeatherReport(state.weatherReport);
-      renderWeatherCard(state.weatherReport);
-    }
 
     if (report.golden_hour_windows && report.golden_hour_windows.length > 0) {
       state.currentMinutes = parseHHMMToMinutes(report.golden_hour_windows[0].peak_time_local);
@@ -4798,12 +4924,47 @@ async function loadLandmarkScenario(customCoord = null) {
     renderSidebar();
     setCameraMode("orbit");
     updateSunRaysAndShader();
-    fetchWebcamTruthForScenario("sunset");
+    loadingEl.hidden = true;
+
+    // Stream weather corridor asynchronously with full error isolation
+    weatherPromise
+      .then(async (weatherRes) => {
+        if (reqSeq !== scenarioLoadSeq) return;
+        if (!weatherRes.ok) throw new Error(`Weather HTTP ${weatherRes.status}`);
+        const wDoc = await weatherRes.json();
+        if (reqSeq !== scenarioLoadSeq) return;
+        state.weatherReport = wDoc;
+        if (isPast) {
+          state.cachedTruthReport = state.weatherReport;
+          state.cachedTruthKey = truthKey;
+        }
+        _activeCorridorLutSector = null;
+        _lastSyncedFluidMinutes = -999;
+        try {
+          volumetricEngine.setLiveWeatherReport(state.weatherReport);
+        } catch (veErr) {
+          console.warn("Volumetric weather sync warning:", veErr);
+        }
+        renderWeatherCard(state.weatherReport);
+        updateSunRaysAndShader();
+        updateViewfinderReadout();
+        fetchWebcamTruthForScenario("sunset");
+      })
+      .catch((wErr) => {
+        if (reqSeq !== scenarioLoadSeq) return;
+        console.warn("Weather corridor fetch failed:", wErr);
+        if (badgeEl) badgeEl.textContent = "FORECAST UNAVAILABLE";
+        if (noteEl) noteEl.textContent = "3D terrain & solar geometry are ready; atmospheric corridor forecast is temporarily unavailable.";
+      });
   } catch (err) {
     console.error("Failed to load scenario:", err);
     document.getElementById("summary-subtitle").textContent = `Error loading scenario: ${err.message}`;
+    if (badgeEl) badgeEl.textContent = "LOAD ERROR";
+    if (noteEl) noteEl.textContent = `Could not load ${label}: ${err.message}`;
   } finally {
-    loadingEl.hidden = true;
+    if (reqSeq === scenarioLoadSeq) {
+      loadingEl.hidden = true;
+    }
   }
 }
 
@@ -5144,7 +5305,7 @@ renderer.domElement.addEventListener("pointerdown", (e) => {
 });
 
 renderer.domElement.addEventListener("pointerup", async (e) => {
-  if (e.button !== 0) return;
+  if (e.button !== 0 || state.cameraMode !== "orbit") return;
   const moveDist = Math.hypot(e.clientX - pointerDownPos.x, e.clientY - pointerDownPos.y);
   if (moveDist > 14 || !terrainMeshRef || !state.terrainPatch || !state.shootReport) return;
 
@@ -5271,6 +5432,14 @@ function scheduleScrubberSettleBake() {
 }
 
 timeScrubber.addEventListener("input", () => {
+  if (state.isPlayingSun) {
+    state.isPlayingSun = false;
+    const pb = document.getElementById("btn-play-sun");
+    if (pb) {
+      pb.textContent = "▶";
+      pb.classList.remove("is-active");
+    }
+  }
   isScrubbingTime = true;
   wakeRenderLoop(true);
   state.currentMinutes = parseFloat(timeScrubber.value);
@@ -5285,6 +5454,9 @@ timeScrubber.addEventListener("input", () => {
 });
 
 timeScrubber.addEventListener("change", () => {
+  state.currentMinutes = parseFloat(timeScrubber.value);
+  syncSliderValue(timeScrubber);
+  updateSunRaysAndShader();
   scheduleScrubberSettleBake();
 });
 
@@ -5435,6 +5607,15 @@ document.querySelectorAll("[data-fog-band]").forEach((btn) => {
 document.querySelectorAll("#vf-lens-bar [data-focal-mm]").forEach((btn) => {
   btn.addEventListener("click", () => {
     applyViewfinderFocalLength(Number(btn.dataset.focalMm), true);
+  });
+});
+
+document.querySelectorAll("#vf-vp-switcher [data-vf-vp]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const idx = Number(btn.dataset.vfVp);
+    if (state.shootReport?.top_viewpoints?.[idx]) {
+      setCameraMode(`vp-${idx}`);
+    }
   });
 });
 
@@ -5853,8 +6034,10 @@ window.addEventListener("keydown", (e) => {
   const labDrawer = document.getElementById("lab-drawer");
   if (labDrawer && !labDrawer.hidden) {
     labDrawer.hidden = true;
+    viewportStageEl?.classList.remove("is-lab-open");
     document.getElementById("btn-open-lab")?.setAttribute("aria-expanded", "false");
     document.getElementById("btn-open-lab")?.classList.remove("is-active");
+    updateSunRaysAndShader();
     return;
   }
   if (state.cameraMode !== "orbit") {
@@ -6354,8 +6537,10 @@ function animate(nowMs = performance.now()) {
   function setLabDrawerOpen(open) {
     if (!labDrawer) return;
     labDrawer.hidden = !open;
+    viewportStageEl?.classList.toggle("is-lab-open", Boolean(open));
     btnOpenLab?.setAttribute("aria-expanded", String(open));
     btnOpenLab?.classList.toggle("is-active", open);
+    updateSunRaysAndShader();
   }
 
   btnOpenLab?.addEventListener("click", () => setLabDrawerOpen(labDrawer?.hidden));
@@ -6414,7 +6599,7 @@ function animate(nowMs = performance.now()) {
             <strong>${escapeFieldCardHtml(spot.name)}</strong>
             <span class="hunt-pill is-${vLower}">${escapeFieldCardHtml(spot.verdict)} · ${p50}%</span>
           </div>
-          <div class="hunt-card-reason">${escapeFieldCardHtml(spot.causal_attribution || spot.primary_phenomenon)}</div>
+          <div class="hunt-card-reason">${escapeFieldCardHtml(String(spot.causal_attribution || spot.primary_phenomenon || "").replace(/`([^`]+)`/g, "$1"))}</div>
         `;
         card.addEventListener("click", () => {
           // If landmark is in selector, jump directly; otherwise load custom coordinate target
@@ -6430,7 +6615,8 @@ function animate(nowMs = performance.now()) {
             state.landmark = matchingOpt.value;
             loadLandmarkScenario();
           } else {
-            loadCustomTargetCoordinate(spot.lat, spot.lon, spot.name);
+            state.landmark = spot.name;
+            loadLandmarkScenario({ lat: spot.lat, lon: spot.lon, name: spot.name });
           }
         });
         resultsEl.appendChild(card);
