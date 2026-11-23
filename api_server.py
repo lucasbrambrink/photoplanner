@@ -345,8 +345,8 @@ def api_tripod_los(
 def api_terrain_patch_bin(
     lat: float = 37.74554,
     lon: float = -119.53315,
-    span_m: float = 9500.0,
-    grid_size: int = 385,
+    span_m: float = 28000.0,
+    grid_size: int = 700,
 ) -> Response:
     payload = legacy_server.run_terrain_patch_binary(lat, lon, span_m, grid_size)
     return Response(
@@ -360,8 +360,8 @@ def api_terrain_patch_bin(
 def api_terrain_patch(
     lat: float = 37.74554,
     lon: float = -119.53315,
-    span_m: float = 9500.0,
-    grid_size: int = 257,
+    span_m: float = 28000.0,
+    grid_size: int = 385,
 ) -> Response:
     payload = legacy_server.run_terrain_patch(lat, lon, span_m, grid_size)
     return Response(content=payload, media_type="application/json")
@@ -371,7 +371,7 @@ def api_terrain_patch(
 def api_usgs_ortho(
     lat: float = 37.74554,
     lon: float = -119.53315,
-    span_m: float = 9500.0,
+    span_m: float = 28000.0,
 ) -> Response:
     jpg = legacy_server.fetch_usgs_ortho_jpeg(lat, lon, span_m)
     return Response(

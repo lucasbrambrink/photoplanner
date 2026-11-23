@@ -263,12 +263,16 @@ def decode_arcgis_f32_geotiff_bytes(
     return res
 
 
+DEFAULT_TERRAIN_SPAN_M = 28000.0
+
+
 def fetch_or_load_full_3dep_raster(
     lat: float, lon: float, span_m: float
 ) -> tuple[int, int, float, float, float, float, object]:
     """Fetches a high-density USGS 3DEP F32 GeoTIFF covering the entire `span_m x span_m` view with matched aspect ratio."""
     import math
 
+    span_m = max(4000.0, min(64000.0, float(span_m)))
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     m_per_lat = 111_132.92
     m_per_lon = 111_412.84 * math.cos(math.radians(lat))
@@ -281,7 +285,12 @@ def fetch_or_load_full_3dep_raster(
     min_lon = lon - dlon
     max_lon = lon + dlon
 
-    h_px = 820
+    if span_m >= 36000.0:
+        h_px = 1440
+    elif span_m >= 18000.0:
+        h_px = 1280
+    else:
+        h_px = 860
     w_px = int(round(h_px * (dlon / dlat)))
     disk_path = CACHE_DIR / f"usgs_3dep_full_{lat:.4f}_{lon:.4f}_{int(span_m)}_{w_px}x{h_px}.tif"
     cache_id = disk_path.name
@@ -296,7 +305,7 @@ def fetch_or_load_full_3dep_raster(
             "&interpolation=+RSP_BilinearInterpolation&f=image"
         )
         req = urllib.request.Request(url, headers={"User-Agent": "PhotoPlanner/0.4"})
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=24) as resp:
             tiff_bytes = resp.read()
         disk_path.write_bytes(tiff_bytes)
     else:
@@ -595,7 +604,7 @@ def build_sf_peninsula_shoot_report(
         meta["lon"] = custom_lon
         meta["name"] = landmark
 
-    raster = fetch_or_load_full_3dep_raster(meta["lat"], meta["lon"], 9200.0)
+    raster = fetch_or_load_full_3dep_raster(meta["lat"], meta["lon"], DEFAULT_TERRAIN_SPAN_M)
     summit_m = sample_geotiff_bilinear(raster, meta["lat"], meta["lon"], is_coastal=True)
     if summit_m < 25.0:
         summit_m = meta["summit_elev_m"]
@@ -794,17 +803,19 @@ def build_sf_peninsula_tripod_los(
 ) -> bytes:
     import math
 
-    raster = fetch_or_load_full_3dep_raster(target_lat, target_lon, 9200.0)
-    tripod_m = sample_geotiff_bilinear(raster, tripod_lat, tripod_lon, is_coastal=True)
-    target_m = sample_geotiff_bilinear(raster, target_lat, target_lon, is_coastal=True)
-
     m_per_lat = 111_132.92
-    m_per_lon = 111_412.84 * math.cos(math.radians(target_lat))
+    m_per_lon = max(10_000.0, 111_412.84 * math.cos(math.radians(target_lat)))
     dy_m = (target_lat - tripod_lat) * m_per_lat
     dx_m = (target_lon - tripod_lon) * m_per_lon
     dist_m = max(50.0, math.hypot(dx_m, dy_m))
     dist_mi = round(dist_m / 1609.344, 2)
     bearing = round((math.degrees(math.atan2(dx_m, dy_m)) + 360.0) % 360.0, 1)
+
+    req_span_m = DEFAULT_TERRAIN_SPAN_M if dist_m <= DEFAULT_TERRAIN_SPAN_M * 0.46 else min(64000.0, max(DEFAULT_TERRAIN_SPAN_M, dist_m * 2.3))
+    is_coastal = is_sf_peninsula_coord(target_lat, target_lon)
+    raster = fetch_or_load_full_3dep_raster(target_lat, target_lon, req_span_m)
+    tripod_m = sample_geotiff_bilinear(raster, tripod_lat, tripod_lon, is_coastal=is_coastal)
+    target_m = sample_geotiff_bilinear(raster, target_lat, target_lon, is_coastal=is_coastal)
 
     num_samples = 64
     profile = []
@@ -817,8 +828,10 @@ def build_sf_peninsula_tripod_los(
         t = i / (num_samples - 1)
         la = tripod_lat + (target_lat - tripod_lat) * t
         lo = tripod_lon + (target_lon - tripod_lon) * t
-        tz = sample_geotiff_bilinear(raster, la, lo, is_coastal=True)
-        rz = start_z + (end_z - start_z) * t
+        tz = sample_geotiff_bilinear(raster, la, lo, is_coastal=is_coastal)
+        d_step = dist_m * t
+        curv_drop = (d_step * (dist_m - d_step)) / (2.0 * 7_349_000.0)
+        rz = start_z + (end_z - start_z) * t - curv_drop
         tft = tz * 3.28084
         rft = rz * 3.28084
         if 2 < i < num_samples - 2:
@@ -920,7 +933,7 @@ def build_universal_dem_shoot_report(
     """Builds a real DEM-raycasted 3D shoot report for any US coordinate without requiring recreation.db."""
     import math
 
-    raster = fetch_or_load_full_3dep_raster(lat, lon, 9200.0)
+    raster = fetch_or_load_full_3dep_raster(lat, lon, DEFAULT_TERRAIN_SPAN_M)
     is_coastal = is_sf_peninsula_coord(lat, lon)
     summit_m = sample_geotiff_bilinear(raster, lat, lon, is_coastal=is_coastal)
     summit_ft = summit_m * 3.28084
@@ -972,7 +985,7 @@ def build_universal_dem_shoot_report(
     # Scan radial DEM ridges around the target summit to find top unobstructed vantage points
     candidates: list[dict] = []
     min_local_m = summit_m
-    for radius_m in (1650.0, 2450.0, 3300.0):
+    for radius_m in (1850.0, 3250.0, 5200.0):
         for az_deg in range(0, 360, 20):
             rad = math.radians(az_deg)
             vp_lat = lat + (math.cos(rad) * radius_m) / m_per_lat
@@ -1348,7 +1361,8 @@ def _compute_terrain_patch_grid(lat: float, lon: float, span_m: float, grid_size
     import math
     import numpy as np
 
-    grid_size = max(240, min(680, grid_size))
+    span_m = max(4000.0, min(64000.0, float(span_m)))
+    grid_size = max(240, min(768, grid_size))
     is_coastal = is_sf_peninsula_coord(lat, lon)
     full_raster = fetch_or_load_full_3dep_raster(lat, lon, span_m)
     core_raster = fetch_or_load_core_3dep_raster(lat, lon)
@@ -1428,8 +1442,9 @@ def run_terrain_patch_binary(lat: float, lon: float, span_m: float, grid_size: i
     Zero-parse binary terrain patch endpoint (`/api/terrain-patch.bin`):
     Packet layout: `[u32_le header_len][UTF-8 JSON header padded to 4B][IEEE-754 float32 LE grid]`.
     """
-    grid_size = max(240, min(680, grid_size))
-    bin_key = f"terrain_3dep_bin_v5:{lat:.4f}:{lon:.4f}:{span_m:.0f}:{grid_size}"
+    span_m = max(4000.0, min(64000.0, float(span_m)))
+    grid_size = max(240, min(768, grid_size))
+    bin_key = f"terrain_3dep_bin_v6:{lat:.4f}:{lon:.4f}:{span_m:.0f}:{grid_size}"
     if bin_key in _CACHE:
         return _CACHE[bin_key]
 
@@ -1446,10 +1461,11 @@ def run_terrain_patch_binary(lat: float, lon: float, span_m: float, grid_size: i
 def run_terrain_patch(lat: float, lon: float, span_m: float, grid_size: int) -> bytes:
     """
     Generates a high-density 100% USGS 3DEP LiDAR-fidelity elevation grid across the ENTIRE `span_m x span_m`
-    scene (`1,035 x 820` base raster + `2,400m` ultra-fine landmark core + any overlapping `1m` LiDAR tiles).
+    scene (wide-area 3DEP base raster + `2,400m` ultra-fine landmark core + any overlapping `1m` LiDAR tiles).
     """
-    grid_size = max(240, min(680, grid_size))
-    cache_key = f"terrain_3dep_v4:{lat:.4f}:{lon:.4f}:{span_m:.0f}:{grid_size}"
+    span_m = max(4000.0, min(64000.0, float(span_m)))
+    grid_size = max(240, min(768, grid_size))
+    cache_key = f"terrain_3dep_v5:{lat:.4f}:{lon:.4f}:{span_m:.0f}:{grid_size}"
     if cache_key in _CACHE:
         return _CACHE[cache_key]
 

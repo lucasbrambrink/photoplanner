@@ -54,6 +54,10 @@ const state = {
   cameraMode: "orbit", // "orbit" | "vp-0" | "vp-1" | "vp-2" | "custom-tripod" | "webcam-snap"
   clickMode: "tripod", // "tripod" | "target"
   surfaceStyle: 0, // 0 = Granite Relief, 1 = USGS Satellite, 2 = Topo Contours
+  terrainSpanM: (() => {
+    const saved = Number(localStorage.getItem("pp_terrain_span_m"));
+    return [12000, 28000, 48000].includes(saved) ? saved : 28000;
+  })(),
   showViewshed: false,
   isPlayingSun: false,
   showSunBeams: false,
@@ -70,6 +74,12 @@ const state = {
   webcamGhostEnabled: false,
   webcamGhostOpacity: 0.38,
 };
+
+function gridSizeForTerrainSpan(spanM) {
+  if (spanM >= 40000) return 768;
+  if (spanM >= 20000) return 700;
+  return 600;
+}
 
 function isPastShootDate(dateStr = state.date) {
   return Boolean(dateStr && dateStr < todayIso);
@@ -143,7 +153,7 @@ const container = document.getElementById("canvas-container");
 const worldScene = new THREE.Scene();
 const scene = worldScene;
 worldScene.background = new THREE.Color(0x060a13);
-worldScene.fog = new THREE.FogExp2(0x0b1930, 0.000009);
+worldScene.fog = new THREE.FogExp2(0x0b1930, 0.0000045);
 
 const overlayScene = new THREE.Scene();
 
@@ -151,9 +161,9 @@ const camera = new THREE.PerspectiveCamera(
   48,
   container.clientWidth / Math.max(container.clientHeight, 1),
   2.0,
-  135000
+  220000
 );
-camera.position.set(-3400, 2500, -2900);
+camera.position.set(-5400, 2900, -4900);
 
 const renderer = new THREE.WebGLRenderer({
   antialias: false,
@@ -167,7 +177,7 @@ container.appendChild(renderer.domElement);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.06;
-controls.maxDistance = 68000;
+controls.maxDistance = 95000;
 controls.minDistance = 2.5;
 controls.target.set(0, 900, 0);
 
@@ -368,7 +378,7 @@ const skyDomeMat = new THREE.ShaderMaterial({
   side: THREE.BackSide,
   depthWrite: false,
 });
-const skyDomeMesh = new THREE.Mesh(new THREE.SphereGeometry(110000, 48, 32), skyDomeMat);
+const skyDomeMesh = new THREE.Mesh(new THREE.SphereGeometry(180000, 48, 32), skyDomeMat);
 atmosphereGroup.add(skyDomeMesh);
 
 // 1x1 fallback white texture before USGS orthoimagery or DEM loads
@@ -1115,7 +1125,7 @@ function buildTerrainMesh() {
   heightTex.minFilter = THREE.LinearFilter;
   heightTex.needsUpdate = true;
 
-  const meshSegs = Math.min(299, Math.max(1, n - 1));
+  const meshSegs = Math.min(512, Math.max(1, n - 1));
   const geoKey = `${meshSegs}_${spanM}`;
   if (cachedTerrainPlaneKey !== geoKey || !cachedTerrainPlaneGeo) {
     cachedTerrainPlaneGeo?.dispose?.();
@@ -2816,7 +2826,7 @@ function updateSunRaysAndShader() {
   // Match scene background & far-field fog to the physical sky horizon phase (Night / Blue Hour / Golden Hour / Day)
   // and modulate volumetric Mie scattering density by live CAMS Aerosol Optical Depth (AOD 550nm)
   const aodVal = hourlyMet?.aod550 ?? wr?.astro_atmosphere?.aod_550nm ?? 0.06;
-  scene.fog.density = 0.000007 + Math.min(0.25, aodVal) * 0.000032;
+  scene.fog.density = 0.0000042 + Math.min(0.25, aodVal) * 0.000024;
 
   if (elevationDeg < -7.0) {
     scene.background.setHex(0x04070e);
@@ -3331,7 +3341,7 @@ function configureControlsForMode(isTripod) {
     controls.enableZoom = true;
     controls.rotateSpeed = 0.85;
     controls.minDistance = 2.5;
-    controls.maxDistance = 68000;
+    controls.maxDistance = 95000;
     controls.minPolarAngle = 0.04;
     controls.maxPolarAngle = Math.PI * 0.495;
   }
@@ -3410,8 +3420,12 @@ function setCameraMode(mode) {
     if (state.shootReport && state.terrainPatch) {
       const lm = state.shootReport.target_landmark;
       const targetPos = latLonElevToWorld(lm.summit_lat, lm.summit_lon, lm.summit_elevation_m);
+      const spanM = state.terrainPatch.span_m || 28000;
+      const orbitDist = Math.min(8200, Math.max(3600, spanM * 0.21));
       controls.target.copy(targetPos).add(new THREE.Vector3(0, 260, 0));
-      camera.position.copy(targetPos).add(new THREE.Vector3(-3400, 1520, -3100));
+      camera.position.copy(targetPos).add(
+        new THREE.Vector3(-orbitDist * 0.74, orbitDist * 0.44, -orbitDist * 0.68)
+      );
       controls.update();
     }
     syncCameraModeButtons();
@@ -4827,7 +4841,7 @@ function renderSidebar() {
 // ============================================================================
 let scenarioLoadSeq = 0;
 
-async function fetchBinaryOrJsonTerrainPatch(lat, lon, spanM = 9200, gridSize = 600) {
+async function fetchBinaryOrJsonTerrainPatch(lat, lon, spanM = 28000, gridSize = 700) {
   try {
     const binRes = await fetch(
       `/api/terrain-patch.bin?lat=${lat}&lon=${lon}&span_m=${spanM}&grid_size=${gridSize}`
@@ -4908,7 +4922,13 @@ async function loadLandmarkScenario(customCoord = null) {
       `/api/weather-forecast?lat=${lm.summit_lat}&lon=${lm.summit_lon}&date=${encodeURIComponent(state.date)}&phase=sunset&sun_az=${initAz}&sun_el=${initEl}&elev_m=${lm.summit_elevation_m}&engine=${encodeURIComponent(state.weatherEngine)}&replay_mode=${initReplay}`
     );
 
-    const terrainPatchData = await fetchBinaryOrJsonTerrainPatch(lm.summit_lat, lm.summit_lon, 9200, 600);
+    const activeSpanM = state.terrainSpanM || 28000;
+    const terrainPatchData = await fetchBinaryOrJsonTerrainPatch(
+      lm.summit_lat,
+      lm.summit_lon,
+      activeSpanM,
+      gridSizeForTerrainSpan(activeSpanM)
+    );
     if (reqSeq !== scenarioLoadSeq) return;
     state.terrainPatch = terrainPatchData;
 
@@ -5593,6 +5613,62 @@ function setFogSliceBand(band) {
   updateSunRaysAndShader();
   wakeRenderLoop(true);
 }
+
+let terrainSpanReloadSeq = 0;
+
+function syncTerrainSpanButtons() {
+  document.querySelectorAll("[data-terrain-span]").forEach((btn) => {
+    btn.classList.toggle("is-active", Number(btn.dataset.terrainSpan) === state.terrainSpanM);
+  });
+}
+
+async function setTerrainSpanM(spanM) {
+  const validSpan = [12000, 28000, 48000].includes(Number(spanM)) ? Number(spanM) : 28000;
+  if (validSpan === state.terrainSpanM && state.terrainPatch?.span_m === validSpan) return;
+  state.terrainSpanM = validSpan;
+  try {
+    localStorage.setItem("pp_terrain_span_m", String(validSpan));
+  } catch (_) {}
+  syncTerrainSpanButtons();
+
+  const lm = state.shootReport?.target_landmark;
+  if (!lm) return;
+  const reqId = ++terrainSpanReloadSeq;
+  loadingEl.hidden = false;
+  loadingTextEl.textContent = `Expanding 3D terrain to ${(validSpan / 1000).toFixed(0)} × ${(validSpan / 1000).toFixed(0)} km…`;
+  try {
+    const patch = await fetchBinaryOrJsonTerrainPatch(
+      lm.summit_lat,
+      lm.summit_lon,
+      validSpan,
+      gridSizeForTerrainSpan(validSpan)
+    );
+    if (reqId !== terrainSpanReloadSeq) return;
+    state.terrainPatch = patch;
+    buildTerrainMesh();
+    buildTrailsAndSightlines();
+    if (state.customTripodReport && !inspectorCard.hidden) {
+      renderCustomTripodPinAndCrossSection(state.customTripodReport);
+    }
+    setCameraMode(state.cameraMode);
+    updateSunRaysAndShader();
+    wakeRenderLoop(true);
+  } catch (err) {
+    console.error("Failed to reload terrain span:", err);
+  } finally {
+    if (reqId === terrainSpanReloadSeq) {
+      loadingEl.hidden = true;
+    }
+  }
+}
+
+syncTerrainSpanButtons();
+
+document.querySelectorAll("[data-terrain-span]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    setTerrainSpanM(Number(btn.dataset.terrainSpan));
+  });
+});
 
 document.getElementById("toggle-atmosphere")?.addEventListener("change", (e) => {
   setFluidLabEnabled(e.target.checked);
