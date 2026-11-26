@@ -77,9 +77,11 @@ const state = {
   showWebcamCard: false,
   webcamGhostEnabled: false,
   webcamGhostOpacity: 0.38,
-  pinnedArchetypeId: null, // null = Auto (Most Likely); string = pinned 3D archetype preview
+  forecastRealization: "p50", // "p10" (thicker/blocked) | "p50" (expected holistic) | "p90" (clearer/optimistic)
+  pinnedArchetypeId: null, // kept for alert deep-link metadata; renderer runs continuously from physical state
   activeArchetypeId: "filtered_gold",
   activeArchetypeDist: null,
+  activePhysicalAtmo: null,
 };
 
 const LIGHT_ARCHETYPE_ORDER = [
@@ -835,9 +837,47 @@ atmosphereGroup.add(hybridGodRaysGroup);
 let activeHybridGodRayMaterials = [];
 let _lastHybridGodRaysKey = "";
 
+// Shared 380 km Rust Radiative-Transfer Corridor LUT GLSL helper (used by both Sky Dome & Terrain)
+const CORRIDOR_LUT_GLSL1 = /* glsl */ `
+  uniform sampler2D uCorridorLutTex;
+  uniform float uHasCorridorHorizon;
+  uniform float uUseCorridorAtmo;
+  uniform float uCorridorLutSunElDeg;
+
+  vec4 sampleCorridorLut(float azimuthDeg, float zAslM) {
+    float uAz = fract(azimuthDeg / 360.0) + (0.5 / 180.0);
+    float vNorm = pow(clamp(max(0.0, zAslM) / 12500.0, 0.0, 1.0), 1.0 / 1.6);
+    float vAlt = vNorm * (31.0 / 32.0) + (0.5 / 32.0);
+    return texture2D(uCorridorLutTex, vec2(uAz, vAlt));
+  }
+
+  float decodeCorridorHorizonDeg(float alphaByteNorm) {
+    return -6.0 + 32.0 * alphaByteNorm;
+  }
+
+  vec3 computeCorridorAtmoModulation(vec3 lutRgb, float zAslM) {
+    float dipDeg = 1.015 * sqrt(max(0.0, zAslM * 0.001));
+    float locEl = clamp(uCorridorLutSunElDeg + dipDeg * 0.52, -1.8, 89.0);
+    float sinEl = sin(radians(max(0.0, locEl)));
+    float amRay = exp(-max(0.0, zAslM) / 8434.0) / (sinEl + 0.15 * pow(max(0.25, locEl + 3.885), -1.253));
+    float amAer = exp(-max(0.0, zAslM) / 1800.0) * 0.72 / (sinEl + 0.09 * pow(max(0.25, locEl + 2.2), -1.15));
+    float o3Slant = 12.2 / sqrt(1.0 + 150.0 * sinEl * sinEl);
+    vec3 tauRef = vec3(0.056, 0.110, 0.220) * amRay
+                + vec3(0.036, 0.045, 0.056) * amAer
+                + vec3(0.026, 0.020, 0.002) * o3Slant;
+    vec3 clearRef = exp(-tauRef);
+    float redMod   = clamp(lutRgb.r / max(0.032, clearRef.r), 0.0, 1.30);
+    float greenMod = mix(redMod, clamp(lutRgb.g / max(0.025, clearRef.g), 0.0, 1.30), smoothstep(0.02, 0.08, clearRef.g));
+    float blueMod  = mix(greenMod, clamp(lutRgb.b / max(0.025, clearRef.b), 0.0, 1.30), smoothstep(0.02, 0.08, clearRef.b));
+    return vec3(redMod, greenMod, blueMod);
+  }
+`;
+
 // ============================================================================
-// Hybrid Physical + 7-Archetype Atmospheric Sky Dome (60 FPS Always-On)
-// Renders unmistakable sky canopies for all 7 Light Archetypes in 3D Map & Tripod views.
+// Unified Continuous Physical Radiative-Transfer Sky Dome (60 FPS Always-On)
+// Synthesizes 380 km corridor beam + 3 local cloud decks (Low Cumulus/Stratus,
+// Mid Altocumulus, High Cirrus Veil) + emergent radial Mie crepuscular scattering
+// + horizon mist/fog continuously for every weather combination.
 // ============================================================================
 const SKY_DOME_VERTEX = /* glsl */ `
   varying vec3 vWorldDir;
@@ -853,19 +893,25 @@ const SKY_DOME_FRAGMENT = /* glsl */ `
   varying vec3 vWorldDir;
   uniform vec3 uSunDirWorld;
   uniform float uSunElDeg;
-  uniform float uVisualSunElDeg;
+  uniform float uSunAzDeg;
   uniform vec3 uMoonDirWorld;
   uniform float uMoonElDeg;
   uniform float uMoonIllum;
   uniform float uCloudTime;
-  uniform vec3 uArchSkyZenith;
-  uniform vec3 uArchSkyHorizon;
-  uniform float uArchSkyBlend;
-  uniform float uArchOvercast;
-  uniform float uArchStorm;
-  uniform float uArchCirrus;
-  uniform float uArchMist;
-  uniform float uArchSunDiskScale;
+  uniform vec2 uWindDirENU;
+
+  // Continuous physical forecast inputs (for active P10 / P50 / P90 realization)
+  uniform float uBeamTrans;      // 0..1 corridor solar transmittance
+  uniform float uBeamSpread;     // 0..1 corridor uncertainty / convective fracture
+  uniform float uLowCloud;       // 0..1 local low stratus / cumulus fraction
+  uniform float uMidCloud;       // 0..1 local mid altocumulus / altostratus fraction
+  uniform float uHighCloud;      // 0..1 local high cirrus / veil fraction
+  uniform float uHighTau;        // 0..4 cirrus optical depth
+  uniform float uFogImmersion;   // 0..1 local valley/coastal fog immersion
+  uniform float uAodHaze;        // 0..1 CAMS aerosol + humid Mie haze
+  uniform float uCanvasGlow;     // 0..1 overhead cloud-canvas illumination potential
+  uniform vec3 uHorizonTint;     // synced with scene.fog.color for seamless horizon dissolve
+${CORRIDOR_LUT_GLSL1}
 
   float starHash(vec3 p) {
     p = fract(p * vec3(443.897, 441.423, 437.195));
@@ -896,154 +942,312 @@ const SKY_DOME_FRAGMENT = /* glsl */ `
     mat2 rot = mat2(0.80, 0.60, -0.60, 0.80);
     for (int i = 0; i < 4; i++) {
       v += a * skyNoise(p);
-      p = rot * p * 2.08;
+      p = rot * p * 2.06;
       a *= 0.5;
     }
     return v;
   }
 
+  float skyFbmFast(vec2 p) {
+    float v = 0.55 * skyNoise(p);
+    p = mat2(0.80, 0.60, -0.60, 0.80) * p * 2.12;
+    v += 0.30 * skyNoise(p);
+    p = mat2(0.80, 0.60, -0.60, 0.80) * p * 2.08;
+    v += 0.15 * skyNoise(p);
+    return v;
+  }
+
+  float hgPhase(float cosTheta, float g) {
+    float g2 = g * g;
+    float denom = max(0.04, 1.0 + g2 - 2.0 * g * cosTheta);
+    return (1.0 - g2) / (4.0 * 3.14159265 * pow(denom, 1.5));
+  }
+
+  // Curved-Earth spherical shell UV projection so clouds naturally foreshorten toward the horizon
+  vec2 cloudShellUv(vec3 d, float shellAltKm) {
+    float yPos = max(d.y, 0.0);
+    float rNorm = shellAltKm / 6371.0;
+    float pathLen = sqrt(yPos * yPos + 2.0 * rNorm) - yPos;
+    // Clamp grazing distance so horizon clouds never alias into infinite frequency
+    float distKm = min(pathLen * 6371.0, shellAltKm * 15.0 + 36.0);
+    return (d.xz * distKm) / max(3.5, shellAltKm * 4.8);
+  }
+
+  // Physical incident solar spectrum reaching a cloud deck at altitude altKm (Rayleigh + Chappuis ozone + 380km corridor LUT)
+  vec3 incidentSunAtAlt(float altKm, out float corridorAccess) {
+    // Curved-Earth horizon dip: high cirrus at 9.5 km still sees sun ~3.1 deg higher than sea level!
+    float dipDeg = 1.015 * sqrt(max(0.0, altKm));
+    float elLoc = uSunElDeg + dipDeg;
+    float vis = smoothstep(-3.8, 0.6, elLoc);
+    if (vis <= 0.001) {
+      corridorAccess = 0.0;
+      return vec3(0.0);
+    }
+
+    float sinEl = sin(radians(max(elLoc, 0.08)));
+    float am = clamp(1.0 / (sinEl + 0.14 * pow(max(0.15, elLoc + 3.6), -1.2)), 1.0, 32.0);
+    // Physical Rayleigh + aerosol + ozone Chappuis (absorbs green/orange at low sun -> magenta/crimson-violet!)
+    float altDecay = exp(-altKm / 7.8);
+    vec3 tau = vec3(0.046, 0.118, 0.258) * (am * (0.45 + 0.55 * altDecay))
+             + vec3(0.045, 0.068, 0.095) * (uAodHaze * am * 0.45)
+             + vec3(0.024, 0.030, 0.004) * min(am, 16.0);
+    vec3 spec = exp(-tau);
+    // Boost crimson-rose-magenta Chappuis sunset chromaticity right near elLoc -2..+5 deg
+    float twilightRed = smoothstep(-3.2, 0.8, elLoc) * (1.0 - smoothstep(4.5, 13.0, elLoc));
+    vec3 sunsetChroma = mix(vec3(1.0, 0.34, 0.42), vec3(1.0, 0.68, 0.30), smoothstep(-1.5, 4.5, elLoc));
+    spec = mix(spec, max(spec, sunsetChroma * 0.88), twilightRed * 0.58);
+
+    // Couple with real 380 km Rust radiative-transfer corridor LUT when near sunrise/sunset
+    float corrTrans = uBeamTrans;
+    vec3 corrTint = vec3(1.0);
+    if (uUseCorridorAtmo > 0.5) {
+      float nearLut = 1.0 - smoothstep(8.0, 22.0, abs(uSunElDeg - uCorridorLutSunElDeg));
+      vec4 lut = sampleCorridorLut(uSunAzDeg, altKm * 1000.0);
+      vec3 cMod = computeCorridorAtmoModulation(lut.rgb, altKm * 1000.0);
+      float cLum = clamp(dot(cMod, vec3(0.54, 0.34, 0.12)), 0.0, 1.25);
+      // Higher cloud decks clear distant low-cloud blockers more easily than ground level
+      float altBoost = mix(uBeamTrans, max(uBeamTrans, min(1.0, uBeamTrans * 1.25 + 0.14 * (altKm / 10.0))), smoothstep(2.0, 9.5, altKm));
+      corrTrans = mix(altBoost, clamp(mix(altBoost, cLum, 0.55), 0.02, 1.15), nearLut);
+      corrTint = mix(vec3(1.0), clamp(cMod / max(0.08, cLum), 0.45, 1.38), nearLut * 0.65);
+    } else {
+      corrTrans = mix(uBeamTrans, min(1.0, uBeamTrans * 1.18 + 0.08 * (altKm / 10.0)), smoothstep(2.0, 9.5, altKm));
+    }
+
+    corridorAccess = clamp(corrTrans * vis, 0.0, 1.15);
+    return spec * corrTint * corridorAccess;
+  }
+
+  // Fast billowing low+mid cumulus silhouette used BOTH for cloud rendering AND radial crepuscular raymarch
+  float sampleCumulusOccluder(vec3 d, float drift) {
+    if (d.y < -0.02 || (uLowCloud < 0.03 && uMidCloud < 0.08)) return 0.0;
+    vec2 uv = cloudShellUv(d, 1.8) + uWindDirENU * (drift * 0.45);
+    float n1 = skyFbmFast(uv * 0.42 + vec2(1.7, -0.9));
+    float n2 = skyFbmFast(uv * 1.18 - vec2(drift * 0.25, -drift * 0.15));
+    // Billowing cauliflower profile when fractured; smoother continuous blanket when overcast
+    float billow = mix(n1 * 0.72 + n2 * 0.28, n1 * 0.55 + (1.0 - abs(n2 * 2.0 - 1.0)) * 0.45, uBeamSpread);
+    float effCov = clamp(max(uLowCloud, uMidCloud * 0.68), 0.0, 1.0);
+    float thresh = mix(0.76, 0.18, effCov);
+    float softness = mix(0.14, 0.28, 1.0 - uBeamSpread * 0.55);
+    float horizonFade = smoothstep(-0.02, 0.09, d.y);
+    return smoothstep(thresh, thresh + softness, billow) * horizonFade * smoothstep(0.03, 0.18, effCov);
+  }
+
   void main() {
     vec3 dir = normalize(vWorldDir);
-    float y = clamp(dir.y, -0.15, 1.0);
-    float horizonFactor = pow(1.0 - clamp(y, 0.0, 1.0), 2.8);
+    float y = clamp(dir.y, -0.25, 1.0);
+    float horizonFactor = pow(1.0 - clamp(y, 0.0, 1.0), 2.65);
     vec3 sunDir = normalize(uSunDirWorld);
     float sunCos = clamp(dot(dir, sunDir), -1.0, 1.0);
     float antiSunCos = clamp(dot(dir, -sunDir), 0.0, 1.0);
-    float effEl = uVisualSunElDeg;
+    float el = uSunElDeg;
+    float drift = uCloudTime * 0.018;
 
-    float tBlueHour = smoothstep(-8.5, -1.5, effEl) * (1.0 - smoothstep(1.0, 7.5, effEl));
-    float tGolden = smoothstep(-1.5, 3.0, effEl) * (1.0 - smoothstep(9.0, 18.0, effEl));
-    float tDay = smoothstep(8.0, 20.0, effEl);
-    float tNight = 1.0 - smoothstep(-8.0, -1.0, effEl);
+    // 1. Physical Clear-Sky Rayleigh + Chappuis Ozone + Aerosol Haze Base
+    float tNight = 1.0 - smoothstep(-10.5, -2.5, el);
+    float tBlueHour = smoothstep(-10.5, -3.5, el) * (1.0 - smoothstep(-0.5, 6.5, el));
+    float tGolden = smoothstep(-2.8, 2.2, el) * (1.0 - smoothstep(8.5, 18.0, el));
+    float tDay = smoothstep(7.0, 20.0, el);
+    float wSum = max(tNight + tBlueHour + tGolden + tDay, 0.001);
 
-    vec3 zenithNight = vec3(0.015, 0.030, 0.072);
-    vec3 zenithBlueHour = vec3(0.045, 0.145, 0.35);
-    vec3 zenithGolden = vec3(0.085, 0.24, 0.50);
-    vec3 zenithDay = vec3(0.13, 0.36, 0.70);
+    vec3 zenithCol = (
+      vec3(0.012, 0.024, 0.060) * tNight +
+      vec3(0.042, 0.125, 0.340) * tBlueHour +
+      vec3(0.082, 0.235, 0.520) * tGolden +
+      vec3(0.105, 0.335, 0.720) * tDay
+    ) / wSum;
 
-    vec3 horizNight = vec3(0.04, 0.075, 0.15);
-    vec3 horizBlueHour = vec3(0.15, 0.28, 0.52);
-    vec3 horizGolden = vec3(0.34, 0.43, 0.60);
-    vec3 horizDay = vec3(0.46, 0.65, 0.86);
+    vec3 horizCol = (
+      vec3(0.028, 0.052, 0.110) * tNight +
+      vec3(0.165, 0.255, 0.520) * tBlueHour +
+      vec3(0.380, 0.435, 0.580) * tGolden +
+      vec3(0.470, 0.675, 0.880) * tDay
+    ) / wSum;
 
-    vec3 zenithCol = zenithNight * tNight + zenithBlueHour * tBlueHour + zenithGolden * tGolden + zenithDay * tDay;
-    vec3 horizCol = horizNight * tNight + horizBlueHour * tBlueHour + horizGolden * tGolden + horizDay * tDay;
-    float weightSum = max(tNight + tBlueHour + tGolden + tDay, 0.001);
-    zenithCol /= weightSum;
-    horizCol /= weightSum;
-
-    // Blend in active Light Archetype atmospheric palette
-    zenithCol = mix(zenithCol, uArchSkyZenith, uArchSkyBlend);
-    horizCol = mix(horizCol, uArchSkyHorizon, uArchSkyBlend);
-
+    // Aerosol / coastal haze whitens and warms/cools the horizon naturally
+    vec3 hazeHorizonCol = mix(vec3(0.55, 0.64, 0.74), vec3(0.76, 0.83, 0.89), tDay) * (0.28 + 0.72 * smoothstep(-6.0, 6.0, el));
+    horizCol = mix(horizCol, hazeHorizonCol, clamp(uAodHaze * 0.55, 0.0, 0.62));
     vec3 skyCol = mix(zenithCol, horizCol, horizonFactor);
 
-    // Belt of Venus & Earth's twilight shadow wedge (strong in Blue Hour & Filtered Gold)
-    float clearBelts = 1.0 - max(uArchOvercast, uArchStorm * 0.8);
-    float beltBand = exp(-pow((y - 0.09) / 0.09, 2.0)) * pow(antiSunCos, 1.3);
-    skyCol = mix(skyCol, vec3(0.72, 0.42, 0.70), beltBand * (tBlueHour * 0.72 + tGolden * 0.38) * clearBelts);
+    // Anti-solar Belt of Venus (rose-magenta ozone scatter) & Earth's deep indigo shadow wedge
+    float clearSkyOpen = 1.0 - clamp(max(uLowCloud, uMidCloud * 0.85), 0.0, 0.92);
+    float beltBand = exp(-pow((y - 0.085) / 0.085, 2.0)) * pow(antiSunCos, 1.3);
+    skyCol = mix(skyCol, vec3(0.76, 0.40, 0.68), beltBand * (tBlueHour * 0.72 + tGolden * 0.42) * clearSkyOpen);
+    float earthShadow = smoothstep(0.07, -0.02, y) * pow(antiSunCos, 1.2);
+    skyCol = mix(skyCol, vec3(0.042, 0.088, 0.235), earthShadow * (tBlueHour * 0.75 + tGolden * 0.44) * clearSkyOpen);
 
-    float earthShadowBand = smoothstep(0.08, -0.02, y) * pow(antiSunCos, 1.2);
-    skyCol = mix(skyCol, vec3(0.045, 0.095, 0.24), earthShadowBand * (tBlueHour * 0.72 + tGolden * 0.42) * clearBelts);
+    // Circumsolar Mie forward scatter & horizon twilight glow (gated by real corridor beam transmittance!)
+    float sunGlowVis = smoothstep(-6.5, 2.2, el);
+    float mieCore = pow(max(sunCos, 0.0), 7.5) * exp(-abs(y) * 2.5);
+    float mieBroad = pow(max(sunCos, 0.0), 2.0) * horizonFactor;
+    vec3 dawnDuskGlow = mix(vec3(0.96, 0.30, 0.26), vec3(1.0, 0.76, 0.36), smoothstep(-2.5, 7.5, el));
+    float corridorGlowFactor = 0.14 + 0.86 * clamp(uBeamTrans, 0.0, 1.0);
+    float overcastDamp = 1.0 - smoothstep(0.68, 0.96, uLowCloud) * (1.0 - uBeamSpread * 0.65);
+    skyCol += dawnDuskGlow * (mieCore * 0.68 + mieBroad * (0.36 + 0.28 * uAodHaze)) * sunGlowVis * corridorGlowFactor * overcastDamp;
 
-    // Circumsolar Mie forward scattering & golden-crimson twilight glow
-    float sunGlowVis = smoothstep(-7.5, 2.0, effEl);
-    float mieCore = pow(max(sunCos, 0.0), 8.0) * exp(-abs(y) * 2.8);
-    float mieBroad = pow(max(sunCos, 0.0), 2.1) * horizonFactor;
-    vec3 dawnDuskGlow = mix(vec3(0.98, 0.36, 0.20), vec3(1.0, 0.78, 0.38), smoothstep(-3.0, 7.0, effEl));
-    float glowSuppression = 1.0 - uArchOvercast * 0.88;
-    skyCol += dawnDuskGlow * (mieCore * 0.72 + mieBroad * 0.42) * sunGlowVis * glowSuppression;
-
-    // Procedural Sky-Dome Cloud Canopies (projected onto upper dome — < 0.08ms GPU at 60 FPS)
-    if (y > -0.02 && (uArchOvercast > 0.02 || uArchStorm > 0.02 || uArchCirrus > 0.02)) {
-      vec2 skyUv = dir.xz / max(0.14, y + 0.16);
-      float drift = uCloudTime * 0.015;
-      float horizonFade = smoothstep(-0.02, 0.12, y);
-
-      // 1. Giant Softbox: Thick, uniform cool 6500-7500K overcast stratus blanket
-      if (uArchOvercast > 0.02) {
-        float ov1 = skyFbm(skyUv * 1.15 + vec2(drift, drift * 0.4));
-        float ov2 = skyFbm(skyUv * 2.8 - vec2(drift * 0.6, 0.0));
-        vec3 ovDark = vec3(0.48, 0.54, 0.62);
-        vec3 ovBright = vec3(0.74, 0.80, 0.87);
-        vec3 ovCol = mix(ovDark, ovBright, smoothstep(0.25, 0.82, ov1 * 0.7 + ov2 * 0.3));
-        ovCol = mix(ovCol, vec3(0.68, 0.74, 0.82), horizonFactor * 0.55);
-        skyCol = mix(skyCol, ovCol, clamp(uArchOvercast * (0.82 + 0.18 * horizonFade), 0.0, 0.98));
-      }
-
-      // 2. Clearing Storm: Brooding dark storm cloud slabs with fractured silver-gold sun breaks
-      if (uArchStorm > 0.02) {
-        float stMacro = skyFbm(skyUv * 1.35 + vec2(drift * 1.2, -drift * 0.5));
-        float stDetail = skyFbm(skyUv * 3.6 - vec2(drift * 1.8, drift * 0.9));
-        float stormCov = smoothstep(0.34, 0.70, stMacro * 0.72 + stDetail * 0.28);
-        float breakEdge = smoothstep(0.28, 0.44, stMacro) * (1.0 - smoothstep(0.48, 0.68, stMacro));
-        vec3 stormBase = mix(vec3(0.10, 0.14, 0.22), vec3(0.24, 0.30, 0.40), stDetail);
-        vec3 silverRim = mix(vec3(0.95, 0.88, 0.74), vec3(1.0, 0.70, 0.28), clamp(pow(max(sunCos, 0.0), 1.6), 0.0, 1.0));
-        vec3 stormCol = mix(stormBase, silverRim, clamp(breakEdge * (0.55 + 0.85 * pow(max(sunCos, 0.0), 2.0)), 0.0, 0.95));
-        // Bright glowing sun-break windows between dark storm slabs
-        float sunWindow = (1.0 - stormCov) * pow(max(sunCos, 0.0), 3.0);
-        skyCol += vec3(1.0, 0.82, 0.44) * sunWindow * uArchStorm * 0.65;
-        skyCol = mix(skyCol, stormCol, stormCov * uArchStorm * (0.72 + 0.24 * horizonFade));
-      }
-
-      // 3. High Thin Veil & Filtered Gold Alpenglow Cirrus: Silky upper-tropospheric streaks
-      if (uArchCirrus > 0.02) {
-        vec2 ciUv = vec2(skyUv.x * 2.4 + skyUv.y * 0.65, skyUv.y * 0.85 - skyUv.x * 0.35);
-        float ci1 = skyFbm(ciUv * 1.4 + vec2(drift * 1.6, 0.0));
-        float ci2 = skyFbm(ciUv * 3.2 - vec2(drift * 0.8, 0.2));
-        float veilMask = smoothstep(0.32, 0.76, ci1 * 0.65 + ci2 * 0.35) * horizonFade;
-        vec3 cirrusDayCol = mix(vec3(0.84, 0.88, 0.92), vec3(0.98, 0.95, 0.89), pow(max(sunCos, 0.0), 2.0));
-        vec3 cirrusGoldCol = mix(vec3(0.96, 0.46, 0.26), vec3(1.0, 0.80, 0.42), pow(max(sunCos, 0.0), 1.5));
-        vec3 cirrusCol = mix(cirrusDayCol, cirrusGoldCol, clamp(tGolden * 0.92 + tBlueHour * 0.55, 0.0, 1.0));
-        // High thin veil creates a continuous 1-2 stop luminous scrim across the sky
-        float scrimFloor = 0.26 * uArchCirrus * (1.0 - tGolden * 0.5);
-        skyCol = mix(skyCol, cirrusCol, clamp((veilMask * 0.72 + scrimFloor) * uArchCirrus, 0.0, 0.82));
-      }
-    }
-
-    // 4. Atmospheric Diffusion: Luminous milky pearl-mist veil lifting from horizon
-    if (uArchMist > 0.02) {
-      float mistBand = pow(1.0 - clamp(y, 0.0, 1.0), 1.45);
-      vec3 mistCol = mix(vec3(0.76, 0.84, 0.90), vec3(0.88, 0.92, 0.95), mistBand);
-      skyCol = mix(skyCol, mistCol, clamp(uArchMist * (0.25 + 0.68 * mistBand), 0.0, 0.92));
-      // Broad soft diffused solar halo through mist
-      float mistHalo = pow(max(sunCos, 0.0), 3.2) * uArchMist * smoothstep(-2.0, 6.0, effEl);
-      skyCol += vec3(0.96, 0.93, 0.86) * mistHalo * 0.32;
-    }
-
-    // Physical limb-darkened Solar Disk & inner corona (scaled by archetype cloud screening)
-    if (effEl > -1.4 && y > -0.04 && uArchSunDiskScale > 0.01) {
+    // 2. Solar Disk & Aureole (behind clouds, attenuated naturally by clouds & corridor)
+    float skyCloudOcc = 0.0;
+    if (el > -1.4 && y > -0.03) {
       float angDeg = degrees(acos(clamp(sunCos, -1.0, 1.0)));
-      float diskMask = 1.0 - smoothstep(0.24, 0.34, angDeg);
-      float aureole = exp(-angDeg / 1.35) * 0.55 + exp(-angDeg / 4.2) * 0.18;
-      float sinEl = sin(radians(max(effEl, 0.12)));
-      float airMass = clamp(1.0 / (sinEl + 0.12 * pow(max(0.0, effEl + 2.8), -0.75)), 1.0, 28.0);
+      float diskMask = 1.0 - smoothstep(0.24, 0.36, angDeg);
+      float aureole = exp(-angDeg / 1.45) * 0.55 + exp(-angDeg / 4.8) * (0.16 + 0.22 * uAodHaze);
+      float sinEl = sin(radians(max(el, 0.12)));
+      float airMass = clamp(1.0 / (sinEl + 0.12 * pow(max(0.0, el + 2.8), -0.75)), 1.0, 28.0);
       vec3 sunExt = exp(-vec3(0.048, 0.122, 0.255) * airMass);
-      float horizonCut = smoothstep(-1.2, 0.15, effEl);
-      skyCol += sunExt * (diskMask * 4.2 + aureole * 1.15) * horizonCut * uArchSunDiskScale;
+      float horizonCut = smoothstep(-1.2, 0.15, el);
+      float diskVis = clamp(uBeamTrans, 0.0, 1.0) * (1.0 - smoothstep(0.72, 0.96, uLowCloud));
+      skyCol += sunExt * (diskMask * 4.2 + aureole * 1.15) * horizonCut * diskVis;
     }
 
-    // Physical Lunar Disk & soft nocturnal aureole
-    if (uMoonElDeg > -0.8 && uMoonIllum > 0.03 && effEl < -2.0 && y > -0.02 && uArchOvercast < 0.6) {
+    // 3. Lunar Disk in twilight / night
+    if (uMoonElDeg > -0.8 && uMoonIllum > 0.03 && el < -2.0 && y > -0.02) {
       vec3 moonDir = normalize(uMoonDirWorld);
       float moonCos = clamp(dot(dir, moonDir), -1.0, 1.0);
       float mAng = degrees(acos(moonCos));
-      float mDisk = 1.0 - smoothstep(0.24, 0.33, mAng);
-      float mGlow = exp(-mAng / 1.8) * 0.25;
-      skyCol += vec3(0.84, 0.90, 1.0) * (mDisk * 1.6 + mGlow) * uMoonIllum * smoothstep(-0.6, 1.0, uMoonElDeg);
+      float mDisk = 1.0 - smoothstep(0.24, 0.34, mAng);
+      float mGlow = exp(-mAng / 1.9) * 0.24;
+      skyCol += vec3(0.84, 0.90, 1.0) * (mDisk * 1.55 + mGlow) * uMoonIllum * smoothstep(-0.6, 1.0, uMoonElDeg);
     }
 
+    // 4. Three Physically-Lit Local Cloud Decks (far-to-near compositing: High Cirrus -> Mid Altocumulus -> Low Cumulus/Stratus)
+    float dayAmbient = 0.06 + 0.94 * smoothstep(-8.5, 6.0, el);
+    vec3 skyAmbientTop = mix(vec3(0.14, 0.22, 0.38), vec3(0.60, 0.72, 0.86), smoothstep(-4.0, 14.0, el)) * dayAmbient;
+
+    if (y > -0.02) {
+      float horizonFade = smoothstep(-0.02, 0.09, y);
+
+      // --- DECK 3: High Cirrus & Alpenglow Veil (~9.5 km ASL) ---
+      if (uHighCloud > 0.04) {
+        float highAccess = 0.0;
+        vec3 highSun = incidentSunAtAlt(9.5, highAccess);
+        vec2 ciUv = cloudShellUv(dir, 9.5) + uWindDirENU * (drift * 0.95);
+        vec2 streakUv = vec2(ciUv.x * 1.65 + ciUv.y * 0.45, ciUv.y * 0.65 - ciUv.x * 0.25);
+        float c1 = skyFbm(streakUv * 0.55 + vec2(2.1, -0.7));
+        float c2 = skyFbm(streakUv * 1.45 - vec2(drift * 0.4, 0.15));
+        float ciThresh = mix(0.68, 0.24, uHighCloud);
+        float ciFilaments = smoothstep(ciThresh, ciThresh + 0.28, c1 * 0.65 + c2 * 0.35);
+        // Optically thin continuous scrim when high cloud cover is high
+        float scrimFloor = smoothstep(0.40, 0.92, uHighCloud) * clamp(uHighTau * 0.22, 0.05, 0.38) * (1.0 - smoothstep(2.8, 5.5, uHighTau));
+        float ciAlpha = clamp((ciFilaments * 0.78 + scrimFloor) * smoothstep(0.04, 0.22, uHighCloud) * horizonFade, 0.0, 0.86);
+
+        // When the 380 km corridor is open at 9.5 km, cirrus ignites warm gold -> crimson -> violet-magenta!
+        // When blocked by a distant storm wall (highAccess ~ 0), it renders flat cool grey.
+        float ciForward = 0.42 + 0.72 * pow(max(sunCos, 0.0), 3.0);
+        vec3 ciLit = highSun * (1.15 + 0.55 * uCanvasGlow) * ciForward;
+        vec3 ciShadow = skyAmbientTop * mix(0.75, 0.52, clamp(uHighTau * 0.25, 0.0, 1.0));
+        vec3 ciCol = ciShadow + ciLit * (0.48 + 0.52 * (1.0 - ciFilaments * 0.45));
+        skyCol = mix(skyCol, ciCol, ciAlpha);
+        skyCloudOcc = max(skyCloudOcc, ciAlpha * 0.55);
+      }
+
+      // --- DECK 2: Mid Altocumulus / Altostratus (~4.5 km ASL) ---
+      if (uMidCloud > 0.04) {
+        float midAccess = 0.0;
+        vec3 midSun = incidentSunAtAlt(4.5, midAccess);
+        vec2 mUv = cloudShellUv(dir, 4.5) + uWindDirENU * (drift * 0.65);
+        float m1 = skyFbm(mUv * 0.48 + vec2(-1.4, 2.3));
+        float m2 = skyFbm(mUv * 1.35 + vec2(drift * 0.2, -0.3));
+        float mDensity = m1 * 0.68 + m2 * 0.32;
+        float mThresh = mix(0.72, 0.22, uMidCloud);
+        float mAlpha = smoothstep(mThresh, mThresh + 0.22, mDensity) * smoothstep(0.04, 0.20, uMidCloud) * horizonFade;
+
+        // Sunlit undersides ignite fiery crimson-orange at sunset when far corridor is open; cool slate when blocked
+        float mThick = smoothstep(mThresh, min(0.98, mThresh + 0.42), mDensity);
+        float mEdge = (1.0 - mThick * 0.65) * (0.48 + 0.85 * pow(max(sunCos, 0.0), 3.5));
+        vec3 mShadow = mix(vec3(0.14, 0.19, 0.30), vec3(0.36, 0.43, 0.54), smoothstep(-3.0, 12.0, el)) * dayAmbient;
+        vec3 mCol = mix(mShadow * (0.72 + 0.28 * (1.0 - mThick)), mShadow * 0.58 + midSun * (1.18 + 0.45 * uCanvasGlow) * mEdge, clamp(0.25 + 0.75 * midAccess, 0.0, 1.0));
+        skyCol = mix(skyCol, mCol, clamp(mAlpha * 0.92, 0.0, 0.94));
+        skyCloudOcc = max(skyCloudOcc, mAlpha * 0.85);
+      }
+
+      // --- EMERGENT RADIAL MIE CREPUSCULAR SCATTERING (Behind & Around Broken Low/Mid Clouds) ---
+      // Strictly physics-driven: emerges whenever broken clouds + sunlit corridor + aerosols coexist!
+      float lowMidCov = max(uLowCloud, uMidCloud * 0.72);
+      float crepWeight = smoothstep(0.12, 0.36, lowMidCov)
+                       * (1.0 - smoothstep(0.84, 0.98, uLowCloud * (1.0 - uBeamSpread * 0.45)))
+                       * smoothstep(0.12, 0.48, uBeamTrans)
+                       * smoothstep(-3.2, 2.5, el);
+      float crepShaftLight = 0.0;
+      if (crepWeight > 0.01 && sunCos > 0.12) {
+        // Interleaved gradient noise dither removes banding across 14 radial steps
+        float dither = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+        float shaftAcc = 0.0;
+        float wAcc = 0.0;
+        for (int s = 0; s < 14; s++) {
+          float tStep = (float(s) + dither) / 14.0;
+          // Sample along spherical arc from sky pixel toward sun
+          vec3 sampleDir = normalize(mix(dir, sunDir, tStep * 0.82));
+          float occ = sampleCumulusOccluder(sampleDir, drift);
+          float decay = exp(-tStep * 1.45);
+          shaftAcc += (1.0 - occ) * decay;
+          wAcc += decay;
+        }
+        float shaftRatio = shaftAcc / max(wAcc, 0.001);
+        // Contrast the sunlit air shafts against the shadowed cloud-turret wedges
+        float shaftContrast = smoothstep(0.18, 0.88, shaftRatio);
+        float mieScat = hgPhase(sunCos, 0.72) * 1.85 + pow(max(sunCos, 0.0), 3.0) * 0.45;
+        float hazeGain = 0.32 + 0.88 * uAodHaze;
+        crepShaftLight = clamp(shaftContrast * mieScat * crepWeight * hazeGain * horizonFade, 0.0, 1.35);
+
+        float rayAccess = 0.0;
+        vec3 raySunCol = incidentSunAtAlt(2.2, rayAccess);
+        vec3 shaftRgb = mix(vec3(0.85, 0.93, 1.0), raySunCol * 1.35, 0.65);
+        // Background sky shafts glow cleanly behind foreground clouds
+        skyCol += shaftRgb * crepShaftLight * (0.48 + 0.32 * (1.0 - skyCloudOcc));
+      }
+
+      // --- DECK 1: Low Stratus / Billowing Cumulus (~1.5 km ASL) ---
+      if (uLowCloud > 0.04) {
+        float lowAccess = 0.0;
+        vec3 lowSun = incidentSunAtAlt(1.5, lowAccess);
+        vec2 lUv = cloudShellUv(dir, 1.8) + uWindDirENU * (drift * 0.45);
+        float l1 = skyFbm(lUv * 0.42 + vec2(1.7, -0.9));
+        float l2 = skyFbm(lUv * 1.18 - vec2(drift * 0.25, -drift * 0.15));
+        float billow = mix(l1 * 0.72 + l2 * 0.28, l1 * 0.55 + (1.0 - abs(l2 * 2.0 - 1.0)) * 0.45, uBeamSpread);
+        float lThresh = mix(0.76, 0.18, uLowCloud);
+        float lSoft = mix(0.12, 0.26, 1.0 - uBeamSpread * 0.55);
+        float lAlpha = smoothstep(lThresh, lThresh + lSoft, billow) * smoothstep(0.04, 0.18, uLowCloud) * horizonFade;
+
+        // Optical thickness inside the cloud turret: thin edges catch blazing silver-gold forward scatter,
+        // thick undersides show cool cerulean-slate Rayleigh sky shadow!
+        float lThick = smoothstep(lThresh, min(0.99, lThresh + 0.46), billow);
+        // Smooth transition from billowing cumulus (broken) to uniform cool 6800K softbox blanket (sealed overcast)
+        float isUniformOvercast = smoothstep(0.76, 0.95, uLowCloud) * (1.0 - uBeamSpread * 0.65);
+
+        // Beer-Lambert + powder silver-lining effect on cloud rims facing the sun
+        float rimPowder = (1.0 - exp(-2.2 * (1.0 - lThick * 0.72))) * exp(-1.15 * lThick);
+        float silverRim = rimPowder * (0.35 + 1.95 * pow(max(sunCos, 0.0), 4.5) + 0.9 * hgPhase(sunCos, 0.76));
+
+        vec3 bellyBlue = mix(vec3(0.11, 0.18, 0.30), vec3(0.32, 0.46, 0.64), smoothstep(-3.0, 14.0, el)) * dayAmbient;
+        vec3 overcastCol = mix(vec3(0.44, 0.51, 0.60), vec3(0.70, 0.76, 0.84), smoothstep(0.22, 0.82, billow)) * dayAmbient;
+        vec3 cumulusCol = mix(bellyBlue * (0.68 + 0.32 * (1.0 - lThick)), bellyBlue * 0.78 + lowSun * (0.95 + 1.45 * silverRim), clamp(0.18 + 0.82 * lowAccess, 0.0, 1.0));
+        vec3 lowCol = mix(cumulusCol, overcastCol, isUniformOvercast);
+
+        // Blend subtle foreground haze crepuscular in-scattering across lower sunlit cloud faces
+        lowCol += lowSun * crepShaftLight * 0.14 * (1.0 - isUniformOvercast);
+
+        skyCol = mix(skyCol, lowCol, clamp(lAlpha * 0.97, 0.0, 0.98));
+        skyCloudOcc = max(skyCloudOcc, lAlpha);
+      }
+    }
+
+    // 5. Local Coastal / Valley Fog & Atmospheric Diffusion Band rising from horizon
+    float mistStrength = clamp(uFogImmersion * 0.85 + uAodHaze * 0.35, 0.0, 1.0);
+    if (mistStrength > 0.04) {
+      float mistBand = pow(1.0 - clamp(y, 0.0, 1.0), 1.55);
+      vec3 mistDay = mix(vec3(0.72, 0.80, 0.88), vec3(0.86, 0.90, 0.94), mistBand);
+      vec3 mistGold = mix(vec3(0.76, 0.60, 0.52), vec3(0.90, 0.74, 0.58), mistBand);
+      vec3 mistCol = mix(mistDay, mistGold, tGolden * uBeamTrans * 0.75) * (0.14 + 0.86 * smoothstep(-7.5, 4.0, el));
+      skyCol = mix(skyCol, mistCol, clamp(mistStrength * (0.15 + 0.72 * mistBand), 0.0, 0.90));
+    }
+
+    // 6. Seamless below-horizon atmospheric dissolve synced with scene.fog color
     if (y < 0.0) {
-      vec3 belowHorizCol = mix(
-        skyCol * 0.72,
-        uArchSkyHorizon * mix(0.72, 0.92, clamp(uArchMist + uArchOvercast * 0.65, 0.0, 1.0)),
-        clamp(0.45 + uArchSkyBlend * 0.45, 0.0, 0.92)
-      );
-      skyCol = mix(skyCol, belowHorizCol, clamp(-y * 4.5, 0.0, 1.0));
+      vec3 belowCol = mix(skyCol * 0.78, uHorizonTint, 0.65);
+      skyCol = mix(skyCol, belowCol, clamp(-y * 4.5, 0.0, 1.0));
     }
 
-    // Procedural starfield in deep twilight / Blue Hour / night
-    float starVis = smoothstep(-1.2, -5.5, effEl) * smoothstep(0.04, 0.32, y) * (1.0 - max(uArchOvercast, uArchStorm * 0.85));
+    // 7. Procedural Starfield in clear twilight / Blue Hour / night (occluded naturally by real cloud decks!)
+    float starVis = smoothstep(-1.5, -6.0, el) * smoothstep(0.04, 0.30, y) * (1.0 - clamp(skyCloudOcc, 0.0, 0.95));
     if (starVis > 0.01) {
       vec3 starCell = floor(dir * 420.0);
       float h = starHash(starCell);
@@ -1063,19 +1267,23 @@ const skyDomeMat = new THREE.ShaderMaterial({
   uniforms: {
     uSunDirWorld: { value: new THREE.Vector3(-0.9, 0.05, 0.2).normalize() },
     uSunElDeg: { value: 0.5 },
-    uVisualSunElDeg: { value: 0.5 },
+    uSunAzDeg: { value: 258.0 },
     uMoonDirWorld: { value: new THREE.Vector3(-0.6, 0.35, 0.4).normalize() },
     uMoonElDeg: { value: -10.0 },
     uMoonIllum: { value: 0.25 },
     uCloudTime: { value: 0.0 },
-    uArchSkyZenith: { value: new THREE.Color(0x1a386b) },
-    uArchSkyHorizon: { value: new THREE.Color(0xd97236) },
-    uArchSkyBlend: { value: 0.72 },
-    uArchOvercast: { value: 0.0 },
-    uArchStorm: { value: 0.0 },
-    uArchCirrus: { value: 0.65 },
-    uArchMist: { value: 0.15 },
-    uArchSunDiskScale: { value: 1.0 },
+    uWindDirENU: { value: new THREE.Vector2(0.88, -0.46) },
+    uBeamTrans: { value: 0.65 },
+    uBeamSpread: { value: 0.35 },
+    uLowCloud: { value: 0.18 },
+    uMidCloud: { value: 0.22 },
+    uHighCloud: { value: 0.42 },
+    uHighTau: { value: 0.85 },
+    uFogImmersion: { value: 0.12 },
+    uAodHaze: { value: 0.22 },
+    uCanvasGlow: { value: 0.55 },
+    uHorizonTint: { value: new THREE.Color(0x52647a) },
+    ...volumetricEngine.corridorUniforms,
   },
   side: THREE.BackSide,
   depthWrite: false,
@@ -1116,41 +1324,6 @@ spatialCloudTex.needsUpdate = true;
 function computeDynamicCloudSlant(sunDirY, horizLen = 1.0) {
   return Math.min(8.2, Math.max(0.35, horizLen / Math.max(0.11, sunDirY)));
 }
-
-const CORRIDOR_LUT_GLSL1 = /* glsl */ `
-  uniform sampler2D uCorridorLutTex;
-  uniform float uHasCorridorHorizon;
-  uniform float uUseCorridorAtmo;
-  uniform float uCorridorLutSunElDeg;
-
-  vec4 sampleCorridorLut(float azimuthDeg, float zAslM) {
-    float uAz = fract(azimuthDeg / 360.0) + (0.5 / 180.0);
-    float vNorm = pow(clamp(max(0.0, zAslM) / 12500.0, 0.0, 1.0), 1.0 / 1.6);
-    float vAlt = vNorm * (31.0 / 32.0) + (0.5 / 32.0);
-    return texture2D(uCorridorLutTex, vec2(uAz, vAlt));
-  }
-
-  float decodeCorridorHorizonDeg(float alphaByteNorm) {
-    return -6.0 + 32.0 * alphaByteNorm;
-  }
-
-  vec3 computeCorridorAtmoModulation(vec3 lutRgb, float zAslM) {
-    float dipDeg = 1.015 * sqrt(max(0.0, zAslM * 0.001));
-    float locEl = clamp(uCorridorLutSunElDeg + dipDeg * 0.52, -1.8, 89.0);
-    float sinEl = sin(radians(max(0.0, locEl)));
-    float amRay = exp(-max(0.0, zAslM) / 8434.0) / (sinEl + 0.15 * pow(max(0.25, locEl + 3.885), -1.253));
-    float amAer = exp(-max(0.0, zAslM) / 1800.0) * 0.72 / (sinEl + 0.09 * pow(max(0.25, locEl + 2.2), -1.15));
-    float o3Slant = 12.2 / sqrt(1.0 + 150.0 * sinEl * sinEl);
-    vec3 tauRef = vec3(0.056, 0.110, 0.220) * amRay
-                + vec3(0.036, 0.045, 0.056) * amAer
-                + vec3(0.026, 0.020, 0.002) * o3Slant;
-    vec3 clearRef = exp(-tauRef);
-    float redMod   = clamp(lutRgb.r / max(0.032, clearRef.r), 0.0, 1.30);
-    float greenMod = mix(redMod, clamp(lutRgb.g / max(0.025, clearRef.g), 0.0, 1.30), smoothstep(0.02, 0.08, clearRef.g));
-    float blueMod  = mix(greenMod, clamp(lutRgb.b / max(0.025, clearRef.b), 0.0, 1.30), smoothstep(0.02, 0.08, clearRef.b));
-    return vec3(redMod, greenMod, blueMod);
-  }
-`;
 
 const createDefaultCloudGapsUniform = () =>
   Array.from({ length: 6 }, () => new THREE.Vector4(0, 0, 600, 0));
@@ -1476,13 +1649,15 @@ const TERRAIN_FRAGMENT_SHADER = /* glsl */ `
     }
 
     vec3 corrChromaTint = vec3(1.0);
-    if (uUseCorridorAtmo > 0.5 && uUseFluidShadows > 0.5) {
+    if (uUseCorridorAtmo > 0.5) {
       float sunAzDeg = mod(degrees(atan(uSunDirENU.x, uSunDirENU.y)) + 360.0, 360.0);
+      float sunElNow = degrees(asin(clamp(uSunDirENU.z, -1.0, 1.0)));
+      float nearLut = 1.0 - smoothstep(8.0, 22.0, abs(sunElNow - uCorridorLutSunElDeg));
       vec4 corr = sampleCorridorLut(sunAzDeg, z);
       vec3 corrMod = computeCorridorAtmoModulation(corr.rgb, z);
       float corrBeamStrength = clamp(dot(corrMod, vec3(0.55, 0.33, 0.12)), 0.0, 1.25);
-      cloudTransmittance *= clamp(corrBeamStrength, 0.03, 1.18);
-      corrChromaTint = mix(vec3(1.0), clamp(corrMod / max(0.08, corrBeamStrength), 0.35, 1.45), 0.85);
+      cloudTransmittance *= mix(1.0, clamp(corrBeamStrength, 0.08, 1.18), nearLut * 0.65);
+      corrChromaTint = mix(vec3(1.0), clamp(corrMod / max(0.08, corrBeamStrength), 0.42, 1.42), nearLut * 0.72);
     }
 
     float isThickOvercast = smoothstep(1.25, 2.6, uMeanCloudTau);
@@ -3657,26 +3832,243 @@ function setTextIfChanged(el, cacheField, nextVal) {
   }
 }
 
+function _lerpColorHex(hexA, hexB, t, out = new THREE.Color()) {
+  const cA = new THREE.Color(hexA);
+  const cB = new THREE.Color(hexB);
+  return out.copy(cA).lerp(cB, _lfClamp(t, 0, 1));
+}
+
+function computePhysicalAtmosphereState(minutes, elevationDeg, hourlyMet, realization = "p50") {
+  const wr = state.weatherReport;
+  const inv = wr?.inversion_model || {};
+  const realKey = realization === "p10" || realization === "p90" ? realization : "p50";
+  const lmElevFt =
+    state.shootReport?.target_landmark?.summit_elevation_ft ??
+    inv.target_elev_ft ??
+    (state.terrainPatch?.max_elevation_m ? state.terrainPatch.max_elevation_m * 3.28084 : 1500);
+
+  // Pull raw hourly or primary forecast fields
+  const baseP10 = hourlyMet?.p10Pct ?? wr?.calibrated_probabilities?.transmittance_p10_pct ?? wr?.transmittance_p10_pct ?? 35;
+  const baseP50 = hourlyMet?.p50Pct ?? wr?.calibrated_probabilities?.transmittance_p50_pct ?? wr?.transmittance_p50_pct ?? 62;
+  const baseP90 = hourlyMet?.p90Pct ?? wr?.calibrated_probabilities?.transmittance_p90_pct ?? wr?.transmittance_p90_pct ?? 86;
+  const baseLow = hourlyMet?.cloudLowPct ?? wr?.cloud_low_pct ?? 18;
+  const baseMid = hourlyMet?.cloudMidPct ?? wr?.cloud_mid_pct ?? 18;
+  const baseHigh = hourlyMet?.cloudHighPct ?? wr?.cloud_high_pct ?? 35;
+  const baseFogPct = hourlyMet?.fogPct ?? wr?.valley_inversion_fog_pct ?? baseLow;
+  const baseHighTau = hourlyMet?.highOpticalDepth ?? wr?.fluid_atmosphere_params?.highOpticalDepth ?? (baseHigh / 100) * 1.1;
+  const baseVisMi = hourlyMet?.visibilityMiles ?? wr?.visibility_miles ?? 18;
+  const baseRh = hourlyMet?.rhPct ?? inv.rh_2m_pct ?? 58;
+  const baseAod = hourlyMet?.aod550 ?? wr?.astro_atmosphere?.aod_550nm ?? 0.07;
+  const baseCanvas = hourlyMet?.canvasGlow ?? wr?.canvas_score ?? 52;
+  const fogP50Ft = hourlyMet?.fogTopFt ?? inv.fog_top_p50_ft ?? inv.fog_top_ft ?? 1250;
+  const fogP10Ft = inv.fog_top_p10_ft ?? Math.max(120, fogP50Ft - 320);
+  const fogP90Ft = inv.fog_top_p90_ft ?? (fogP50Ft + 320);
+
+  // Realization shifts the genuine physical forecast ensemble envelope (P10 = thicker/higher fog/lower beam, P90 = clearer/lower fog/higher beam)
+  const beamPct = realKey === "p10" ? baseP10 : realKey === "p90" ? baseP90 : baseP50;
+  const beamTrans = _lfClamp(beamPct / 100, 0.02, 1.0);
+  const spreadPct = Math.max(0, baseP90 - baseP10);
+  const beamSpread = _lfClamp(spreadPct / 68.0, 0.0, 1.0);
+
+  const cloudShift = realKey === "p10" ? 16 : realKey === "p90" ? -16 : 0;
+  const lowPct = _lfClamp(baseLow + cloudShift, 0, 100);
+  const midPct = _lfClamp(baseMid + cloudShift * 0.75, 0, 100);
+  const highPct = _lfClamp(baseHigh + cloudShift * 0.35, 0, 100);
+  const fogPct = _lfClamp(baseFogPct + cloudShift * 0.85, 0, 100);
+  const visMi = _lfClamp(baseVisMi * (realKey === "p10" ? 0.68 : realKey === "p90" ? 1.32 : 1.0), 0.3, 45.0);
+  const fogTopFt = realKey === "p10" ? fogP90Ft : realKey === "p90" ? fogP10Ft : fogP50Ft;
+
+  const lowCloud = lowPct / 100;
+  const midCloud = midPct / 100;
+  const highCloud = highPct / 100;
+  const highTau = Math.max(0, baseHighTau * (realKey === "p10" ? 1.25 : realKey === "p90" ? 0.78 : 1.0));
+  const canvasGlow = _lfClamp((baseCanvas / 100) * (0.30 + 0.70 * beamTrans), 0, 1);
+
+  const clearanceFt = fogTopFt > 0 ? lmElevFt - fogTopFt : 9999;
+  const aboveFogSea = fogTopFt > 0 && clearanceFt >= 120;
+  const lowOverhead = aboveFogSea && (inv.is_coastal || (inv.inversion_delta_t_f ?? 0) >= 1.2) ? lowCloud * 0.22 : lowCloud;
+  const opaqueOverhead = 1.0 - (1.0 - lowOverhead) * (1.0 - midCloud);
+  const lowMidCover = Math.max(lowCloud, midCloud * 0.75);
+
+  // Local fog immersion & aerosol Mie haze
+  const visFog = _lfSmoothstep(10.0, 1.2, visMi);
+  const buriedFog = fogTopFt > 0 ? _lfSmoothstep(220, -220, clearanceFt) * (fogPct / 100) : 0;
+  const fogImmersion = _lfClamp(Math.max(visFog * 0.92, buriedFog * 0.88), 0, 1);
+  const aodHaze = _lfClamp(
+    _lfSmoothstep(0.04, 0.42, baseAod) * 0.65 + _lfSmoothstep(20.0, 4.0, visMi) * 0.45 + _lfSmoothstep(62, 95, baseRh) * 0.28,
+    0,
+    1
+  );
+
+  // Solar phase blending weights
+  const el = elevationDeg;
+  const tNight = 1.0 - _lfSmoothstep(-10.5, -2.5, el);
+  const tBlueHour = _lfSmoothstep(-10.5, -3.5, el) * (1.0 - _lfSmoothstep(-0.5, 6.5, el));
+  const tGolden = _lfSmoothstep(-2.8, 2.2, el) * (1.0 - _lfSmoothstep(8.5, 18.0, el));
+  const tDay = _lfSmoothstep(7.0, 20.0, el);
+
+  // Continuous physical regimes (no hardcoded snaps — every mix blends smoothly!)
+  const overcastWrap = _lfSmoothstep(0.55, 0.94, opaqueOverhead) * (1.0 - _lfSmoothstep(0.28, 0.70, beamTrans));
+  const cirrusScrim = _lfSmoothstep(0.24, 0.75, highCloud) * (1.0 - _lfSmoothstep(3.2, 6.5, highTau)) * (1.0 - overcastWrap);
+  const brokenStorm =
+    _lfSmoothstep(0.16, 0.50, lowMidCover) *
+    (1.0 - _lfSmoothstep(0.84, 0.98, lowCloud * (1.0 - beamSpread * 0.45))) *
+    _lfSmoothstep(0.14, 0.48, beamTrans) *
+    _lfSmoothstep(-1.0, 4.0, el) *
+    (0.35 + 0.65 * beamSpread);
+
+  // 1. Direct Key Solar Color (physical Kelvin progression from crimson-amber horizon to crisp 5500K midday)
+  const keyTint = _lerpColorHex(0xff6b35, 0xffa84c, _lfSmoothstep(-1.0, 5.5, el));
+  keyTint.lerp(new THREE.Color(0xfff5e6), _lfSmoothstep(5.5, 16.0, el));
+  keyTint.lerp(new THREE.Color(0xffffff), _lfSmoothstep(16.0, 32.0, el));
+  // In thick overcast or Blue Hour, direct key shifts cool & diffuse
+  keyTint.lerp(new THREE.Color(0xb8c8dc), overcastWrap * 0.68);
+  keyTint.lerp(new THREE.Color(0x5c7be0), tBlueHour * (1.0 - tGolden * 0.65));
+
+  // 2. Diffuse Sky & Cloud-Canvas Shadow Fill Color (coupled to what the sky is actually doing!)
+  const shadowTint = _lerpColorHex(0x162244, 0x2f4888, tBlueHour);
+  shadowTint.lerp(new THREE.Color(0x283e6a), tGolden * 0.75);
+  shadowTint.lerp(new THREE.Color(0x3a547d), tDay * 0.85);
+  // Warm rose/crimson/violet sky-bounce when mid/high sunset clouds are burning overhead!
+  const sunsetCloudBounce = tGolden * canvasGlow * _lfSmoothstep(0.12, 0.65, midCloud + highCloud * 0.85) * beamTrans;
+  shadowTint.lerp(new THREE.Color(0x5c3a5e), _lfClamp(sunsetCloudBounce * 0.75, 0, 0.68));
+  // Soft scrim warm-neutral fill
+  shadowTint.lerp(new THREE.Color(0x6c7c8e), cirrusScrim * tDay * 0.45);
+  // Thick uniform overcast wrap (cool 6800K shadowless softbox)
+  shadowTint.lerp(new THREE.Color(0x8fa3ba), overcastWrap * (0.45 + 0.55 * _lfSmoothstep(-4.0, 6.0, el)) * 0.82);
+  // Luminous fog diffusion fill
+  shadowTint.lerp(new THREE.Color(0x88a0b6), fogImmersion * (0.30 + 0.70 * _lfSmoothstep(-4.0, 6.0, el)) * 0.72);
+
+  // 3. Direct vs. Ambient Ratio, Shadow Penumbra Sharpness, Micro-Contrast & Broken Cloud Spotlight Drama
+  const sunAbove = _lfSmoothstep(-1.4, 2.6, el);
+  const directWeight = _lfClamp(
+    sunAbove * (0.14 + 1.18 * beamTrans * (1.0 - overcastWrap * 0.78) * (1.0 - cirrusScrim * 0.24) * (1.0 - fogImmersion * 0.52)),
+    0.08,
+    1.40
+  );
+  const ambientWeight = _lfClamp(
+    0.24 +
+      0.56 * overcastWrap +
+      0.28 * cirrusScrim +
+      0.38 * fogImmersion +
+      0.52 * tBlueHour * (1.0 - sunAbove * 0.5) +
+      0.16 * sunsetCloudBounce,
+    0.20,
+    0.88
+  );
+  const shadowSharpness = _lfClamp(
+    (1.18 - 0.96 * overcastWrap - 0.48 * cirrusScrim - 0.64 * fogImmersion) * sunAbove + 0.14 * (1.0 - sunAbove),
+    0.08,
+    1.32
+  );
+  const microContrast = _lfClamp(1.04 + 0.24 * overcastWrap + 0.18 * tGolden * beamTrans, 0.96, 1.32);
+  const spotlightDrama = _lfClamp(brokenStorm * 0.92, 0.0, 0.92);
+  const warmth = _lfClamp(
+    tGolden * (0.35 + 0.65 * beamTrans) - tBlueHour * 0.55 - overcastWrap * 0.35,
+    -0.55,
+    1.0
+  );
+
+  // 4. Seamless Horizon / Scene Fog Color & Aerial Depth
+  const fogColor = _lerpColorHex(0x131e38, 0x283a72, tBlueHour);
+  fogColor.lerp(new THREE.Color(0x6e4d46), tGolden * (0.35 + 0.65 * beamTrans) * (1.0 - overcastWrap * 0.75));
+  fogColor.lerp(new THREE.Color(0x527aa6), tDay * (1.0 - overcastWrap * 0.6));
+  fogColor.lerp(new THREE.Color(0x7c8b9c), overcastWrap * (0.25 + 0.75 * _lfSmoothstep(-4.0, 6.0, el)) * 0.85);
+  fogColor.lerp(new THREE.Color(0x9cb3c6), fogImmersion * (0.25 + 0.75 * _lfSmoothstep(-4.0, 6.0, el)) * 0.85);
+  fogColor.lerp(new THREE.Color(0x8899aa), aodHaze * tDay * 0.42);
+
+  const fogDensity =
+    0.000011 +
+    fogImmersion * 0.000062 +
+    aodHaze * 0.000024 +
+    overcastWrap * 0.000014;
+  const aerialLayerStrength = _lfClamp(0.20 + fogImmersion * 0.72 + aodHaze * 0.32 + overcastWrap * 0.18, 0.18, 0.95);
+
+  // 5. Compute the honest Light Mix translation for this realization (used for Field Reference & Mix Readout)
+  let lightMix = null;
+  if (realKey === "p50" && wr?.light_archetypes?.probabilities) {
+    const phaseKey = String(wr.phase || "sunset").toLowerCase().includes("sunrise") ? "sunrise" : "sunset";
+    const win = state.shootReport?.golden_hour_windows?.find((g) => g.phase.toLowerCase().includes(phaseKey));
+    const peakMin = win ? parseHHMMToMinutes(win.peak_time_local) : null;
+    if (peakMin != null && Math.abs(minutes - peakMin) <= 8) {
+      lightMix = wr.light_archetypes;
+    }
+  }
+  if (!lightMix) {
+    lightMix = computeClientLightArchetypes({
+      sunElDeg: elevationDeg,
+      p10Pct: realKey === "p10" ? Math.max(0, beamPct - 10) : realKey === "p90" ? Math.max(0, beamPct - 14) : baseP10,
+      p50Pct: beamPct,
+      p90Pct: realKey === "p10" ? Math.min(100, beamPct + 14) : realKey === "p90" ? Math.min(100, beamPct + 8) : baseP90,
+      cloudLowPct: lowPct,
+      cloudMidPct: midPct,
+      cloudHighPct: highPct,
+      fogPct,
+      fogTopFt,
+      targetElevFt: lmElevFt,
+      canvasGlowScore: canvasGlow * 100,
+      aod550: baseAod,
+      highOpticalDepth: highTau,
+      inversionDeltaTF: inv.inversion_delta_t_f ?? 0,
+      visibilityMiles: visMi,
+      rhPct: baseRh,
+      directBeamPct: beamPct,
+      isCoastal: Boolean(inv.is_coastal),
+    });
+  }
+
+  return {
+    realization: realKey,
+    beamPct: Math.round(beamPct),
+    beamTrans,
+    beamSpread,
+    lowPct: Math.round(lowPct),
+    midPct: Math.round(midPct),
+    highPct: Math.round(highPct),
+    lowCloud,
+    midCloud,
+    highCloud,
+    highTau,
+    fogPct: Math.round(fogPct),
+    fogTopFt: Math.round(fogTopFt),
+    fogImmersion,
+    visMi: Math.round(visMi * 10) / 10,
+    aod550: Math.round(baseAod * 100) / 100,
+    aodHaze,
+    canvasGlow,
+    overcastWrap,
+    cirrusScrim,
+    brokenStorm,
+    keyTint,
+    shadowTint,
+    directWeight,
+    ambientWeight,
+    shadowSharpness,
+    microContrast,
+    spotlightDrama,
+    warmth,
+    fogColor,
+    fogDensity,
+    aerialLayerStrength,
+    lightMix,
+  };
+}
+
 function updateSunRaysAndShader() {
   const hourlyMet = applyHourlyWeatherAtMinutes(state.currentMinutes);
   const { azimuthDeg, elevationDeg } = getSolarAnglesAtMinutes(state.currentMinutes);
-  const { dist: archDist, activeId: activeArchId } = resolveActiveLightArchetype(
+  const phys = computePhysicalAtmosphereState(
     state.currentMinutes,
     elevationDeg,
-    hourlyMet
+    hourlyMet,
+    state.forecastRealization || "p50"
   );
-  const archProfile = ARCHETYPE_VISUAL_PROFILES[activeArchId] || ARCHETYPE_VISUAL_PROFILES.filtered_gold;
-
-  // When a scenario is pinned, clamp the visual solar elevation into its physically valid regime so every
-  // archetype looks unmistakable live in 3D while preserving real azimuth and scrubber continuity.
-  let visualElDeg = elevationDeg;
-  if (state.pinnedArchetypeId && Array.isArray(archProfile.pinnedSunElRange)) {
-    const [elLo, elHi] = archProfile.pinnedSunElRange;
-    visualElDeg = _lfClamp(elevationDeg, elLo, elHi);
-  }
+  state.activePhysicalAtmo = phys;
+  state.activeArchetypeDist = phys.lightMix;
+  state.activeArchetypeId = phys.lightMix?.dominant_id || "filtered_gold";
 
   const azRad = (azimuthDeg * Math.PI) / 180;
-  const elRad = (visualElDeg * Math.PI) / 180;
+  const elRad = (elevationDeg * Math.PI) / 180;
 
   const sunEast = Math.sin(azRad) * Math.cos(elRad);
   const sunNorth = Math.cos(azRad) * Math.cos(elRad);
@@ -3685,10 +4077,6 @@ function updateSunRaysAndShader() {
 
   const wr = state.weatherReport;
   const inv = wr?.inversion_model;
-  const aodVal = hourlyMet?.aod550 ?? wr?.astro_atmosphere?.aod_550nm ?? 0.06;
-  const archFogDensity =
-    archProfile.fogDensity +
-    Math.min(0.28, aodVal) * (activeArchId === "atmospheric_diffusion" ? 0.000045 : 0.000018);
 
   if (terrainShaderMaterial) {
     const tu = terrainShaderMaterial.uniforms;
@@ -3696,17 +4084,17 @@ function updateSunRaysAndShader() {
     tu.uHighlightZone.value = state.highlightLandingZone ? 1.0 : 0.0;
     tu.uShowViewshed.value = state.showViewshed ? 1.0 : 0.0;
     tu.uSurfaceStyle.value = state.surfaceStyle;
-    tu.uArchKeyTint.value.setHex(archProfile.keyTint);
-    tu.uArchShadowTint.value.setHex(archProfile.shadowTint);
-    tu.uArchDirectWeight.value = archProfile.directWeight;
-    tu.uArchAmbientWeight.value = archProfile.ambientWeight;
-    tu.uArchShadowSharpness.value = archProfile.shadowSharpness;
-    tu.uArchMicroContrast.value = archProfile.microContrast;
-    tu.uArchSpotlightDrama.value = archProfile.spotlightDrama;
-    tu.uArchWarmth.value = archProfile.warmth;
-    tu.uSceneFogColor.value.setHex(archProfile.fogColor);
-    tu.uSceneFogDensity.value = archFogDensity;
-    tu.uAerialLayerStrength.value = archProfile.aerialLayerStrength;
+    tu.uArchKeyTint.value.copy(phys.keyTint);
+    tu.uArchShadowTint.value.copy(phys.shadowTint);
+    tu.uArchDirectWeight.value = phys.directWeight;
+    tu.uArchAmbientWeight.value = phys.ambientWeight;
+    tu.uArchShadowSharpness.value = phys.shadowSharpness;
+    tu.uArchMicroContrast.value = phys.microContrast;
+    tu.uArchSpotlightDrama.value = phys.spotlightDrama;
+    tu.uArchWarmth.value = phys.warmth;
+    tu.uSceneFogColor.value.copy(phys.fogColor);
+    tu.uSceneFogDensity.value = phys.fogDensity;
+    tu.uAerialLayerStrength.value = phys.aerialLayerStrength;
     volumetricEngine.updateTerrainBakeUniforms({
       sunDirENU: tu.uSunDirENU.value,
       showViewshed: state.showViewshed,
@@ -3738,43 +4126,44 @@ function updateSunRaysAndShader() {
     -Math.cos(mAzRad) * Math.cos(mElRad)
   ).normalize();
 
-  // Update Hybrid Physical + 7-Archetype Sky Dome (always-on 60 FPS)
+  // Update Unified Continuous Physical Sky Dome (3 cloud decks + 380 km corridor LUT + radial Mie scattering)
   atmosphereGroup.visible = true;
   const su = skyDomeMat.uniforms;
   su.uSunDirWorld.value.copy(sunDirWorld);
   su.uSunElDeg.value = elevationDeg;
-  su.uVisualSunElDeg.value = visualElDeg;
+  su.uSunAzDeg.value = azimuthDeg;
   su.uMoonDirWorld.value.copy(moonDirWorld);
   su.uMoonElDeg.value = moonEl;
   su.uMoonIllum.value = moonIllum;
-  su.uArchSkyZenith.value.setHex(archProfile.skyZenith);
-  su.uArchSkyHorizon.value.setHex(archProfile.skyHorizon);
-  su.uArchSkyBlend.value = archProfile.skyBlend;
-  su.uArchOvercast.value = archProfile.skyOvercast;
-  su.uArchStorm.value = archProfile.skyStorm;
-  su.uArchCirrus.value = archProfile.skyCirrus;
-  su.uArchMist.value = archProfile.skyMist;
-  su.uArchSunDiskScale.value = archProfile.sunDiskScale;
+  su.uWindDirENU.value.copy(activeWindDirENU);
+  su.uBeamTrans.value = phys.beamTrans;
+  su.uBeamSpread.value = phys.beamSpread;
+  su.uLowCloud.value = phys.lowCloud;
+  su.uMidCloud.value = phys.midCloud;
+  su.uHighCloud.value = phys.highCloud;
+  su.uHighTau.value = phys.highTau;
+  su.uFogImmersion.value = phys.fogImmersion;
+  su.uAodHaze.value = phys.aodHaze;
+  su.uCanvasGlow.value = phys.canvasGlow;
+  su.uHorizonTint.value.copy(phys.fogColor);
 
-  // Sync Solar & Lunar Vectors to the opt-in GPU WebGL2 Volumetric Raymarcher (0–12.2 km column + 3D Cirrus)
+  // Crepuscular scattering now emerges physically in the sky dome — disable legacy geometric cones on terrain
+  hybridGodRaysGroup.visible = false;
+
+  // Sync Solar & Lunar Vectors to the opt-in GPU WebGL2 Volumetric Raymarcher
   volumetricEngine.updateCelestialUniforms({
     sunDirWorld,
-    sunElDeg: visualElDeg,
+    sunElDeg: elevationDeg,
     moonDirWorld,
     moonElDeg: moonEl,
     moonIllum,
   });
 
-  const activeLowPct = hourlyMet ? hourlyMet.cloudLowPct : (wr?.cloud_low_pct || 15);
-  const mistCov = wr
-    ? Math.max(
-        0.14,
-        ((wr.valley_inversion_fog_pct || 25) * 0.8 +
-          activeLowPct * 0.3 +
-          (inv?.cloud_sea_score || 0) * 0.25) /
-          110
-      )
-    : 0.24;
+  const mistCov = _lfClamp(
+    Math.max(0.10, (phys.fogPct * 0.8 + phys.lowPct * 0.3 + (inv?.cloud_sea_score || 0) * 0.25) / 110),
+    0.08,
+    0.92
+  );
 
   if (state.terrainPatch) {
     const minElevM = state.terrainPatch.min_elevation_m ?? 0.0;
@@ -3782,59 +4171,51 @@ function updateSunRaysAndShader() {
       state.terrainPatch.max_elevation_m ??
       state.shootReport?.target_landmark?.summit_elevation_m ??
       (minElevM + 800);
-    const p50Ft =
-      hourlyMet?.fogTopFt ??
-      inv?.fog_top_p50_ft ??
-      inv?.fog_top_ft ??
-      (wr?.lcl_cloud_base_ft ? wr.lcl_cloud_base_ft - 600 : 1250);
-    const p10Ft = inv?.fog_top_p10_ft ?? Math.max(120, p50Ft - 320);
-    const p90Ft = inv?.fog_top_p90_ft ?? (p50Ft + 320);
     const band = state.fogSliceBand || "p50";
-    const activeFogTopFt = band === "p10" ? p10Ft : band === "p90" ? p90Ft : p50Ft;
+    // When Fog band isn't manually turned off, track the active realization's fog lid smoothly
+    const activeFogTopFt =
+      band === "p10"
+        ? (inv?.fog_top_p10_ft ?? Math.max(120, phys.fogTopFt - 320))
+        : band === "p90"
+          ? (inv?.fog_top_p90_ft ?? (phys.fogTopFt + 320))
+          : phys.fogTopFt;
     const fogBaseFt = inv?.fog_base_ft ?? Math.max(80, activeFogTopFt - 650);
-    let fogTopM = activeFogTopFt / 3.28084;
+    const fogTopM = activeFogTopFt / 3.28084;
     const fogBaseM = fogBaseFt / 3.28084;
 
-    update3DPositionalClouds(sunDirWorld, visualElDeg, minElevM, fogBaseM, fogTopM, mistCov);
-    updateHybridGodRayShafts(archProfile, sunDirWorld, visualElDeg, minElevM, maxElevM);
+    update3DPositionalClouds(sunDirWorld, elevationDeg, minElevM, fogBaseM, fogTopM, mistCov);
 
     volumetricEngine.setScrubberKinematics?.({
       minutesLocal: state.currentMinutes,
-      lowPct: hourlyMet?.cloudLowPct ?? wr?.cloud_low_pct,
-      midPct: hourlyMet?.cloudMidPct ?? wr?.cloud_mid_pct,
-      highPct: hourlyMet?.cloudHighPct ?? wr?.cloud_high_pct,
-      fogPct: hourlyMet?.fogPct ?? wr?.valley_inversion_fog_pct,
+      lowPct: phys.lowPct,
+      midPct: phys.midPct,
+      highPct: phys.highPct,
+      fogPct: phys.fogPct,
       isScrubbing: isScrubbingTime || state.isPlayingSun,
     });
 
-    // Lightweight translucent 3D Fog-Sea / Atmospheric Diffusion Elevation Slice
+    // Lightweight translucent 3D Fog-Sea Elevation Slice driven by physical inversion lid
     const isLowInversionLayer = fogTopM <= maxElevM + 260.0;
-    const forceMistSlice = Boolean(archProfile.forceMistSlice);
-    const suppressForHarsh = activeArchId === "harsh_sun" && !state.pinnedArchetypeId && activeLowPct < 20;
     const fogSliceVisible =
       band !== "off" &&
-      !suppressForHarsh &&
-      (forceMistSlice || (isLowInversionLayer && activeFogTopFt > minElevM * 3.28084 + 35));
+      isLowInversionLayer &&
+      activeFogTopFt > minElevM * 3.28084 + 35 &&
+      (phys.fogPct >= 18 || phys.fogImmersion >= 0.25);
     const spanM = state.terrainPatch.span_m || 28000;
     fogSeaSliceMesh.visible = fogSliceVisible;
     if (fogSliceVisible) {
-      const sliceY = forceMistSlice && !isLowInversionLayer
-        ? Math.max(35.0, (maxElevM - minElevM) * 0.42)
-        : Math.max(8.0, fogTopM - minElevM);
-      if (forceMistSlice && !isLowInversionLayer) {
-        fogTopM = minElevM + sliceY;
-      }
+      const sliceY = Math.max(8.0, fogTopM - minElevM);
       fogSeaSliceMesh.scale.set(spanM * 1.06, spanM * 1.06, 1);
       fogSeaSliceMesh.position.set(0, sliceY, 0);
-      fogSeaSliceMat.uniforms.uColor.value.setHex(archProfile.fogSliceColor);
+      fogSeaSliceMat.uniforms.uColor.value.copy(phys.fogColor).lerp(new THREE.Color(0xdce8f2), 0.55);
       fogSeaSliceMat.uniforms.uRimColor.value.setHex(
-        band === "p90" ? 0xf87171 : band === "p10" ? 0x38bdf8 : archProfile.fogSliceRim
+        band === "p90" ? 0xf87171 : band === "p10" ? 0x38bdf8 : phys.warmth > 0.25 ? 0xff9f38 : 0x7dd3fc
       );
       fogSeaSliceMat.uniforms.uBandTint.value = band === "p10" ? 0.0 : band === "p90" ? 1.0 : 0.5;
-      fogSeaSliceMat.uniforms.uDiffusionMode.value = activeArchId === "atmospheric_diffusion" ? 1.0 : 0.0;
+      fogSeaSliceMat.uniforms.uDiffusionMode.value = phys.fogImmersion;
       fogSeaSliceMat.uniforms.uOpacity.value = state.showAtmosphere
-        ? Math.min(0.24, archProfile.fogSliceOpacity * 0.45)
-        : Math.max(archProfile.fogSliceOpacity, Math.min(0.62, mistCov * 0.68));
+        ? Math.min(0.24, mistCov * 0.36)
+        : _lfClamp(0.22 + mistCov * 0.44 + phys.fogImmersion * 0.20, 0.20, 0.68);
     }
 
     const hudFogLabel = document.getElementById("hud-fog-alt-readout");
@@ -3854,18 +4235,18 @@ function updateSunRaysAndShader() {
       terrainShaderMaterial.uniforms.uFogStrength.value = state.showAtmosphere
         ? Math.min(0.92, mistCov * 1.1)
         : fogSliceVisible
-          ? Math.min(0.86, Math.max(activeArchId === "atmospheric_diffusion" ? 0.72 : 0.0, mistCov * 0.80))
+          ? _lfClamp(Math.max(phys.fogImmersion * 0.72, mistCov * 0.76), 0.0, 0.86)
           : 0.0;
     }
   }
 
-  // Sync scene.fog & scene.background to active Light Archetype + live CAMS Aerosol Optical Depth
-  scene.fog.density = archFogDensity;
-  scene.fog.color.setHex(archProfile.fogColor);
-  scene.background.setHex(archProfile.skyHorizon);
+  // Sync scene.fog & scene.background seamlessly with continuous physical atmosphere
+  scene.fog.density = phys.fogDensity;
+  scene.fog.color.copy(phys.fogColor);
+  scene.background.copy(phys.fogColor);
 
-  // Sync Scenario Switcher cards, Field Reference, Full 7-Archetype Breakdown & Floating Viewport Pills live
-  renderLightArchetypeScenarioUI(archDist, activeArchId, hourlyMet);
+  // Sync Forecast Realization switcher, Physical Telemetry, Light Mix & Field Reference live
+  renderLightArchetypeScenarioUI(phys.lightMix, state.activeArchetypeId, hourlyMet, phys);
 
   // Update Valley-Wide 3D Solar Light Field on GPU when enabled
   updateValleyLightField(sunDirWorld, elevationDeg);
@@ -5272,17 +5653,26 @@ function renderTimelineArchetypeRibbon() {
   }
 }
 
+function selectForecastRealization(realization) {
+  const next = realization === "p10" || realization === "p90" ? realization : "p50";
+  state.forecastRealization = next;
+  state.pinnedArchetypeId = null;
+  _lastArchetypeUiKey = "";
+  updateSunRaysAndShader();
+  wakeRenderLoop(true);
+}
+
 function selectLightArchetype(archetypeIdOrNull) {
-  const nextPin =
-    archetypeIdOrNull && ARCHETYPE_VISUAL_PROFILES[archetypeIdOrNull]
+  if (archetypeIdOrNull === "p10" || archetypeIdOrNull === "p50" || archetypeIdOrNull === "p90") {
+    selectForecastRealization(archetypeIdOrNull);
+    return;
+  }
+  state.forecastRealization = "p50";
+  state.pinnedArchetypeId =
+    archetypeIdOrNull && LIGHT_ARCHETYPE_META[archetypeIdOrNull]
       ? archetypeIdOrNull
       : null;
-  if (state.pinnedArchetypeId === nextPin && nextPin !== null) {
-    // Clicking an already-pinned card keeps it pinned (use 1-click Auto pill/btn to reset)
-  }
-  state.pinnedArchetypeId = nextPin;
   _lastArchetypeUiKey = "";
-  _lastHybridGodRaysKey = "";
   updateSunRaysAndShader();
   wakeRenderLoop(true);
 }
@@ -5292,22 +5682,26 @@ function bindArchetypeSwitcherEvents() {
   _archetypeDelegationBound = true;
 
   const autoBtn = document.getElementById("btn-archetype-auto");
-  autoBtn?.addEventListener("click", () => selectLightArchetype(null));
+  autoBtn?.addEventListener("click", () => selectForecastRealization("p50"));
 
-  const onScenarioClick = (e) => {
+  const onRealizationClick = (e) => {
+    const rBtn = e.target.closest("[data-realization]");
+    if (rBtn) {
+      selectForecastRealization(rBtn.dataset.realization);
+      return;
+    }
     const btn = e.target.closest("[data-archetype-action]");
     if (!btn) return;
     const act = btn.dataset.archetypeAction;
-    if (act === "auto") {
-      selectLightArchetype(null);
-    } else if (ARCHETYPE_VISUAL_PROFILES[act]) {
-      selectLightArchetype(act);
+    if (act === "auto" || act === "p50") {
+      selectForecastRealization("p50");
+    } else if (act === "p10" || act === "p90") {
+      selectForecastRealization(act);
     }
   };
 
-  document.getElementById("scenario-cards-list")?.addEventListener("click", onScenarioClick);
-  document.getElementById("archetype-all7-list")?.addEventListener("click", onScenarioClick);
-  document.getElementById("viewport-scenario-pills")?.addEventListener("click", onScenarioClick);
+  document.getElementById("scenario-cards-list")?.addEventListener("click", onRealizationClick);
+  document.getElementById("viewport-scenario-pills")?.addEventListener("click", onRealizationClick);
   document.getElementById("light-chapters-strip")?.addEventListener("click", (e) => {
     const btn = e.target.closest("[data-chapter-jump]");
     if (!btn) return;
@@ -5342,95 +5736,123 @@ function bindArchetypeSwitcherEvents() {
   }
 }
 
-function renderLightArchetypeScenarioUI(dist, activeId, hourlyMet = null) {
+function renderLightArchetypeScenarioUI(dist, activeId, hourlyMet = null, physState = null) {
   if (!dist || !dist.probabilities) return;
   bindArchetypeSwitcherEvents();
   renderLightChaptersStrip(state.currentMinutes);
   renderTimelineArchetypeRibbon();
 
-  const isPinned = Boolean(state.pinnedArchetypeId);
+  const realKey = state.forecastRealization || "p50";
+  const isExpected = realKey === "p50";
   const timeTxt = formatMinutesToHHMM(state.currentMinutes);
   const probs = dist.probabilities;
   const rankedIds =
     Array.isArray(dist.ranked_ids) && dist.ranked_ids.length === 7
       ? dist.ranked_ids
       : [...LIGHT_ARCHETYPE_ORDER].sort((a, b) => (probs[b] || 0) - (probs[a] || 0));
-  const viableIds =
-    Array.isArray(dist.viable_ids) && dist.viable_ids.length > 0
-      ? dist.viable_ids
-      : [rankedIds[0]];
 
-  const uiKey = `${activeId}|${isPinned ? 1 : 0}|${timeTxt}|${rankedIds.map((k) => `${k}:${probs[k]}`).join(",")}`;
+  const phys =
+    physState ||
+    state.activePhysicalAtmo ||
+    computePhysicalAtmosphereState(
+      state.currentMinutes,
+      getSolarAnglesAtMinutes(state.currentMinutes).elevationDeg,
+      hourlyMet,
+      realKey
+    );
+
+  const uiKey = `${realKey}|${activeId}|${timeTxt}|${phys.beamPct}|${phys.lowPct}/${phys.midPct}/${phys.highPct}|${rankedIds.map((k) => `${k}:${probs[k]}`).join(",")}`;
   if (uiKey === _lastArchetypeUiKey) return;
   _lastArchetypeUiKey = uiKey;
 
   const activeMeta = getArchetypeMeta(activeId);
-  const activeProb = probs[activeId] ?? 0;
+  const secondaryId = rankedIds[1];
+  const secondaryPct = secondaryId ? probs[secondaryId] || 0 : 0;
+  const secondaryMeta = secondaryId ? getArchetypeMeta(secondaryId) : null;
+  const mixHeadline =
+    secondaryMeta && secondaryPct >= 20
+      ? `${activeMeta.name} + ${secondaryMeta.short_name || secondaryMeta.name}`
+      : activeMeta.name;
 
-  // 1. Header row (Auto vs Pinned + time chip + 1-click Auto reset)
+  // 1. Header row (P10/P50/P90 Realization + Blended Light Mix + time chip + P50 reset)
   const dotEl = document.getElementById("archetype-active-dot");
   if (dotEl) {
     dotEl.style.background = activeMeta.accent_hex;
     dotEl.style.boxShadow = `0 0 8px ${activeMeta.accent_hex}88`;
   }
+  const realTag = realKey === "p10" ? "P10 THICKER" : realKey === "p90" ? "P90 CLEARER" : "P50 EXPECTED";
   const modeLabelEl = document.getElementById("archetype-mode-label");
   if (modeLabelEl) {
-    modeLabelEl.textContent = isPinned
-      ? `PINNED · ${activeMeta.name}`
-      : `AUTO · ${activeMeta.name} (${activeProb}%)`;
+    modeLabelEl.textContent = `${realTag} · ${mixHeadline}`;
   }
   const timeChipEl = document.getElementById("archetype-time-chip");
   if (timeChipEl) timeChipEl.textContent = timeTxt;
 
   const autoBtnEl = document.getElementById("btn-archetype-auto");
   if (autoBtnEl) {
-    autoBtnEl.classList.toggle("is-active", !isPinned);
-    autoBtnEl.classList.toggle("is-reset-cta", isPinned);
-    autoBtnEl.textContent = isPinned ? "↺ Auto" : "Auto";
-    autoBtnEl.setAttribute("aria-pressed", String(!isPinned));
+    autoBtnEl.classList.toggle("is-active", isExpected);
+    autoBtnEl.classList.toggle("is-reset-cta", !isExpected);
+    autoBtnEl.textContent = isExpected ? "P50" : "↺ P50";
+    autoBtnEl.setAttribute("aria-pressed", String(isExpected));
   }
 
-  // 2. Clickable 3D Preview Cards for every archetype >= 20% (always >= 1)
-  // If user pinned a <20% scenario from the full 7 list, keep it visible at the bottom with a Pinned tag.
-  const cardIds = [...viableIds];
-  if (isPinned && !cardIds.includes(activeId)) {
-    cardIds.push(activeId);
-  }
+  // 2. Physical Forecast Realization Switcher (P10 Thicker | P50 Expected | P90 Clearer) + Live Atmosphere Readout
+  const { elevationDeg } = getSolarAnglesAtMinutes(state.currentMinutes);
+  const realStates = {
+    p10: realKey === "p10" ? phys : computePhysicalAtmosphereState(state.currentMinutes, elevationDeg, hourlyMet, "p10"),
+    p50: realKey === "p50" ? phys : computePhysicalAtmosphereState(state.currentMinutes, elevationDeg, hourlyMet, "p50"),
+    p90: realKey === "p90" ? phys : computePhysicalAtmosphereState(state.currentMinutes, elevationDeg, hourlyMet, "p90"),
+  };
+
+  const realSpecs = [
+    { id: "p10", badge: "P10", sub: "Thicker", st: realStates.p10 },
+    { id: "p50", badge: "P50", sub: "Expected", st: realStates.p50 },
+    { id: "p90", badge: "P90", sub: "Clearer", st: realStates.p90 },
+  ];
+
   const cardsEl = document.getElementById("scenario-cards-list");
   if (cardsEl) {
-    cardsEl.innerHTML = cardIds
-      .map((id) => {
-        const meta = getArchetypeMeta(id);
-        const pct = probs[id] ?? 0;
-        const isActive = id === activeId;
-        const isDom = id === dist.dominant_id;
-        const badgeText = isActive && isPinned ? "Pinned" : isDom ? "Most Likely" : "Preview";
+    const cardsHtml = realSpecs
+      .map(({ id, badge, sub, st }) => {
+        const domId = st.lightMix?.dominant_id || "filtered_gold";
+        const domMeta = getArchetypeMeta(domId);
+        const isAct = id === realKey;
+        const shortLbl = CHAPTER_SHORT_ARCH_LABEL[domId] || domMeta.short_name;
+        const tip = `${badge} ${sub}: Corridor beam ${st.beamPct}%, Clouds ${st.lowPct}%L / ${st.midPct}%M / ${st.highPct}%H, Fog ${st.fogTopFt} ft`;
         return `
           <button
             type="button"
-            class="scenario-card${isActive ? " is-active" : ""}${isActive && isPinned ? " is-pinned" : ""}"
-            data-archetype-action="${escapeHtmlText(id)}"
-            aria-pressed="${isActive ? "true" : "false"}"
-            style="--arch-accent:${escapeHtmlText(meta.accent_hex)};--arch-swatch:${escapeHtmlText(meta.swatch_gradient)};"
+            class="realization-card${isAct ? " is-active" : ""}"
+            data-realization="${id}"
+            aria-pressed="${isAct ? "true" : "false"}"
+            title="${escapeHtmlText(tip)}"
+            style="--real-col:${escapeHtmlText(domMeta.accent_hex)};"
           >
-            <span class="scenario-card-swatch" aria-hidden="true"></span>
-            <span class="scenario-card-info">
-              <span class="scenario-card-title-row">
-                <span class="scenario-card-name">${escapeHtmlText(meta.name)}</span>
-                <span class="scenario-card-tag">${escapeHtmlText(badgeText)}</span>
-              </span>
-              <span class="scenario-card-sub">${escapeHtmlText(meta.subtitle)}</span>
+            <span class="realization-top">
+              <span class="realization-badge">${badge}</span>
+              <span class="realization-sub">${sub}</span>
             </span>
-            <span class="scenario-card-right">
-              <span class="scenario-card-pct">${pct}%</span>
-              <span class="scenario-card-hint">3D live</span>
+            <span class="realization-beam">Beam ${st.beamPct}%</span>
+            <span class="realization-mix">
+              <span class="realization-dot" style="background:${escapeHtmlText(domMeta.accent_hex)};"></span>
+              <span>${escapeHtmlText(shortLbl)}</span>
             </span>
           </button>`;
       })
       .join("");
+
+    const telemetryHtml = `
+      <div class="atmo-telemetry-strip" title="Continuous physical parameters driving the live 3D sky &amp; terrain shader">
+        <span>Beam <strong>${phys.beamPct}%</strong></span>
+        <span>Clouds <strong>${phys.lowPct}L · ${phys.midPct}M · ${phys.highPct}H</strong></span>
+        <span>Vis <strong>${phys.visMi}mi</strong></span>
+        <span>AOD <strong>${phys.aod550.toFixed(2)}</strong></span>
+      </div>`;
+
+    cardsEl.innerHTML = `<div class="realization-grid">${cardsHtml}</div>${telemetryHtml}`;
   }
 
-  // 3. Active Archetype Field Reference (Shadow Edge, Contrast, Color Cast, Best For, Tactical Lever)
+  // 3. Active Field Reference (Shadow Edge, Contrast, Color Cast, Best For, Tactical Lever)
   const fr = activeMeta.field_reference || {};
   const shadowEl = document.getElementById("ref-shadow-edge");
   const contrastEl = document.getElementById("ref-contrast");
@@ -5443,7 +5865,7 @@ function renderLightArchetypeScenarioUI(dist, activeId, hourlyMet = null) {
   if (bestEl) bestEl.textContent = fr.best_for || "--";
   if (leverEl) leverEl.textContent = fr.tactical_lever || "--";
 
-  // 4. Collapsible Full 7-Archetype 100% Breakdown Bar
+  // 4. Collapsible Holistic Light Mix Breakdown Bar (100% continuous composition)
   const totalPct = LIGHT_ARCHETYPE_ORDER.reduce((acc, k) => acc + (Number(probs[k]) || 0), 0);
   const sumEl = document.getElementById("archetype-sum-label");
   if (sumEl) sumEl.textContent = `${totalPct}%`;
@@ -5466,60 +5888,46 @@ function renderLightArchetypeScenarioUI(dist, activeId, hourlyMet = null) {
       .map((k) => {
         const meta = getArchetypeMeta(k);
         const pct = probs[k] || 0;
-        const isActive = k === activeId;
+        const isDom = k === activeId;
         return `
-          <button
-            type="button"
-            class="archetype-all7-row${isActive ? " is-active" : ""}"
-            data-archetype-action="${escapeHtmlText(k)}"
-            aria-pressed="${isActive ? "true" : "false"}"
-            title="Preview ${escapeHtmlText(meta.name)} live in 3D"
+          <div
+            class="archetype-all7-row is-readonly${isDom ? " is-active" : ""}"
+            title="${escapeHtmlText(meta.name)} contributes ${pct}% to this continuous light mix"
           >
             <span class="archetype-all7-dot" style="background:${escapeHtmlText(meta.accent_hex)};"></span>
             <span class="archetype-all7-name">${escapeHtmlText(meta.name)}</span>
             <span class="archetype-all7-track"><span class="archetype-all7-fill" style="width:${pct}%;background:${escapeHtmlText(meta.accent_hex)};"></span></span>
             <span class="archetype-all7-pct">${pct}%</span>
-          </button>`;
+          </div>`;
       })
       .join("");
   }
 
-  // 5. Floating >= 20% Scenario Pills on the 3D Viewport (3D Map & Tripod Modes)
+  // 5. Floating P10 / P50 Expected / P90 Realization Pills on the 3D Viewport (3D Map & Tripod Modes)
   const vpPillsEl = document.getElementById("viewport-scenario-pills");
   if (vpPillsEl) {
-    const autoPillHtml = `
-      <button
-        type="button"
-        class="vp-scenario-pill is-auto${!isPinned ? " is-active" : ""}"
-        data-archetype-action="auto"
-        aria-pressed="${!isPinned ? "true" : "false"}"
-        title="Auto — follow most likely archetype as you scrub time"
-      >
-        <span>${isPinned ? "↺ Auto" : "Auto"}</span>
-      </button>
-      <span class="vp-scenario-divider" aria-hidden="true"></span>`;
-
-    const scenarioPillsHtml = cardIds
-      .map((id) => {
-        const meta = getArchetypeMeta(id);
-        const pct = probs[id] ?? 0;
-        const isActive = id === activeId;
+    const pillsHtml = realSpecs
+      .map(({ id, badge, sub, st }) => {
+        const isAct = id === realKey;
+        const domId = st.lightMix?.dominant_id || "filtered_gold";
+        const domMeta = getArchetypeMeta(domId);
         return `
           <button
             type="button"
-            class="vp-scenario-pill${isActive ? " is-active" : ""}"
-            data-archetype-action="${escapeHtmlText(id)}"
-            aria-pressed="${isActive ? "true" : "false"}"
-            style="--arch-accent:${escapeHtmlText(meta.accent_hex)};"
-            title="${escapeHtmlText(meta.name)} (${pct}%) — ${escapeHtmlText(meta.subtitle)}"
+            class="vp-scenario-pill${isAct ? " is-active" : ""}"
+            data-realization="${id}"
+            aria-pressed="${isAct ? "true" : "false"}"
+            style="--arch-accent:${escapeHtmlText(domMeta.accent_hex)};"
+            title="${badge} ${sub} — Beam ${st.beamPct}%, Clouds ${st.lowPct}L/${st.midPct}M/${st.highPct}H"
           >
-            <span class="vp-scenario-pill-dot" style="background:${escapeHtmlText(meta.accent_hex)};"></span>
-            <span>${escapeHtmlText(meta.short_name || meta.name)}</span>
-            <span class="vp-scenario-pill-pct">${pct}%</span>
+            <span class="vp-scenario-pill-dot" style="background:${escapeHtmlText(domMeta.accent_hex)};"></span>
+            <span>${badge}${id === "p50" ? " Expected" : ""}</span>
+            <span class="vp-scenario-pill-pct">${st.beamPct}%</span>
           </button>`;
       })
       .join("");
-    vpPillsEl.innerHTML = autoPillHtml + scenarioPillsHtml;
+    const mixChipHtml = `<span class="vp-scenario-divider" aria-hidden="true"></span><span class="vp-mix-readout">${escapeHtmlText(mixHeadline)}</span>`;
+    vpPillsEl.innerHTML = pillsHtml + mixChipHtml;
   }
 
   // Live conditions update when scrubbing hourly timeline
@@ -6453,6 +6861,7 @@ async function loadLandmarkScenario(customCoord = null) {
       ? pendingBootArchetype
       : null;
   pendingBootArchetype = null;
+  state.forecastRealization = "p50";
   _lastArchetypeUiKey = "";
   _lastChaptersRenderKey = "";
   _lastRibbonRenderKey = "";
