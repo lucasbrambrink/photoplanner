@@ -1,0 +1,18 @@
+{
+  "git-sync-workflow": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python3 ./hooks/session_start_sync.py",
+        "timeout": 15
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 ./hooks/stop_enforce_push.py",
+        "timeout": 15
+      }
+    ]
+  }
+}
