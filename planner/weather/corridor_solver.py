@@ -161,6 +161,200 @@ def _find_sunrise_sunset_golden_hours(
     return best_sr, best_ss
 
 
+def _fmt_min_hhmm(minutes_local: int | float) -> str:
+    m = int(round(float(minutes_local))) % 1440
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def _interp_hourly_entry(hourly_timeline: list[dict[str, Any]], minutes_local: float) -> dict[str, float]:
+    """Linearly interpolates numerical meteorological fields from `hourly_timeline` at exact `minutes_local`."""
+    if not hourly_timeline:
+        return {}
+    sorted_h = sorted(hourly_timeline, key=lambda e: float(e.get("minutes_local", int(e.get("hour", 0)) * 60 + 30)))
+    m_clamped = max(0.0, min(1440.0, float(minutes_local)))
+    lo = sorted_h[0]
+    hi = sorted_h[-1]
+    for idx in range(len(sorted_h) - 1):
+        m0 = float(sorted_h[idx].get("minutes_local", int(sorted_h[idx].get("hour", 0)) * 60 + 30))
+        m1 = float(sorted_h[idx + 1].get("minutes_local", int(sorted_h[idx + 1].get("hour", 0)) * 60 + 30))
+        if m0 <= m_clamped <= m1:
+            lo = sorted_h[idx]
+            hi = sorted_h[idx + 1]
+            break
+    if m_clamped <= float(sorted_h[0].get("minutes_local", 30)):
+        lo = hi = sorted_h[0]
+    elif m_clamped >= float(sorted_h[-1].get("minutes_local", 1410)):
+        lo = hi = sorted_h[-1]
+
+    m0 = float(lo.get("minutes_local", int(lo.get("hour", 0)) * 60 + 30))
+    m1 = float(hi.get("minutes_local", int(hi.get("hour", 0)) * 60 + 30))
+    t = 0.0 if m1 <= m0 else max(0.0, min(1.0, (m_clamped - m0) / (m1 - m0)))
+
+    num_keys = (
+        "p10_pct",
+        "p50_pct",
+        "p90_pct",
+        "cloud_low_pct",
+        "cloud_mid_pct",
+        "cloud_high_pct",
+        "fog_pct",
+        "fog_top_ft",
+        "high_optical_depth",
+        "visibility_miles",
+        "rh_pct",
+        "aod_550nm",
+        "canvas_glow_score",
+        "direct_beam_pct",
+    )
+    out: dict[str, float] = {}
+    for k in num_keys:
+        v0 = float(lo.get(k, 0.0) or 0.0)
+        v1 = float(hi.get(k, v0) or v0)
+        out[k] = v0 + (v1 - v0) * t
+    return out
+
+
+def _compute_solar_light_chapters(
+    *,
+    lat: float,
+    lon: float,
+    req_date: dt.date,
+    tz_offset_hr: float,
+    hourly_timeline: list[dict[str, Any]],
+    target_elev_ft: float,
+    inversion_delta_t_f: float,
+    is_coastal: bool,
+    is_sunset: bool,
+    primary_phase_minutes: int,
+    primary_light_archetypes: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """
+    Computes the day's 5 exact solar-ephemeris-anchored Light Chapters:
+      1. Dawn Blue (`el ∈ [-8.5°, -1.5°]` pre-sunrise)
+      2. Morning Gold (`el ∈ [-0.8°, +10.0°]` post-sunrise)
+      3. Midday (`el > +10.0°` around solar noon)
+      4. Evening Gold (`el ∈ [+10.0°, -0.8°]` pre-sunset)
+      5. Dusk Blue (`el ∈ [-1.5°, -8.5°]` post-sunset)
+
+    Interpolates the 4-layer meteorological column at each chapter's exact solar peak so
+    chained windows (e.g. Evening Gold -> Dusk Blue) are never skipped by 1-hour sampling.
+    """
+    samples: list[tuple[int, float, float]] = []
+    for mins in range(0, 1440, 2):
+        az, el = _solar_ephemeris_local(lat, lon, req_date, float(mins), tz_offset_hr)
+        samples.append((mins, az, el))
+
+    noon_sample = max(samples, key=lambda s: s[2])
+    solar_noon_min = noon_sample[0]
+
+    am_samples = [s for s in samples if s[0] <= solar_noon_min]
+    pm_samples = [s for s in samples if s[0] >= solar_noon_min]
+
+    def _window_from_filter(
+        pool: list[tuple[int, float, float]],
+        el_lo: float,
+        el_hi: float,
+        target_el: float,
+        fallback_min: int,
+    ) -> tuple[int, int, int, float, float]:
+        hits = [s for s in pool if el_lo <= s[2] <= el_hi]
+        if hits:
+            start_m = hits[0][0]
+            end_m = hits[-1][0]
+            peak = min(hits, key=lambda s: abs(s[2] - target_el))
+            return start_m, peak[0], end_m, peak[1], peak[2]
+        peak = min(pool, key=lambda s: abs(s[0] - fallback_min)) if pool else (fallback_min, 180.0, 0.0)
+        return max(0, peak[0] - 25), peak[0], min(1438, peak[0] + 25), peak[1], peak[2]
+
+    sr_crossing = min(am_samples, key=lambda s: abs(s[2] - 0.0)) if am_samples else (390, 95.0, 0.0)
+    ss_crossing = min(pm_samples, key=lambda s: abs(s[2] - 0.0)) if pm_samples else (1050, 265.0, 0.0)
+    sunrise_min = sr_crossing[0]
+    sunset_min = ss_crossing[0]
+
+    db_s, db_p, db_e, db_az, db_el = _window_from_filter(am_samples, -8.5, -1.5, -5.0, max(0, sunrise_min - 32))
+    mg_s, mg_p, mg_e, mg_az, mg_el = _window_from_filter(am_samples, -0.8, 10.0, 3.0, min(700, sunrise_min + 22))
+    md_s, md_p, md_e, md_az, md_el = _window_from_filter(samples, 10.0, 90.0, noon_sample[2], solar_noon_min)
+    eg_s, eg_p, eg_e, eg_az, eg_el = _window_from_filter(pm_samples, -0.8, 10.0, 3.0, max(740, sunset_min - 22))
+    kb_s, kb_p, kb_e, kb_az, kb_el = _window_from_filter(pm_samples, -8.5, -1.5, -5.0, min(1438, sunset_min + 32))
+
+    # Align the active golden-hour chapter peak cleanly with the solved primary phase snapshot
+    if is_sunset:
+        eg_p = int(primary_phase_minutes)
+        eg_az, eg_el = _solar_ephemeris_local(lat, lon, req_date, float(eg_p), tz_offset_hr)
+    else:
+        mg_p = int(primary_phase_minutes)
+        mg_az, mg_el = _solar_ephemeris_local(lat, lon, req_date, float(mg_p), tz_offset_hr)
+
+    chapter_specs = [
+        ("dawn_blue", "Dawn Blue", "Dawn Blue Hour", db_s, db_p, db_e, db_az, db_el, False),
+        ("morning_gold", "AM Gold", "Morning Golden Hour", mg_s, mg_p, mg_e, mg_az, mg_el, not is_sunset),
+        ("midday", "Midday", "Midday Light", md_s, md_p, md_e, md_az, md_el, False),
+        ("evening_gold", "PM Gold", "Evening Golden Hour", eg_s, eg_p, eg_e, eg_az, eg_el, is_sunset),
+        ("dusk_blue", "Dusk Blue", "Dusk Blue Hour", kb_s, kb_p, kb_e, kb_az, kb_el, False),
+    ]
+
+    chapters: list[dict[str, Any]] = []
+    for cid, short_lbl, full_lbl, s_m, p_m, e_m, p_az, p_el, use_primary in chapter_specs:
+        if use_primary and primary_light_archetypes and isinstance(primary_light_archetypes.get("probabilities"), dict):
+            prim_probs = dict(primary_light_archetypes["probabilities"])
+            prim_dom = str(primary_light_archetypes["dominant_id"])
+            arch = {
+                "probabilities": prim_probs,
+                "dominant_id": prim_dom,
+                "dominant_pct": int(prim_probs.get(prim_dom, 0)),
+                "viable_ids": list(primary_light_archetypes.get("viable_ids") or [prim_dom]),
+            }
+        else:
+            hm = _interp_hourly_entry(hourly_timeline, float(p_m))
+            arch = compute_light_archetypes(
+                sun_el_deg=float(p_el),
+                p10_pct=hm.get("p10_pct", 35.0),
+                p50_pct=hm.get("p50_pct", 60.0),
+                p90_pct=hm.get("p90_pct", 82.0),
+                cloud_low_pct=hm.get("cloud_low_pct", 20.0),
+                cloud_mid_pct=hm.get("cloud_mid_pct", 15.0),
+                cloud_high_pct=hm.get("cloud_high_pct", 30.0),
+                fog_pct=hm.get("fog_pct", 15.0),
+                fog_top_ft=hm.get("fog_top_ft", 0.0),
+                target_elev_ft=float(target_elev_ft),
+                canvas_glow_score=hm.get("canvas_glow_score", 45.0),
+                aod_550nm=hm.get("aod_550nm", 0.07),
+                high_optical_depth=hm.get("high_optical_depth", 0.0),
+                inversion_delta_t_f=float(inversion_delta_t_f),
+                visibility_miles=hm.get("visibility_miles", 18.0),
+                rh_pct=hm.get("rh_pct", 55.0),
+                direct_beam_pct=hm.get("direct_beam_pct", hm.get("p50_pct", 60.0)),
+                is_coastal=is_coastal,
+                compact=True,
+            )
+
+        chapters.append(
+            {
+                "id": cid,
+                "label": short_lbl,
+                "full_label": full_lbl,
+                "start_minutes": int(s_m),
+                "peak_minutes": int(p_m),
+                "end_minutes": int(e_m),
+                "start_local": _fmt_min_hhmm(s_m),
+                "peak_local": _fmt_min_hhmm(p_m),
+                "end_local": _fmt_min_hhmm(e_m),
+                "sun_az_deg": round(float(p_az), 1),
+                "sun_el_deg": round(float(p_el), 1),
+                "light_archetypes": arch,
+            }
+        )
+
+    sun_events = {
+        "dawn_blue_min": int(db_p),
+        "sunrise_min": int(sunrise_min),
+        "solar_noon_min": int(solar_noon_min),
+        "sunset_min": int(sunset_min),
+        "dusk_blue_min": int(kb_p),
+    }
+    return chapters, sun_events
+
+
 def _compass_cardinal(az_deg: float) -> str:
     dirs = [
         "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
@@ -3244,6 +3438,21 @@ def solve_weather_and_corridor(
         compact=False,
     )
 
+    primary_phase_minutes = int(ss_info[0] if is_sunset else sr_info[0])
+    light_chapters, sun_events = _compute_solar_light_chapters(
+        lat=lat,
+        lon=lon,
+        req_date=req_date,
+        tz_offset_hr=tz_offset_hr,
+        hourly_timeline=hourly_timeline,
+        target_elev_ft=float(target_elev_ft),
+        inversion_delta_t_f=float(inversion_delta_t_f),
+        is_coastal=is_coastal,
+        is_sunset=is_sunset,
+        primary_phase_minutes=primary_phase_minutes,
+        primary_light_archetypes=primary_light_archetypes,
+    )
+
     payload_dict = {
         "date": req_date.isoformat(),
         "phase": "Sunset" if is_sunset else "Sunrise",
@@ -3266,6 +3475,8 @@ def solve_weather_and_corridor(
         "calibrated_probabilities": calibrated_probabilities,
         "light_archetypes": primary_light_archetypes,
         "light_archetype_catalog": ARCHETYPE_CATALOG,
+        "light_chapters": light_chapters,
+        "sun_events": sun_events,
         "color_temperature_kelvin": kelvin,
         "chappuis_rose_index": chappuis_rose,
         "lcl_cloud_base_ft": lcl_cloud_base_ft,

@@ -3304,6 +3304,49 @@ function update3DPositionalClouds(sunDirWorld, elevationDeg, minElevM, fogBaseM,
 let _activeCorridorLutSector = null;
 let _lastSyncedFluidMinutes = -999;
 
+function sampleHourlyMetAtMinutes(minutes) {
+  const wr = state.weatherReport;
+  const timeline = wr?.hourly_timeline;
+  if (!wr || !Array.isArray(timeline) || timeline.length < 2) return null;
+
+  const clampedMin = Math.max(0, Math.min(1439, minutes));
+  const fHour = (clampedMin - 30) / 60.0;
+  const idx0 = Math.max(0, Math.min(timeline.length - 1, Math.floor(fHour)));
+  const idx1 = Math.max(0, Math.min(timeline.length - 1, idx0 + 1));
+  const alpha = idx0 === idx1 ? 0.0 : Math.max(0.0, Math.min(1.0, fHour - idx0));
+  const row0 = timeline[idx0];
+  const row1 = timeline[idx1];
+  const pickRow = alpha < 0.5 ? row0 : row1;
+  const lerpNum = (a, b, fallback = 0) => {
+    const va = typeof a === "number" ? a : fallback;
+    const vb = typeof b === "number" ? b : va;
+    return va + (vb - va) * alpha;
+  };
+  return {
+    expBeamPct: Math.round(lerpNum(row0.expected_transmittance_pct, row1.expected_transmittance_pct, wr.ray_transmittance_pct ?? 50)),
+    directBeamPct: Math.round(lerpNum(row0.direct_beam_pct, row1.direct_beam_pct, wr.direct_beam_probability_pct ?? 50)),
+    p10Pct: Math.round(lerpNum(row0.p10_pct, row1.p10_pct, wr.transmittance_p10_pct ?? 0)),
+    p50Pct: Math.round(lerpNum(row0.p50_pct, row1.p50_pct, wr.transmittance_p50_pct ?? 50)),
+    p90Pct: Math.round(lerpNum(row0.p90_pct, row1.p90_pct, wr.transmittance_p90_pct ?? 80)),
+    kelvin: Math.round(lerpNum(row0.kelvin, row1.kelvin, wr.color_temperature_kelvin ?? 2400)),
+    canvasGlow: Math.round(lerpNum(row0.canvas_glow_score, row1.canvas_glow_score, wr.canvas_score ?? 50)),
+    fogTopFt: Math.round(lerpNum(row0.fog_top_ft, row1.fog_top_ft, wr.fog_top_ft ?? 1250)),
+    cloudLowPct: Math.round(lerpNum(row0.cloud_low_pct, row1.cloud_low_pct, wr.cloud_low_pct ?? 15)),
+    cloudMidPct: Math.round(lerpNum(row0.cloud_mid_pct, row1.cloud_mid_pct, wr.cloud_mid_pct ?? 15)),
+    cloudHighPct: Math.round(lerpNum(row0.cloud_high_pct, row1.cloud_high_pct, wr.cloud_high_pct ?? 20)),
+    fogPct: Math.round(lerpNum(row0.fog_pct, row1.fog_pct, row0.cloud_low_pct ?? wr.cloud_low_pct ?? 15)),
+    highOpticalDepth: lerpNum(row0.high_optical_depth, row1.high_optical_depth, wr.fluid_atmosphere_params?.highOpticalDepth ?? 0.5),
+    visibilityMiles: lerpNum(row0.visibility_miles, row1.visibility_miles, wr.visibility_miles ?? 16),
+    rhPct: Math.round(lerpNum(row0.rh_pct, row1.rh_pct, wr.inversion_model?.rh_2m_pct ?? 58)),
+    tempF: Math.round(lerpNum(row0.temp_f, row1.temp_f, wr.temp_sunset_f ?? 58)),
+    windMph: Math.round(lerpNum(row0.wind_mph, row1.wind_mph, wr.wind_mph ?? 8)),
+    aod550: lerpNum(row0.aod_550nm, row1.aod_550nm, wr.astro_atmosphere?.aod_550nm ?? 0.06),
+    blockerLabel: pickRow?.blocker_label || "clear",
+    blockerDistKm: pickRow?.blocker_distance_km || 0,
+    hourlyArchetypes: pickRow?.light_archetypes || null,
+  };
+}
+
 function applyHourlyWeatherAtMinutes(minutes) {
   const wr = state.weatherReport;
   if (!wr) return null;
@@ -4898,7 +4941,336 @@ function renderWeatherCard(w) {
 }
 
 let _lastArchetypeUiKey = "";
+let _lastChaptersRenderKey = "";
+let _lastRibbonRenderKey = "";
+let _cachedRibbonSlices = [];
 let _archetypeDelegationBound = false;
+
+const CHAPTER_SHORT_ARCH_LABEL = {
+  giant_softbox: "Softbox",
+  clearing_storm: "Storm",
+  atmospheric_diffusion: "Mist",
+  high_thin_veil: "Veil",
+  filtered_gold: "Gold",
+  blue_hour: "Blue",
+  harsh_sun: "Sun",
+};
+
+function computeArchetypeDistAtMinute(minutes) {
+  const wr = state.weatherReport;
+  const inv = wr?.inversion_model || {};
+  const lmElevFt =
+    state.shootReport?.target_landmark?.summit_elevation_ft ??
+    inv.target_elev_ft ??
+    (state.terrainPatch?.max_elevation_m ? state.terrainPatch.max_elevation_m * 3.28084 : 1500);
+
+  if (wr?.light_archetypes?.probabilities) {
+    const phaseKey = String(wr.phase || "sunset").toLowerCase().includes("sunrise") ? "sunrise" : "sunset";
+    const win = state.shootReport?.golden_hour_windows?.find((g) => g.phase.toLowerCase().includes(phaseKey));
+    const peakMin = win ? parseHHMMToMinutes(win.peak_time_local) : null;
+    if (peakMin != null && Math.abs(minutes - peakMin) <= 8) {
+      return wr.light_archetypes;
+    }
+  }
+
+  const { elevationDeg } = getSolarAnglesAtMinutes(minutes);
+  const hm = sampleHourlyMetAtMinutes(minutes);
+  if (hm) {
+    return computeClientLightArchetypes({
+      sunElDeg: elevationDeg,
+      p10Pct: hm.p10Pct,
+      p50Pct: hm.p50Pct,
+      p90Pct: hm.p90Pct,
+      cloudLowPct: hm.cloudLowPct,
+      cloudMidPct: hm.cloudMidPct,
+      cloudHighPct: hm.cloudHighPct,
+      fogPct: hm.fogPct,
+      fogTopFt: hm.fogTopFt,
+      targetElevFt: lmElevFt,
+      canvasGlowScore: hm.canvasGlow,
+      aod550: hm.aod550,
+      highOpticalDepth: hm.highOpticalDepth,
+      inversionDeltaTF: inv.inversion_delta_t_f ?? 0,
+      visibilityMiles: hm.visibilityMiles,
+      rhPct: hm.rhPct,
+      directBeamPct: hm.directBeamPct,
+      isCoastal: Boolean(inv.is_coastal),
+    });
+  }
+  return computeClientLightArchetypes({
+    sunElDeg: elevationDeg,
+    p10Pct: 35,
+    p50Pct: 62,
+    p90Pct: 86,
+    cloudLowPct: 18,
+    cloudMidPct: 15,
+    cloudHighPct: 35,
+    fogTopFt: 0,
+    targetElevFt: lmElevFt,
+    canvasGlowScore: 60,
+    aod550: 0.08,
+  });
+}
+
+function getDayLightChapters() {
+  const wr = state.weatherReport;
+  if (Array.isArray(wr?.light_chapters) && wr.light_chapters.length >= 4) {
+    return wr.light_chapters;
+  }
+
+  // Deterministic client-side solar-ephemeris chapters while weather corridor loads
+  const samples = [];
+  for (let m = 0; m < 1440; m += 4) {
+    const { azimuthDeg, elevationDeg } = getSolarAnglesAtMinutes(m);
+    samples.push({ m, az: azimuthDeg, el: elevationDeg });
+  }
+  const noon = samples.reduce((best, s) => (s.el > best.el ? s : best), samples[0]);
+  const am = samples.filter((s) => s.m <= noon.m);
+  const pm = samples.filter((s) => s.m >= noon.m);
+
+  const pickWindow = (pool, elLo, elHi, targetEl, fallbackMin) => {
+    const hits = pool.filter((s) => s.el >= elLo && s.el <= elHi);
+    if (hits.length) {
+      const peak = hits.reduce((best, s) => (Math.abs(s.el - targetEl) < Math.abs(best.el - targetEl) ? s : best), hits[0]);
+      return { start: hits[0].m, peak: peak.m, end: hits[hits.length - 1].m, az: peak.az, el: peak.el };
+    }
+    const peak = pool.reduce((best, s) => (Math.abs(s.m - fallbackMin) < Math.abs(best.m - fallbackMin) ? s : best), pool[0] || { m: fallbackMin, az: 180, el: 0 });
+    return { start: Math.max(0, peak.m - 24), peak: peak.m, end: Math.min(1438, peak.m + 24), az: peak.az, el: peak.el };
+  };
+
+  const sr = am.reduce((best, s) => (Math.abs(s.el) < Math.abs(best.el) ? s : best), am[0] || { m: 390, el: 0 });
+  const ss = pm.reduce((best, s) => (Math.abs(s.el) < Math.abs(best.el) ? s : best), pm[0] || { m: 1050, el: 0 });
+
+  const specs = [
+    { id: "dawn_blue", label: "Dawn Blue", full_label: "Dawn Blue Hour", w: pickWindow(am, -8.5, -1.5, -5.0, Math.max(0, sr.m - 30)) },
+    { id: "morning_gold", label: "AM Gold", full_label: "Morning Golden Hour", w: pickWindow(am, -0.8, 10.0, 3.0, Math.min(700, sr.m + 22)) },
+    { id: "midday", label: "Midday", full_label: "Midday Light", w: pickWindow(samples, 10.0, 90.0, noon.el, noon.m) },
+    { id: "evening_gold", label: "PM Gold", full_label: "Evening Golden Hour", w: pickWindow(pm, -0.8, 10.0, 3.0, Math.max(740, ss.m - 22)) },
+    { id: "dusk_blue", label: "Dusk Blue", full_label: "Dusk Blue Hour", w: pickWindow(pm, -8.5, -1.5, -5.0, Math.min(1438, ss.m + 30)) },
+  ];
+
+  return specs.map(({ id, label, full_label, w }) => {
+    const dist = computeArchetypeDistAtMinute(w.peak);
+    return {
+      id,
+      label,
+      full_label,
+      start_minutes: w.start,
+      peak_minutes: w.peak,
+      end_minutes: w.end,
+      start_local: formatMinutesToHHMM(w.start),
+      peak_local: formatMinutesToHHMM(w.peak),
+      end_local: formatMinutesToHHMM(w.end),
+      sun_az_deg: Math.round(w.az * 10) / 10,
+      sun_el_deg: Math.round(w.el * 10) / 10,
+      light_archetypes: {
+        probabilities: dist.probabilities,
+        dominant_id: dist.dominant_id,
+        dominant_pct: dist.dominant_pct,
+        viable_ids: dist.viable_ids,
+      },
+    };
+  });
+}
+
+function getActiveLightChapter(minutes, chapters) {
+  if (!Array.isArray(chapters) || !chapters.length) return null;
+  for (const ch of chapters) {
+    if (minutes >= ch.start_minutes - 6 && minutes <= ch.end_minutes + 6) {
+      return ch;
+    }
+  }
+  // If between adjacent solar chapters (small 5-15m transition), snap to nearest within 24 min
+  let best = null;
+  let bestDist = Infinity;
+  for (const ch of chapters) {
+    const d = Math.min(Math.abs(minutes - ch.start_minutes), Math.abs(minutes - ch.end_minutes));
+    if (d < bestDist) {
+      bestDist = d;
+      best = ch;
+    }
+  }
+  return bestDist <= 24 ? best : null;
+}
+
+function jumpToLightChapter(chapterId) {
+  const chapters = getDayLightChapters();
+  const ch = chapters.find((c) => c.id === chapterId);
+  if (!ch) return;
+
+  state.pinnedArchetypeId = null;
+  _lastArchetypeUiKey = "";
+  _lastHybridGodRaysKey = "";
+  state.currentMinutes = Math.max(0, Math.min(1440, Number(ch.peak_minutes)));
+  if (timeScrubber) {
+    timeScrubber.value = String(Math.round(state.currentMinutes));
+    syncSliderValue(timeScrubber);
+  }
+  if (chapterId === "morning_gold" || chapterId === "dawn_blue") {
+    markActiveTimePreset?.(document.getElementById("btn-jump-sunrise"));
+  } else if (chapterId === "evening_gold") {
+    markActiveTimePreset?.(document.getElementById("btn-jump-sunset"));
+  } else if (chapterId === "dusk_blue") {
+    markActiveTimePreset?.(document.getElementById("btn-jump-bluehour"));
+  } else {
+    markActiveTimePreset?.(null);
+  }
+  updateSunRaysAndShader();
+  wakeRenderLoop(true);
+}
+
+function renderLightChaptersStrip(minutes) {
+  const stripEl = document.getElementById("light-chapters-strip");
+  const rangeEl = document.getElementById("active-chapter-window");
+  if (!stripEl) return;
+
+  const chapters = getDayLightChapters();
+  const activeCh = getActiveLightChapter(minutes, chapters);
+  if (rangeEl) {
+    if (activeCh) {
+      rangeEl.textContent = `${activeCh.full_label} · ${activeCh.start_local}–${activeCh.end_local}`;
+    } else {
+      const { elevationDeg } = getSolarAnglesAtMinutes(minutes);
+      rangeEl.textContent =
+        elevationDeg < -12
+          ? `Astronomical Night · ${formatMinutesToHHMM(minutes)}`
+          : `Transition · ${formatMinutesToHHMM(minutes)}`;
+    }
+  }
+
+  const activeId = activeCh?.id || "";
+  const key = `${activeId}|${chapters.map((c) => `${c.id}:${c.peak_minutes}:${c.light_archetypes?.dominant_id}:${c.light_archetypes?.dominant_pct}`).join(",")}`;
+  if (key === _lastChaptersRenderKey) return;
+  _lastChaptersRenderKey = key;
+
+  stripEl.innerHTML = chapters
+    .map((ch) => {
+      const arch = ch.light_archetypes || {};
+      const domId = arch.dominant_id || "filtered_gold";
+      const domPct = arch.dominant_pct ?? (arch.probabilities?.[domId] || 0);
+      const meta = getArchetypeMeta(domId);
+      const shortArch = CHAPTER_SHORT_ARCH_LABEL[domId] || meta.short_name;
+      const isAct = ch.id === activeId;
+      const tip = `${ch.full_label} (${ch.start_local}–${ch.end_local}) · ${meta.name} ${domPct}%`;
+      return `
+        <button
+          type="button"
+          class="light-chapter-btn${isAct ? " is-active" : ""}"
+          data-chapter-jump="${escapeHtmlText(ch.id)}"
+          aria-pressed="${isAct ? "true" : "false"}"
+          title="${escapeHtmlText(tip)}"
+          style="--chap-col:${escapeHtmlText(meta.accent_hex)};"
+        >
+          <span class="light-chapter-name">${escapeHtmlText(ch.label)}</span>
+          <span class="light-chapter-time">${escapeHtmlText(ch.peak_local)}</span>
+          <span class="light-chapter-odds">${escapeHtmlText(shortArch)} ${domPct}%</span>
+        </button>`;
+    })
+    .join("");
+}
+
+function renderTimelineArchetypeRibbon() {
+  const canvas = document.getElementById("timeline-archetype-ribbon");
+  const ticksEl = document.getElementById("timeline-ribbon-ticks");
+  if (!canvas) return;
+
+  const wr = state.weatherReport;
+  const chapters = getDayLightChapters();
+  const ribbonKey = [
+    state.landmark,
+    state.date,
+    wr ? `${wr.phase}|${wr.source}|${wr.hourly_timeline?.length || 0}` : "solar-only",
+    chapters.map((c) => `${c.peak_minutes}:${c.light_archetypes?.dominant_id}:${c.light_archetypes?.dominant_pct}`).join(","),
+  ].join("||");
+  if (ribbonKey === _lastRibbonRenderKey) return;
+  _lastRibbonRenderKey = ribbonKey;
+
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+
+  const W = canvas.width;
+  const H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  // Sample 144 slices across 0..1440 min (every 10 minutes) for smooth stacked 100% archetype bands
+  const nSlices = 144;
+  const stepMin = 1440 / nSlices;
+  const slices = [];
+  const sliceW = W / nSlices;
+
+  for (let i = 0; i < nSlices; i++) {
+    const m = (i + 0.5) * stepMin;
+    const { elevationDeg } = getSolarAnglesAtMinutes(m);
+    const dist = computeArchetypeDistAtMinute(m);
+    const probs = dist.probabilities || {};
+    slices.push({ m, el: elevationDeg, dist });
+
+    // Sort descending so dominant archetype occupies the main vertical core & secondary viable scenarios stack cleanly
+    const ordered = [...LIGHT_ARCHETYPE_ORDER].sort((a, b) => (probs[b] || 0) - (probs[a] || 0));
+    const x0 = Math.floor(i * sliceW);
+    const x1 = Math.ceil((i + 1) * sliceW);
+    const w = Math.max(1, x1 - x0);
+    let yCursor = H;
+
+    for (const aid of ordered) {
+      const pct = Number(probs[aid]) || 0;
+      if (pct <= 0) continue;
+      const segH = (pct / 100) * H;
+      const yTop = Math.max(0, yCursor - segH);
+      const meta = getArchetypeMeta(aid);
+      ctx.fillStyle = meta.accent_hex;
+      ctx.fillRect(x0, yTop, w, Math.max(1, yCursor - yTop));
+      yCursor = yTop;
+    }
+
+    // Subtle deep-night dimming (el < -11 deg) so Dawn Blue, Gold, Midday, and Dusk Blue glow cleanly
+    if (elevationDeg < -10.5) {
+      const nightDim = Math.min(0.68, ((-10.5 - elevationDeg) / 14.0) * 0.68);
+      ctx.fillStyle = `rgba(6, 10, 22, ${nightDim.toFixed(3)})`;
+      ctx.fillRect(x0, 0, w, H);
+    }
+  }
+  _cachedRibbonSlices = slices;
+
+  // Draw crisp vertical hairline ticks on the ribbon for key solar chapter peaks
+  const markerColors = {
+    dawn_blue: "rgba(165, 180, 252, 0.75)",
+    morning_gold: "rgba(253, 230, 138, 0.85)",
+    midday: "rgba(255, 255, 255, 0.35)",
+    evening_gold: "rgba(253, 230, 138, 0.85)",
+    dusk_blue: "rgba(165, 180, 252, 0.75)",
+  };
+  for (const ch of chapters) {
+    const px = Math.round((ch.peak_minutes / 1440) * W);
+    ctx.fillStyle = markerColors[ch.id] || "rgba(255,255,255,0.4)";
+    ctx.fillRect(px, 0, 1.5, H);
+  }
+
+  // Render subtle tick labels below the ribbon
+  if (ticksEl) {
+    const se = wr?.sun_events;
+    const amGold = chapters.find((c) => c.id === "morning_gold");
+    const midday = chapters.find((c) => c.id === "midday");
+    const pmGold = chapters.find((c) => c.id === "evening_gold");
+    const duskBlue = chapters.find((c) => c.id === "dusk_blue");
+    const dawnBlue = chapters.find((c) => c.id === "dawn_blue");
+
+    const tickItems = [
+      { min: se?.dawn_blue_min ?? dawnBlue?.peak_minutes ?? 360, lbl: "", dot: "#6366f1" },
+      { min: se?.sunrise_min ?? amGold?.peak_minutes ?? 420, lbl: amGold?.peak_local || "Rise", dot: "#f59e0b" },
+      { min: se?.solar_noon_min ?? midday?.peak_minutes ?? 720, lbl: "12:00", dot: "" },
+      { min: se?.sunset_min ?? pmGold?.peak_minutes ?? 1020, lbl: pmGold?.peak_local || "Set", dot: "#f59e0b" },
+      { min: se?.dusk_blue_min ?? duskBlue?.peak_minutes ?? 1060, lbl: "", dot: "#6366f1" },
+    ];
+    ticksEl.innerHTML = tickItems
+      .map((tk) => {
+        const leftPct = Math.max(4, Math.min(96, (tk.min / 1440) * 100));
+        const dotHtml = tk.dot ? `<span class="timeline-tick-dot" style="background:${tk.dot};"></span>` : "";
+        return `<span class="timeline-tick" style="left:${leftPct.toFixed(1)}%;">${dotHtml}${escapeHtmlText(tk.lbl)}</span>`;
+      })
+      .join("");
+  }
+}
 
 function selectLightArchetype(archetypeIdOrNull) {
   const nextPin =
@@ -4936,11 +5308,45 @@ function bindArchetypeSwitcherEvents() {
   document.getElementById("scenario-cards-list")?.addEventListener("click", onScenarioClick);
   document.getElementById("archetype-all7-list")?.addEventListener("click", onScenarioClick);
   document.getElementById("viewport-scenario-pills")?.addEventListener("click", onScenarioClick);
+  document.getElementById("light-chapters-strip")?.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-chapter-jump]");
+    if (!btn) return;
+    jumpToLightChapter(btn.dataset.chapterJump);
+  });
+
+  // Live hover preview tooltip over the 24-hour probability ribbon
+  const scrubberEl = document.getElementById("time-scrubber");
+  const tipEl = document.getElementById("timeline-hover-tip");
+  if (scrubberEl && tipEl) {
+    scrubberEl.addEventListener("pointermove", (e) => {
+      if (!_cachedRibbonSlices.length) return;
+      const rect = scrubberEl.getBoundingClientRect();
+      if (rect.width <= 0) return;
+      const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      const hoverMin = Math.round(frac * 1440);
+      const idx = Math.max(0, Math.min(_cachedRibbonSlices.length - 1, Math.floor(frac * _cachedRibbonSlices.length)));
+      const sl = _cachedRibbonSlices[idx];
+      if (!sl?.dist) return;
+      const domId = sl.dist.dominant_id;
+      const domPct = sl.dist.dominant_pct ?? sl.dist.probabilities?.[domId] ?? 0;
+      const meta = getArchetypeMeta(domId);
+      const ch = getActiveLightChapter(hoverMin, getDayLightChapters());
+      const chPrefix = ch ? `${ch.label} · ` : "";
+      tipEl.textContent = `${formatMinutesToHHMM(hoverMin)} · ${chPrefix}${meta.name} ${domPct}%`;
+      tipEl.style.left = `${(Math.max(0.08, Math.min(0.92, frac)) * 100).toFixed(1)}%`;
+      tipEl.hidden = false;
+    });
+    scrubberEl.addEventListener("pointerleave", () => {
+      tipEl.hidden = true;
+    });
+  }
 }
 
 function renderLightArchetypeScenarioUI(dist, activeId, hourlyMet = null) {
   if (!dist || !dist.probabilities) return;
   bindArchetypeSwitcherEvents();
+  renderLightChaptersStrip(state.currentMinutes);
+  renderTimelineArchetypeRibbon();
 
   const isPinned = Boolean(state.pinnedArchetypeId);
   const timeTxt = formatMinutesToHHMM(state.currentMinutes);
@@ -5164,6 +5570,8 @@ function syncBriefVerdictHero(w) {
   }
 
   _lastArchetypeUiKey = "";
+  _lastChaptersRenderKey = "";
+  _lastRibbonRenderKey = "";
   if (w.light_archetypes?.probabilities) {
     const activeId = state.pinnedArchetypeId || w.light_archetypes.dominant_id;
     renderLightArchetypeScenarioUI(w.light_archetypes, activeId);
@@ -6046,6 +6454,8 @@ async function loadLandmarkScenario(customCoord = null) {
       : null;
   pendingBootArchetype = null;
   _lastArchetypeUiKey = "";
+  _lastChaptersRenderKey = "";
+  _lastRibbonRenderKey = "";
   _lastHybridGodRaysKey = "";
 
   const lmSel = document.getElementById("landmark-select");
@@ -7130,11 +7540,17 @@ btnSunset.addEventListener("click", () => {
 
 btnBlueHour?.addEventListener("click", () => {
   markActiveTimePreset(btnBlueHour);
+  const duskCh = getDayLightChapters().find((c) => c.id === "dusk_blue");
+  if (duskCh) {
+    jumpToLightChapter("dusk_blue");
+    return;
+  }
   const sunsetWin = state.shootReport?.golden_hour_windows?.find((w) =>
     w.phase.toLowerCase().includes("sunset")
   );
   const sunsetMins = sunsetWin ? parseHHMMToMinutes(sunsetWin.peak_time_local) : 17 * 60 + 18;
-  const mins = Math.min(1435, sunsetMins + 24);
+  const mins = Math.min(1435, sunsetMins + 28);
+  state.pinnedArchetypeId = null;
   state.currentMinutes = mins;
   timeScrubber.value = String(mins);
   syncSliderValue(timeScrubber);

@@ -337,6 +337,63 @@ class TestSevenArchetypeLightEngine(unittest.TestCase):
         self.assertNotEqual(timeline[13]["light_archetypes"]["dominant_id"], "blue_hour")
 
 
+        # Verify all 5 exact solar-ephemeris-anchored Light Chapters & sun_events
+        chapters = doc.get("light_chapters")
+        self.assertIsInstance(chapters, list)
+        self.assertEqual(
+            [c["id"] for c in chapters],
+            ["dawn_blue", "morning_gold", "midday", "evening_gold", "dusk_blue"],
+        )
+        prev_peak = -1
+        for ch in chapters:
+            self.assertGreater(ch["peak_minutes"], prev_peak)
+            prev_peak = ch["peak_minutes"]
+            self.assertLessEqual(ch["start_minutes"], ch["peak_minutes"])
+            self.assertLessEqual(ch["peak_minutes"], ch["end_minutes"])
+            ch_probs = ch["light_archetypes"]["probabilities"]
+            self.assertEqual(set(ch_probs.keys()), set(ARCHETYPE_ORDER))
+            self.assertEqual(sum(ch_probs.values()), 100)
+
+        # Under the same evening weather, Evening Gold and Dusk Blue separate Filtered Gold vs Blue Hour
+        eve_gold = next(c for c in chapters if c["id"] == "evening_gold")
+        dusk_blue = next(c for c in chapters if c["id"] == "dusk_blue")
+        self.assertGreater(eve_gold["sun_el_deg"], -1.5)
+        self.assertLess(dusk_blue["sun_el_deg"], -2.0)
+        self.assertEqual(dusk_blue["light_archetypes"]["dominant_id"], "blue_hour")
+
+        sun_events = doc.get("sun_events") or {}
+        self.assertLess(sun_events["dawn_blue_min"], sun_events["sunrise_min"])
+        self.assertLess(sun_events["sunrise_min"], sun_events["solar_noon_min"])
+        self.assertLess(sun_events["solar_noon_min"], sun_events["sunset_min"])
+        self.assertLess(sun_events["sunset_min"], sun_events["dusk_blue_min"])
+
+        # A sunset Blue Hour alert catches the exact dusk_blue chapter even if golden hour is Filtered Gold
+        from planner.weather.alert_engine import evaluate_alert_gate
+
+        blue_rule = {
+            "id": "wl_blue",
+            "name": "Pedro Point Dusk Blue",
+            "phase": "sunset",
+            "target_archetypes": ["blue_hour"],
+            "min_archetype_prob_pct": 50.0,
+        }
+        ev_blue = evaluate_alert_gate(
+            blue_rule,
+            {
+                "spot_id": "pedro_point",
+                "name": "Pedro Point Headlands",
+                "eval_phase": "sunset",
+                "light_archetypes": doc["light_archetypes"],
+                "light_chapters": chapters,
+                "hourly_timeline": [],
+                "metrics": {"calibrated_p10_pct": 30.0, "calibrated_p50_pct": 65.0, "calibrated_p90_pct": 85.0},
+            },
+        )
+        self.assertEqual(ev_blue["decision"], "TRIGGER")
+        self.assertEqual(ev_blue["matched_archetype_id"], "blue_hour")
+        self.assertEqual(ev_blue["best_time_local"], dusk_blue["peak_local"])
+
+
 class TestLightFinderRebrand(unittest.TestCase):
     def test_user_facing_rebrand_across_html_og_seo_and_field_card(self) -> None:
         index_html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")

@@ -288,6 +288,22 @@ def _select_best_archetype_window(
         primary_hr = int(phase_mins) // 60 if phase_mins is not None else None
         candidates.append((True, primary_time, primary_hr, primary_dist))
 
+    for ch in scored_spot.get("light_chapters") or []:
+        if not isinstance(ch, dict):
+            continue
+        c_dist = ch.get("light_archetypes")
+        if not isinstance(c_dist, dict) or not isinstance(c_dist.get("probabilities"), dict):
+            continue
+        c_id = str(ch.get("id") or "").lower()
+        c_mins = ch.get("peak_minutes")
+        if eval_phase == "sunrise" and c_id not in ("dawn_blue", "morning_gold"):
+            continue
+        if eval_phase == "sunset" and c_id not in ("evening_gold", "dusk_blue"):
+            continue
+        c_hr = int(c_mins) // 60 if c_mins is not None else None
+        c_lbl = str(ch.get("peak_local") or _format_minutes_hhmm(c_mins) or "") or None
+        candidates.append((False, c_lbl, c_hr, c_dist))
+
     timeline = scored_spot.get("hourly_timeline") or []
     for entry in timeline:
         if not isinstance(entry, dict):
@@ -637,6 +653,7 @@ def evaluate_watchlist_rule_live(
             doc = json.loads(raw)
             scored = classify_spot_phenomena_and_attribution(sp, doc)
             scored["light_archetypes"] = doc.get("light_archetypes")
+            scored["light_chapters"] = doc.get("light_chapters") or []
             scored["hourly_timeline"] = doc.get("hourly_timeline") or []
             scored["phase_minutes_local"] = phase_mins
             scored["eval_phase"] = ph

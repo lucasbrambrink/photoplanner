@@ -7,7 +7,7 @@
   <title>LightFinder — 3D Light &amp; Lens Viewfinder</title>
   <meta name="description" content="LightFinder — 3D topographic terrain, 7-archetype probabilistic light engine, and 16–200mm lens viewfinder." />
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23f59e0b' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='8' r='3.5'/%3E%3Cpath d='M3 20l6-8 4 5 3-4 5 7H3z'/%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="/styles.css?v=20261125a" />
+  <link rel="stylesheet" href="/styles.css?v=20261126a" />
   <script type="importmap">
     {
       "imports": {
@@ -153,6 +153,15 @@
       <div class="sheet-body" id="sheet-body">
         <!-- 7-Archetype Probabilistic 3D Scenario Switcher -->
         <section class="verdict-hero archetype-hero" id="archetype-brief-section" aria-label="Probabilistic Light Archetypes">
+          <!-- Time-Separated Solar Light Chapters (Dawn Blue -> AM Gold -> Midday -> PM Gold -> Dusk Blue) -->
+          <div class="light-chapters-block" id="light-chapters-block">
+            <div class="light-chapters-head">
+              <span class="light-chapters-title">Day's Light Windows</span>
+              <span class="light-chapters-range" id="active-chapter-window">Solving solar chapters…</span>
+            </div>
+            <div class="light-chapters-strip" id="light-chapters-strip" role="group" aria-label="Day's Light Chapters"></div>
+          </div>
+
           <div class="archetype-head-row">
             <div class="archetype-status-wrap">
               <span class="archetype-dot" id="archetype-active-dot" aria-hidden="true"></span>
@@ -460,25 +469,36 @@
           <span id="hud-phase-badge" hidden>Sunset</span>
         </div>
 
-        <div class="slider-field dock-slider-wrap">
-          <input
-            class="slider-input timeline-range"
-            id="time-scrubber"
-            type="range"
-            min="0"
-            max="1440"
-            value="1038"
-            step="1"
-            aria-label="24-Hour Solar and Astro Scrubber"
-          />
+        <div class="slider-field dock-slider-wrap" id="dock-slider-wrap">
+          <div class="timeline-ribbon-shell">
+            <canvas
+              id="timeline-archetype-ribbon"
+              class="timeline-archetype-ribbon"
+              width="480"
+              height="28"
+              aria-hidden="true"
+            ></canvas>
+            <input
+              class="slider-input timeline-range"
+              id="time-scrubber"
+              type="range"
+              min="0"
+              max="1440"
+              value="1038"
+              step="1"
+              aria-label="24-Hour Light Archetype Timeline Scrubber"
+            />
+            <div class="timeline-hover-tip" id="timeline-hover-tip" hidden></div>
+          </div>
+          <div class="timeline-ribbon-ticks" id="timeline-ribbon-ticks" aria-hidden="true"></div>
         </div>
 
         <div class="dock-quick-jumps" role="group" aria-label="Quick Light Jumps">
           <button type="button" class="dock-jump-btn" id="btn-jump-sunrise" title="Jump to Sunrise Golden Hour">Rise</button>
           <button type="button" class="dock-jump-btn is-active" id="btn-jump-sunset" title="Jump to Sunset Golden Hour">Set</button>
+          <button type="button" class="dock-jump-btn" id="btn-jump-bluehour" title="Jump to Dusk Blue Hour">Blue</button>
           <button type="button" class="dock-jump-btn" id="btn-jump-night" title="Jump to Astro / Milky Way Peak">Astro</button>
           <button type="button" id="btn-jump-dawn-astro" hidden>02:00</button>
-          <button type="button" id="btn-jump-bluehour" hidden>Blue</button>
         </div>
 
         <button type="button" class="dock-fog-chip" id="btn-cycle-fog-band" title="Cycle 3D probabilistic fog-sea lid (P10 / P50 / P90 / Off)">
@@ -888,6 +908,6 @@
     </div>
   </main>
 
-  <script type="module" src="/app.js?v=20261125b"></script>
+  <script type="module" src="/app.js?v=20261126a"></script>
 </body>
 </html>
