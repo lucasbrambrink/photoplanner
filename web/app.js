@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { VolumetricAtmosphereEngine } from "./volumetric-engine.js?v=20261121b";
+import { VolumetricAtmosphereEngine } from "./volumetric-engine.js?v=20261126a";
 
 // Conditional Popover API polyfill loader (content-first-noise-reduction)
 if (!Object.hasOwn(HTMLElement.prototype, "popover")) {
@@ -69,6 +69,8 @@ const state = {
   shootReport: null,
   terrainPatch: null,
   weatherReport: null,
+  weatherLoadState: "loading", // "loading" | "ready" | "error"
+  weatherErrorMsg: "",
   activeAtmosphericLayers: null,
   hoveredCloudLayerId: null,
   customTripodReport: null,
@@ -76,7 +78,7 @@ const state = {
   selectedVpIndex: 0, // 0..2 when a VP is expanded, -1 when collapsed or inspecting custom pin
   cameraMode: "orbit", // "orbit" | "vp-0" | "vp-1" | "vp-2" | "custom-tripod" | "webcam-snap"
   clickMode: "tripod", // "tripod" | "target"
-  surfaceStyle: 0, // 0 = Granite Relief, 1 = USGS Satellite, 2 = Topo Contours
+  surfaceStyle: 1, // 0 = Granite Relief, 1 = USGS Satellite (photorealistic default), 2 = Topo Contours
   terrainSpanM: (() => {
     const saved = Number(localStorage.getItem("pp_terrain_span_m"));
     return [12000, 28000, 48000].includes(saved) ? saved : 28000;
@@ -85,11 +87,11 @@ const state = {
   isPlayingSun: false,
   showSunBeams: false,
   showLightField: false,
-  showAtmosphere: true, // WebGL2 3D Volumetric Fluid Lab enabled by default
+  showAtmosphere: true, // Real 3D HRRR/GOES volumetric clouds + DEM terrain-edge & cloud-gap light shafts ON by default
   fogSliceBand: "p50", // "p10" | "p50" | "p90" | "off" (lightweight 3D fog-sea elevation slice)
   focalLengthMm: 35, // 16 | 24 | 35 | 50 | 70 | 200 (full-frame 35mm camera lens viewfinder)
   showSightlines: true,
-  highlightLandingZone: true,
+  highlightLandingZone: false,
   webcamReport: null,
   selectedWebcamIdx: 0,
   selectedWebcamFrameIdx: -1,
@@ -929,6 +931,7 @@ const SKY_DOME_FRAGMENT = /* glsl */ `
   uniform float uFogImmersion;   // 0..1 local valley/coastal fog immersion
   uniform float uAodHaze;        // 0..1 CAMS aerosol + humid Mie haze
   uniform float uCanvasGlow;     // 0..1 overhead cloud-canvas illumination potential
+  uniform float uVolumetricActive; // 1.0 when real 3D HRRR/GOES volumetric raymarcher owns the clouds
   uniform vec3 uHorizonTint;     // synced with scene.fog.color for seamless horizon dissolve
 ${CORRIDOR_LUT_GLSL1}
 
@@ -1103,18 +1106,35 @@ ${CORRIDOR_LUT_GLSL1}
     float overcastDamp = 1.0 - smoothstep(0.68, 0.96, uLowCloud) * (1.0 - uBeamSpread * 0.65);
     skyCol += dawnDuskGlow * (mieCore * 0.68 + mieBroad * (0.36 + 0.28 * uAodHaze)) * sunGlowVis * corridorGlowFactor * overcastDamp;
 
-    // 2. Solar Disk & Aureole (behind clouds, attenuated naturally by clouds & corridor)
+    // 2. Solar Disk & Veil Aureole (Beer-Lambert extinction across ALL cloud decks: low, mid, high cirrus veil)
     float skyCloudOcc = 0.0;
     if (el > -1.4 && y > -0.03) {
       float angDeg = degrees(acos(clamp(sunCos, -1.0, 1.0)));
-      float diskMask = 1.0 - smoothstep(0.24, 0.36, angDeg);
-      float aureole = exp(-angDeg / 1.45) * 0.55 + exp(-angDeg / 4.8) * (0.16 + 0.22 * uAodHaze);
       float sinEl = sin(radians(max(el, 0.12)));
       float airMass = clamp(1.0 / (sinEl + 0.12 * pow(max(0.0, el + 2.8), -0.75)), 1.0, 28.0);
       vec3 sunExt = exp(-vec3(0.048, 0.122, 0.255) * airMass);
       float horizonCut = smoothstep(-1.2, 0.15, el);
-      float diskVis = clamp(uBeamTrans, 0.0, 1.0) * (1.0 - smoothstep(0.72, 0.96, uLowCloud));
-      skyCol += sunExt * (diskMask * 4.2 + aureole * 1.15) * horizonCut * diskVis;
+
+      // Total slant optical depth along the solar ray from Low, Mid, and High Cirrus Veil decks
+      float veilTau = uHighCloud * max(0.55, uHighTau) * 1.65;
+      float tauDisk = uLowCloud * 6.8 + uMidCloud * 4.2 + veilTau;
+      float beamGate = clamp(uBeamTrans, 0.0, 1.0);
+
+      // Direct crisp solar disk vanishes smoothly under High Thin Veil (exp(-tau)) & disappears under overcast!
+      float sharpDiskVis = beamGate * exp(-tauDisk * 1.45) * (1.0 - smoothstep(0.55, 0.92, uLowCloud));
+      float diskMask = 1.0 - smoothstep(0.24, 0.38, angDeg);
+
+      // In High Thin Veil (cirrostratus), direct beam scatters forward into a wide milky aureole + subtle 22-deg ice halo
+      float veilFactor = smoothstep(0.25, 0.80, uHighCloud) * (1.0 - smoothstep(0.45, 0.85, max(uLowCloud, uMidCloud)));
+      float aureoleWidth = mix(1.45, 4.6, veilFactor);
+      float aureoleVis = beamGate * exp(-max(0.0, tauDisk - 1.35) * 0.58) * (1.0 - smoothstep(0.72, 0.96, max(uLowCloud, uMidCloud)));
+      float aureole = exp(-angDeg / aureoleWidth) * mix(0.52, 0.34, veilFactor)
+                    + exp(-angDeg / 7.5) * (0.14 + 0.24 * uAodHaze + 0.22 * veilFactor);
+      float iceHalo22 = 0.075 * veilFactor * exp(-pow((angDeg - 22.0) / 2.6, 2.0)) * beamGate;
+      vec3 veilMilkyCol = mix(sunExt, vec3(0.96, 0.94, 0.92), veilFactor * 0.45);
+
+      skyCol += sunExt * (diskMask * 3.8 * sharpDiskVis) * horizonCut;
+      skyCol += veilMilkyCol * (aureole * 0.95 * aureoleVis + iceHalo22) * horizonCut;
     }
 
     // 3. Lunar Disk in twilight / night
@@ -1127,12 +1147,12 @@ ${CORRIDOR_LUT_GLSL1}
       skyCol += vec3(0.84, 0.90, 1.0) * (mDisk * 1.55 + mGlow) * uMoonIllum * smoothstep(-0.6, 1.0, uMoonElDeg);
     }
 
-    // 4. Three Physically-Lit Local Cloud Decks (far-to-near compositing: High Cirrus -> Mid Altocumulus -> Low Cumulus/Stratus)
+    // 4. Fallback 2D Cloud Decks (only rendered when 3D HRRR/GOES volumetric raymarcher is toggled OFF)
     float dayAmbient = 0.06 + 0.94 * smoothstep(-8.5, 6.0, el);
     vec3 skyAmbientTop = mix(vec3(0.14, 0.22, 0.38), vec3(0.60, 0.72, 0.86), smoothstep(-4.0, 14.0, el)) * dayAmbient;
 
-    if (y > -0.02) {
-      float horizonFade = smoothstep(-0.02, 0.09, y);
+    if (y > -0.02 && uVolumetricActive < 0.5) {
+      float horizonFade = smoothstep(-0.03, 0.015, y);
 
       // --- DECK 3: High Cirrus & Alpenglow Veil (~9.5 km ASL) ---
       if (uHighCloud > 0.04) {
@@ -1301,6 +1321,7 @@ const skyDomeMat = new THREE.ShaderMaterial({
     uFogImmersion: { value: 0.12 },
     uAodHaze: { value: 0.22 },
     uCanvasGlow: { value: 0.55 },
+    uVolumetricActive: { value: 1.0 },
     uHorizonTint: { value: new THREE.Color(0x52647a) },
     ...volumetricEngine.corridorUniforms,
   },
@@ -1710,8 +1731,9 @@ const TERRAIN_FRAGMENT_SHADER = /* glsl */ `
     float litEffective = mix(0.55 + 0.45 * topoLit, pow(clamp(topoLit, 0.0, 1.0), mix(0.65, 1.45, clamp(uArchShadowSharpness * 0.75, 0.0, 1.0))), clamp(uArchShadowSharpness, 0.0, 1.0));
     float ndotlShaped = mix(0.62 + 0.38 * ndotl, ndotl, clamp(uArchShadowSharpness, 0.0, 1.0));
 
-    // Ambient / Shadowed Umbra vs. Sunlit Direct Key driven by active Light Archetype
-    vec3 shadowColor = archRockBase * uArchShadowTint * (0.48 + 0.52 * uArchAmbientWeight) * (0.55 + 0.45 * relZ);
+    // Ambient / Shadowed Umbra with realistic hemisphere sky-fill (prevents crushed pitch-black backlit cliffs)
+    vec3 hemiFill = mix(uArchShadowTint, vec3(0.46, 0.54, 0.70), 0.35);
+    vec3 shadowColor = archRockBase * hemiFill * (0.76 + 0.54 * uArchAmbientWeight) * (0.68 + 0.32 * relZ);
     vec3 warmSunColor = uArchKeyTint * corrChromaTint;
     float cloudMod = mix(1.0, effectiveCloudLight, clamp(uArchShadowSharpness * 0.65, 0.0, 0.85));
     vec3 sunlitColor = archRockBase * (uArchAmbientWeight * 0.52 + uArchDirectWeight * (0.28 + 0.92 * ndotlShaped) * stormUmbraMask) * warmSunColor * cloudMod;
@@ -1844,23 +1866,31 @@ const TERRAIN_FRAGMENT_SHADER = /* glsl */ `
       }
     }
 
-    // Apply contour overlays
+    // Apply contour overlays ONLY on Relief (0) and Topo (2) — keep USGS Satellite (1) clean & photographic!
     if (uSurfaceStyle > 1.5) {
       // High-contrast Topo Contours mode
       finalColor = mix(finalColor, vec3(0.95, 0.76, 0.32), contour20 * 0.26);
       finalColor = mix(finalColor, vec3(1.0, 0.86, 0.45), contour200 * 0.65);
-    } else {
+    } else if (uSurfaceStyle < 0.5) {
       finalColor = mix(finalColor, finalColor * 0.76, contour50 * 0.25);
       finalColor = mix(finalColor, vec3(0.95, 0.82, 0.55), contour200 * 0.18);
     }
 
-    // 4. Graduated Exponential Aerial Perspective & Depth-Layer Mist (synced with scene.fog at 60 FPS)
-    float camDist = length(cameraPosition - vWorldPos);
+    // 4. Physically-Based Directional Rayleigh/Mie Aerial Perspective & Depth-Layer Ridge Mist
+    vec3 viewVec = vWorldPos - cameraPosition;
+    float camDist = length(viewVec);
+    vec3 viewDir = viewVec / max(camDist, 1.0);
+    vec3 sunDirW = normalize(vec3(uSunDirENU.x, uSunDirENU.z, -uSunDirENU.y));
+    float sunViewAlign = max(0.0, dot(viewDir, sunDirW));
+    float mieForward = pow(sunViewAlign, 4.0) * smoothstep(-2.5, 6.0, sunElDeg);
+    vec3 rayleighCool = uSceneFogColor * vec3(0.92, 0.98, 1.10);
+    vec3 mieWarm = mix(vec3(1.0, 0.62, 0.34), vec3(1.0, 0.86, 0.64), smoothstep(0.0, 12.0, sunElDeg));
+    vec3 aerialColor = mix(rayleighCool, mieWarm, clamp(mieForward * (0.42 + 0.48 * goldenFactor) * cloudTransmittance, 0.0, 0.85));
+
     float distFog = 1.0 - exp(-camDist * uSceneFogDensity);
-    // Low-valley mist weighting makes successive ridges separate into crisp graduated layers in Atmospheric Diffusion
-    float valleyLayerBoost = (1.0 - smoothstep(0.10, 0.88, relZ)) * uAerialLayerStrength * 0.48 * smoothstep(400.0, 4800.0, camDist);
-    float totalAerial = clamp(distFog + valleyLayerBoost, 0.0, 0.92);
-    finalColor = mix(finalColor, uSceneFogColor, totalAerial);
+    float valleyLayerBoost = (1.0 - smoothstep(0.10, 0.88, relZ)) * uAerialLayerStrength * 0.44 * smoothstep(400.0, 4800.0, camDist);
+    float totalAerial = clamp(distFog + valleyLayerBoost, 0.0, 0.90);
+    finalColor = mix(finalColor, aerialColor, totalAerial);
 
     gl_FragColor = vec4(finalColor, 1.0);
   }
@@ -3859,6 +3889,7 @@ function _lerpColorHex(hexA, hexB, t, out = new THREE.Color()) {
 
 function computePhysicalAtmosphereState(minutes, elevationDeg, hourlyMet, realization = "p50") {
   const wr = state.weatherReport;
+  const hasWeather = Boolean(wr || hourlyMet);
   const inv = wr?.inversion_model || {};
   const realKey = realization === "p10" || realization === "p90" ? realization : "p50";
   const lmElevFt =
@@ -3866,22 +3897,22 @@ function computePhysicalAtmosphereState(minutes, elevationDeg, hourlyMet, realiz
     inv.target_elev_ft ??
     (state.terrainPatch?.max_elevation_m ? state.terrainPatch.max_elevation_m * 3.28084 : 1500);
 
-  // Pull raw hourly or primary forecast fields
-  const baseP10 = hourlyMet?.p10Pct ?? wr?.calibrated_probabilities?.transmittance_p10_pct ?? wr?.transmittance_p10_pct ?? 35;
-  const baseP50 = hourlyMet?.p50Pct ?? wr?.calibrated_probabilities?.transmittance_p50_pct ?? wr?.transmittance_p50_pct ?? 62;
-  const baseP90 = hourlyMet?.p90Pct ?? wr?.calibrated_probabilities?.transmittance_p90_pct ?? wr?.transmittance_p90_pct ?? 86;
-  const baseLow = hourlyMet?.cloudLowPct ?? wr?.cloud_low_pct ?? 18;
-  const baseMid = hourlyMet?.cloudMidPct ?? wr?.cloud_mid_pct ?? 18;
-  const baseHigh = hourlyMet?.cloudHighPct ?? wr?.cloud_high_pct ?? 35;
-  const baseFogPct = hourlyMet?.fogPct ?? wr?.valley_inversion_fog_pct ?? baseLow;
-  const baseHighTau = hourlyMet?.highOpticalDepth ?? wr?.fluid_atmosphere_params?.highOpticalDepth ?? (baseHigh / 100) * 1.1;
-  const baseVisMi = hourlyMet?.visibilityMiles ?? wr?.visibility_miles ?? 18;
-  const baseRh = hourlyMet?.rhPct ?? inv.rh_2m_pct ?? 58;
-  const baseAod = hourlyMet?.aod550 ?? wr?.astro_atmosphere?.aod_550nm ?? 0.07;
-  const baseCanvas = hourlyMet?.canvasGlow ?? wr?.canvas_score ?? 52;
-  const fogP50Ft = hourlyMet?.fogTopFt ?? inv.fog_top_p50_ft ?? inv.fog_top_ft ?? 1250;
-  const fogP10Ft = inv.fog_top_p10_ft ?? Math.max(120, fogP50Ft - 320);
-  const fogP90Ft = inv.fog_top_p90_ft ?? (fogP50Ft + 320);
+  // Pull raw hourly or primary forecast fields (NEVER invent fake storm-break clouds if weather hasn't loaded!)
+  const baseP10 = hasWeather ? (hourlyMet?.p10Pct ?? wr?.calibrated_probabilities?.transmittance_p10_pct ?? wr?.transmittance_p10_pct ?? 84) : 88;
+  const baseP50 = hasWeather ? (hourlyMet?.p50Pct ?? wr?.calibrated_probabilities?.transmittance_p50_pct ?? wr?.transmittance_p50_pct ?? 90) : 92;
+  const baseP90 = hasWeather ? (hourlyMet?.p90Pct ?? wr?.calibrated_probabilities?.transmittance_p90_pct ?? wr?.transmittance_p90_pct ?? 95) : 96;
+  const baseLow = hasWeather ? (hourlyMet?.cloudLowPct ?? wr?.cloud_low_pct ?? 0) : 0;
+  const baseMid = hasWeather ? (hourlyMet?.cloudMidPct ?? wr?.cloud_mid_pct ?? 0) : 0;
+  const baseHigh = hasWeather ? (hourlyMet?.cloudHighPct ?? wr?.cloud_high_pct ?? 0) : 0;
+  const baseFogPct = hasWeather ? (hourlyMet?.fogPct ?? wr?.valley_inversion_fog_pct ?? baseLow) : 0;
+  const baseHighTau = hasWeather ? (hourlyMet?.highOpticalDepth ?? wr?.fluid_atmosphere_params?.highOpticalDepth ?? (baseHigh / 100) * 1.1) : 0.0;
+  const baseVisMi = hasWeather ? (hourlyMet?.visibilityMiles ?? wr?.visibility_miles ?? 24) : 25;
+  const baseRh = hasWeather ? (hourlyMet?.rhPct ?? inv.rh_2m_pct ?? 48) : 45;
+  const baseAod = hasWeather ? (hourlyMet?.aod550 ?? wr?.astro_atmosphere?.aod_550nm ?? 0.06) : 0.06;
+  const baseCanvas = hasWeather ? (hourlyMet?.canvasGlow ?? wr?.canvas_score ?? 35) : 20;
+  const fogP50Ft = hasWeather ? (hourlyMet?.fogTopFt ?? inv.fog_top_p50_ft ?? inv.fog_top_ft ?? 0) : 0;
+  const fogP10Ft = inv.fog_top_p10_ft ?? (fogP50Ft > 0 ? Math.max(120, fogP50Ft - 320) : 0);
+  const fogP90Ft = inv.fog_top_p90_ft ?? (fogP50Ft > 0 ? fogP50Ft + 320 : 0);
 
   // Realization shifts the genuine physical forecast ensemble envelope (P10 = thicker/higher fog/lower beam, P90 = clearer/lower fog/higher beam)
   const beamPct = realKey === "p10" ? baseP10 : realKey === "p90" ? baseP90 : baseP50;
@@ -3889,7 +3920,7 @@ function computePhysicalAtmosphereState(minutes, elevationDeg, hourlyMet, realiz
   const spreadPct = Math.max(0, baseP90 - baseP10);
   const beamSpread = _lfClamp(spreadPct / 68.0, 0.0, 1.0);
 
-  const cloudShift = realKey === "p10" ? 16 : realKey === "p90" ? -16 : 0;
+  const cloudShift = hasWeather ? (realKey === "p10" ? 16 : realKey === "p90" ? -16 : 0) : 0;
   const lowPct = _lfClamp(baseLow + cloudShift, 0, 100);
   const midPct = _lfClamp(baseMid + cloudShift * 0.75, 0, 100);
   const highPct = _lfClamp(baseHigh + cloudShift * 0.35, 0, 100);
@@ -4037,6 +4068,7 @@ function computePhysicalAtmosphereState(minutes, elevationDeg, hourlyMet, realiz
   }
 
   return {
+    hasWeather,
     realization: realKey,
     beamPct: Math.round(beamPct),
     beamTrans,
@@ -4164,12 +4196,13 @@ function updateSunRaysAndShader() {
   su.uFogImmersion.value = phys.fogImmersion;
   su.uAodHaze.value = phys.aodHaze;
   su.uCanvasGlow.value = phys.canvasGlow;
+  su.uVolumetricActive.value = state.showAtmosphere ? 1.0 : 0.0;
   su.uHorizonTint.value.copy(phys.fogColor);
 
-  // Crepuscular scattering now emerges physically in the sky dome — disable legacy geometric cones on terrain
+  // Crepuscular scattering now emerges physically in the 3D volumetric raymarcher — disable legacy geometric cones on terrain
   hybridGodRaysGroup.visible = false;
 
-  // Sync Solar & Lunar Vectors to the opt-in GPU WebGL2 Volumetric Raymarcher
+  // Sync Solar & Lunar Vectors to the GPU WebGL2 Volumetric Cloud & Terrain-Edge Light-Shaft Raymarcher
   volumetricEngine.updateCelestialUniforms({
     sunDirWorld,
     sunElDeg: elevationDeg,
@@ -4210,6 +4243,8 @@ function updateSunRaysAndShader() {
       midPct: phys.midPct,
       highPct: phys.highPct,
       fogPct: phys.fogPct,
+      aodHaze: phys.aodHaze,
+      beamTrans: phys.beamTrans,
       isScrubbing: isScrubbingTime || state.isPlayingSun,
     });
 
@@ -4579,7 +4614,7 @@ function updateSunRaysAndShader() {
     }
   }
 
-  sunBeamsGroup.visible = shouldBuildSunBeams && state.cameraMode === "orbit";
+  sunBeamsGroup.visible = shouldBuildSunBeams;
 
   // Update unified bottom Scrubber & telemetry readouts (concise so slider width never squishes)
   const hhmm = formatMinutesToHHMM(state.currentMinutes);
@@ -5399,16 +5434,16 @@ function computeArchetypeDistAtMinute(minutes) {
   }
   return computeClientLightArchetypes({
     sunElDeg: elevationDeg,
-    p10Pct: 35,
-    p50Pct: 62,
-    p90Pct: 86,
-    cloudLowPct: 18,
-    cloudMidPct: 15,
-    cloudHighPct: 35,
+    p10Pct: 88,
+    p50Pct: 92,
+    p90Pct: 96,
+    cloudLowPct: 0,
+    cloudMidPct: 0,
+    cloudHighPct: 0,
     fogTopFt: 0,
     targetElevFt: lmElevFt,
-    canvasGlowScore: 60,
-    aod550: 0.08,
+    canvasGlowScore: 20,
+    aod550: 0.06,
   });
 }
 
@@ -5704,6 +5739,12 @@ function bindArchetypeSwitcherEvents() {
   autoBtn?.addEventListener("click", () => selectForecastRealization("p50"));
 
   const onRealizationClick = (e) => {
+    const retryBtn = e.target.closest("[data-weather-retry]");
+    if (retryBtn) {
+      const phase = state.currentMinutes < 12 * 60 ? "sunrise" : "sunset";
+      fetchWeatherForCorridor(phase);
+      return;
+    }
     const rBtn = e.target.closest("[data-realization]");
     if (rBtn) {
       selectForecastRealization(rBtn.dataset.realization);
@@ -5780,7 +5821,7 @@ function renderLightArchetypeScenarioUI(dist, activeId, hourlyMet = null, physSt
       realKey
     );
 
-  const uiKey = `${realKey}|${activeId}|${timeTxt}|${phys.beamPct}|${phys.lowPct}/${phys.midPct}/${phys.highPct}|${rankedIds.map((k) => `${k}:${probs[k]}`).join(",")}`;
+  const uiKey = `${state.weatherLoadState}|${state.weatherErrorMsg}|${state.weatherReport?.data_provenance?.trust_badge || ""}|${realKey}|${activeId}|${timeTxt}|${phys.beamPct}|${phys.lowPct}/${phys.midPct}/${phys.highPct}|${rankedIds.map((k) => `${k}:${probs[k]}`).join(",")}`;
   if (uiKey === _lastArchetypeUiKey) return;
   _lastArchetypeUiKey = uiKey;
 
@@ -5796,13 +5837,25 @@ function renderLightArchetypeScenarioUI(dist, activeId, hourlyMet = null, physSt
   // 1. Header row (P10/P50/P90 Realization + Blended Light Mix + time chip + P50 reset)
   const dotEl = document.getElementById("archetype-active-dot");
   if (dotEl) {
-    dotEl.style.background = activeMeta.accent_hex;
-    dotEl.style.boxShadow = `0 0 8px ${activeMeta.accent_hex}88`;
+    const dotCol =
+      state.weatherLoadState === "error"
+        ? "#ef4444"
+        : state.weatherLoadState === "loading" && !state.weatherReport
+          ? "#64748b"
+          : activeMeta.accent_hex;
+    dotEl.style.background = dotCol;
+    dotEl.style.boxShadow = `0 0 8px ${dotCol}88`;
   }
   const realTag = realKey === "p10" ? "P10 THICKER" : realKey === "p90" ? "P90 CLEARER" : "P50 EXPECTED";
   const modeLabelEl = document.getElementById("archetype-mode-label");
   if (modeLabelEl) {
-    modeLabelEl.textContent = `${realTag} · ${mixHeadline}`;
+    if (state.weatherLoadState === "error" && !state.weatherReport) {
+      modeLabelEl.textContent = "FORECAST UNAVAILABLE";
+    } else if (state.weatherLoadState === "loading" && !state.weatherReport) {
+      modeLabelEl.textContent = "SYNCING LIVE HRRR 3KM + GOES…";
+    } else {
+      modeLabelEl.textContent = `${realTag} · ${mixHeadline}`;
+    }
   }
   const timeChipEl = document.getElementById("archetype-time-chip");
   if (timeChipEl) timeChipEl.textContent = timeTxt;
@@ -5815,7 +5868,7 @@ function renderLightArchetypeScenarioUI(dist, activeId, hourlyMet = null, physSt
     autoBtnEl.setAttribute("aria-pressed", String(isExpected));
   }
 
-  // 2. Physical Forecast Realization Switcher (P10 Thicker | P50 Expected | P90 Clearer) + Live Atmosphere Readout
+  // 2. Physical Forecast Realization Switcher (P10 Thicker | P50 Expected | P90 Clearer) + Honest Provenance Strip
   const { elevationDeg } = getSolarAnglesAtMinutes(state.currentMinutes);
   const realStates = {
     p10: realKey === "p10" ? phys : computePhysicalAtmosphereState(state.currentMinutes, elevationDeg, hourlyMet, "p10"),
@@ -5831,44 +5884,69 @@ function renderLightArchetypeScenarioUI(dist, activeId, hourlyMet = null, physSt
 
   const cardsEl = document.getElementById("scenario-cards-list");
   if (cardsEl) {
-    const cardsHtml = realSpecs
-      .map(({ id, badge, sub, st }) => {
-        const domId = st.lightMix?.dominant_id || "filtered_gold";
-        const domMeta = getArchetypeMeta(domId);
-        const isAct = id === realKey;
-        const shortLbl = CHAPTER_SHORT_ARCH_LABEL[domId] || domMeta.short_name;
-        const tip = `${badge} ${sub}: Corridor beam ${st.beamPct}%, Clouds ${st.lowPct}%L / ${st.midPct}%M / ${st.highPct}%H, Fog ${st.fogTopFt} ft`;
-        return `
-          <button
-            type="button"
-            class="realization-card${isAct ? " is-active" : ""}"
-            data-realization="${id}"
-            aria-pressed="${isAct ? "true" : "false"}"
-            title="${escapeHtmlText(tip)}"
-            style="--real-col:${escapeHtmlText(domMeta.accent_hex)};"
-          >
-            <span class="realization-top">
-              <span class="realization-badge">${badge}</span>
-              <span class="realization-sub">${sub}</span>
-            </span>
-            <span class="realization-beam">Beam ${st.beamPct}%</span>
-            <span class="realization-mix">
-              <span class="realization-dot" style="background:${escapeHtmlText(domMeta.accent_hex)};"></span>
-              <span>${escapeHtmlText(shortLbl)}</span>
-            </span>
-          </button>`;
-      })
-      .join("");
+    if (state.weatherLoadState === "error" && !state.weatherReport) {
+      cardsEl.innerHTML = `
+        <div class="weather-status-banner is-error">
+          <div class="weather-status-text">
+            <strong>Live weather forecast unavailable</strong>
+            <span>${escapeHtmlText(state.weatherErrorMsg || "Upstream weather feed did not respond. No fake forecast is shown.")}</span>
+          </div>
+          <button type="button" class="btn-subtle btn-xs" data-weather-retry="1">Retry</button>
+        </div>`;
+    } else if (state.weatherLoadState === "loading" && !state.weatherReport) {
+      cardsEl.innerHTML = `
+        <div class="scenario-card-skeleton">Syncing live NOAA HRRR 3 km + GOES satellite + 380 km solar corridor…</div>`;
+    } else {
+      const cardsHtml = realSpecs
+        .map(({ id, badge, sub, st }) => {
+          const domId = st.lightMix?.dominant_id || "filtered_gold";
+          const domMeta = getArchetypeMeta(domId);
+          const isAct = id === realKey;
+          const shortLbl = CHAPTER_SHORT_ARCH_LABEL[domId] || domMeta.short_name;
+          const tip = `${badge} ${sub}: Corridor beam ${st.beamPct}%, Clouds ${st.lowPct}%L / ${st.midPct}%M / ${st.highPct}%H, Fog ${st.fogTopFt} ft`;
+          return `
+            <button
+              type="button"
+              class="realization-card${isAct ? " is-active" : ""}"
+              data-realization="${id}"
+              aria-pressed="${isAct ? "true" : "false"}"
+              title="${escapeHtmlText(tip)}"
+              style="--real-col:${escapeHtmlText(domMeta.accent_hex)};"
+            >
+              <span class="realization-top">
+                <span class="realization-badge">${badge}</span>
+                <span class="realization-sub">${sub}</span>
+              </span>
+              <span class="realization-beam">Beam ${st.beamPct}%</span>
+              <span class="realization-mix">
+                <span class="realization-dot" style="background:${escapeHtmlText(domMeta.accent_hex)};"></span>
+                <span>${escapeHtmlText(shortLbl)}</span>
+              </span>
+            </button>`;
+        })
+        .join("");
 
-    const telemetryHtml = `
-      <div class="atmo-telemetry-strip" title="Continuous physical parameters driving the live 3D sky &amp; terrain shader">
-        <span>Beam <strong>${phys.beamPct}%</strong></span>
-        <span>Clouds <strong>${phys.lowPct}L · ${phys.midPct}M · ${phys.highPct}H</strong></span>
-        <span>Vis <strong>${phys.visMi}mi</strong></span>
-        <span>AOD <strong>${phys.aod550.toFixed(2)}</strong></span>
-      </div>`;
+      const prov = state.weatherReport?.data_provenance || {};
+      const provBadge = prov.trust_badge || prov.nwp_source || state.weatherReport?.source || "Live NWP";
+      const provPrefix = prov.is_live === false ? "Replay" : "Live";
+      const provClass = prov.is_live === false ? "is-replay" : "is-live";
+      const provenanceHtml = `
+        <div class="atmo-provenance-strip ${provClass}" title="${escapeHtmlText(prov.nwp_source || provBadge)}">
+          <span class="prov-dot" aria-hidden="true"></span>
+          <span class="prov-tag">${provPrefix}</span>
+          <span class="prov-models">${escapeHtmlText(provBadge)}</span>
+        </div>`;
 
-    cardsEl.innerHTML = `<div class="realization-grid">${cardsHtml}</div>${telemetryHtml}`;
+      const telemetryHtml = `
+        <div class="atmo-telemetry-strip" title="Continuous physical parameters driving the live 3D volumetric clouds &amp; terrain shader">
+          <span>Beam <strong>${phys.beamPct}%</strong></span>
+          <span>Clouds <strong>${phys.lowPct}L · ${phys.midPct}M · ${phys.highPct}H</strong></span>
+          <span>Vis <strong>${phys.visMi}mi</strong></span>
+          <span>AOD <strong>${phys.aod550.toFixed(2)}</strong></span>
+        </div>`;
+
+      cardsEl.innerHTML = `<div class="realization-grid">${cardsHtml}</div>${telemetryHtml}${provenanceHtml}`;
+    }
   }
 
   // 3. Active Field Reference (Shadow Edge, Contrast, Color Cast, Best For, Tactical Lever)
@@ -6374,9 +6452,17 @@ function buildTruthCacheKey(lat, lon, dateStr, phase) {
   return `${Number(lat).toFixed(4)}:${Number(lon).toFixed(4)}:${dateStr}:${phase.toLowerCase()}`;
 }
 
+let _weatherFetchSeq = 0;
+
 async function fetchWeatherForCorridor(phase = "sunset") {
   const lm = state.shootReport?.target_landmark;
   if (!lm) return;
+
+  const reqSeq = ++_weatherFetchSeq;
+  state.weatherLoadState = "loading";
+  state.weatherErrorMsg = "";
+  _lastArchetypeUiKey = "";
+  updateSunRaysAndShader();
 
   const win = state.shootReport?.golden_hour_windows?.find((w) =>
     w.phase.toLowerCase().includes(phase.toLowerCase())
@@ -6393,28 +6479,64 @@ async function fetchWeatherForCorridor(phase = "sunset") {
   const baseUrl = `/api/weather-forecast?lat=${lm.summit_lat}&lon=${lm.summit_lon}&date=${encodeURIComponent(state.date)}&phase=${phase}&sun_az=${sunAz}&sun_el=${sunEl}&elev_m=${lm.summit_elevation_m}&engine=${encodeURIComponent(state.weatherEngine)}`;
 
   const needBgTruth = isPast && effectiveReplay !== "truth" && state.cachedTruthKey !== truthKey;
-  const [res, bgTruthRes] = await Promise.all([
-    fetch(`${baseUrl}&replay_mode=${encodeURIComponent(effectiveReplay)}`),
-    needBgTruth ? fetch(`${baseUrl}&replay_mode=truth`) : Promise.resolve(null),
-  ]);
-
-  if (bgTruthRes && bgTruthRes.ok) {
-    state.cachedTruthReport = await bgTruthRes.json();
-    state.cachedTruthKey = truthKey;
+  let res = null;
+  let bgTruthRes = null;
+  try {
+    [res, bgTruthRes] = await Promise.all([
+      fetch(`${baseUrl}&replay_mode=${encodeURIComponent(effectiveReplay)}`),
+      needBgTruth ? fetch(`${baseUrl}&replay_mode=truth`) : Promise.resolve(null),
+    ]);
+  } catch (err) {
+    if (reqSeq !== _weatherFetchSeq) return;
+    state.weatherReport = null;
+    state.weatherLoadState = "error";
+    state.weatherErrorMsg = `Network error fetching live weather: ${err?.message || "connection failed"}`;
+    _lastArchetypeUiKey = "";
+    updateSunRaysAndShader();
+    wakeRenderLoop(true);
+    fetchWebcamTruthForScenario(phase);
+    return;
   }
 
-  if (res.ok) {
+  if (reqSeq !== _weatherFetchSeq) return;
+
+  if (bgTruthRes && bgTruthRes.ok) {
+    try {
+      state.cachedTruthReport = await bgTruthRes.json();
+      state.cachedTruthKey = truthKey;
+    } catch (_) {}
+  }
+
+  if (res && res.ok) {
     state.weatherReport = await res.json();
+    state.weatherLoadState = "ready";
+    state.weatherErrorMsg = "";
     if (isPast && effectiveReplay === "truth") {
       state.cachedTruthReport = state.weatherReport;
       state.cachedTruthKey = truthKey;
     }
     _activeCorridorLutSector = null;
     _lastSyncedFluidMinutes = -999;
+    _lastArchetypeUiKey = "";
+    _lastChaptersRenderKey = "";
+    _lastRibbonRenderKey = "";
     volumetricEngine.setLiveWeatherReport(state.weatherReport);
     renderWeatherCard(state.weatherReport);
     renderWebcamChromaComparison();
     updateSunRaysAndShader();
+    wakeRenderLoop(true);
+  } else {
+    let errDetail = `Weather service returned HTTP ${res ? res.status : "error"}`;
+    try {
+      const errBody = await res.json();
+      if (errBody?.error) errDetail = String(errBody.error);
+    } catch (_) {}
+    state.weatherReport = null;
+    state.weatherLoadState = "error";
+    state.weatherErrorMsg = errDetail;
+    _lastArchetypeUiKey = "";
+    updateSunRaysAndShader();
+    wakeRenderLoop(true);
   }
   fetchWebcamTruthForScenario(phase);
 }
@@ -7628,9 +7750,10 @@ const surfBtns = [
 ];
 
 surfBtns.forEach((btn, idx) => {
-  btn.addEventListener("click", () => {
+  btn?.classList.toggle("is-active", idx === state.surfaceStyle);
+  btn?.addEventListener("click", () => {
     state.surfaceStyle = idx;
-    surfBtns.forEach((b) => b.classList.remove("is-active"));
+    surfBtns.forEach((b) => b?.classList.remove("is-active"));
     btn.classList.add("is-active");
     updateSunRaysAndShader();
   });
@@ -7659,12 +7782,14 @@ function syncFluidLabButtons() {
     pill.setAttribute("aria-pressed", String(state.showAtmosphere));
     pill.classList.toggle("is-fluid-active", state.showAtmosphere);
     if (!state.showAtmosphere) {
-      pill.textContent = "Fluid Lab: Off";
+      pill.textContent = "3D Clouds: Off";
+    } else if (!volumetricEngine.evolveFluid) {
+      pill.textContent = "3D Clouds · Live";
     }
   }
   const badge = document.getElementById("fluid-perf-badge");
   if (badge && !state.showAtmosphere) {
-    badge.textContent = "Fast Mode";
+    badge.textContent = "2D Sky Mode";
   }
   const evolveBtn = document.getElementById("btn-toggle-fluid-evolve");
   if (evolveBtn) {
@@ -7675,8 +7800,8 @@ function syncFluidLabButtons() {
 
 function setFluidLabEnabled(enabled) {
   state.showAtmosphere = Boolean(enabled);
-  volumetricEngine.evolveFluid = state.showAtmosphere;
   if (!state.showAtmosphere) {
+    volumetricEngine.evolveFluid = false;
     hideCloudHoverTooltip(true);
   }
   syncFluidLabButtons();

@@ -466,5 +466,89 @@ class TestWebcamTruthFixes(unittest.TestCase):
             self.assertEqual(res_ss["primary_frame"]["timestamp_local"], "20:15")
 
 
+class TestHrrrS3FallbackBundle(unittest.TestCase):
+    def test_build_nwp_bundle_from_hrrr_s3_diurnal_interpolation(self) -> None:
+        from planner.weather.nwp_corridor import build_corridor_coords_meta, build_nwp_bundle_from_hrrr_s3
+
+        coords = build_corridor_coords_meta(37.7459, -119.5332, 241.0, 118.0)
+
+        def _mk_station(low: float, mid: float, high: float, temp: float) -> dict:
+            return {
+                "z_sfc_m": 2500.0,
+                "temp_2m_c": temp,
+                "rh_2m_pct": 48.0,
+                "dewpoint_2m_c": temp - 8.0,
+                "lcdc_pct": low,
+                "mcdc_pct": mid,
+                "hcdc_pct": high,
+                "tcdc_tot_pct": max(low, mid, high),
+                "vis_m": 45000.0,
+                "cape_j_kg": 15.0,
+                "hpbl_m": 820.0,
+                "temp_950_c": temp + 4.0,
+                "temp_925_c": temp + 2.0,
+                "temp_850_c": temp - 2.0,
+                "temp_700_c": -3.5,
+                "temp_500_c": -19.0,
+                "temp_300_c": -44.0,
+                "rh_975_pct": 52.0,
+                "rh_950_pct": 50.0,
+                "rh_925_pct": 46.0,
+                "rh_700_pct": 35.0,
+                "rh_500_pct": 28.0,
+                "rh_300_pct": max(20.0, high * 0.85),
+                "z_925_m": 780.0,
+                "z_850_m": 1510.0,
+                "z_700_m": 3100.0,
+                "z_500_m": 5690.0,
+                "z_300_m": 9380.0,
+                "u10_ms": 3.5,
+                "v10_ms": -1.2,
+                "u850_ms": 5.5,
+                "v850_ms": -1.5,
+                "u700_ms": 9.0,
+                "v700_ms": -2.0,
+                "u500_ms": 18.0,
+                "v500_ms": -4.0,
+                "u300_ms": 30.0,
+                "v300_ms": -6.0,
+                "u250_ms": 34.0,
+                "v250_ms": -7.0,
+                "aotk_550nm": 0.08,
+            }
+
+        hrrr_primary = {
+            "ok": True,
+            "cycle_tag": "20261126 19Z f06",
+            "stations": [_mk_station(0.0, 0.0, 88.0, 10.0) for _ in coords],
+        }
+        morning_stations = [_mk_station(20.0, 10.0, 30.0, 4.0) for _ in coords]
+        bundle = build_nwp_bundle_from_hrrr_s3(
+            hrrr_primary,
+            coords,
+            37.7459,
+            -119.5332,
+            "2026-11-26",
+            primary_hr_idx=17,
+            is_coastal=False,
+            hourly_hrrr_stations={6: morning_stations},
+            upstream_errors=["HTTP 429"],
+        )
+        self.assertTrue(bundle["ok"])
+        self.assertTrue(bundle["hrrr_s3_primary_fallback"])
+        self.assertEqual(len(bundle["point_docs"]), len(coords))
+        h0 = bundle["point_docs"][0]["hourly"]
+        self.assertEqual(len(h0["cloud_cover_high"]), 24)
+        self.assertAlmostEqual(h0["cloud_cover_high"][6], 30.0, places=1)
+        self.assertAlmostEqual(h0["cloud_cover_high"][17], 88.0, places=1)
+        # Midday hr=12 must smoothly interpolate between hr=6 (30%) and hr=17 (88%)
+        self.assertGreater(h0["cloud_cover_high"][12], 55.0)
+        self.assertLess(h0["cloud_cover_high"][12], 68.0)
+        # Verify extract_hour_sounding parses the HRRR S3 doc cleanly
+        snd = extract_hour_sounding(bundle["point_docs"][0], 17, 0.0, 241.0, 37.7459, -119.5332)
+        self.assertEqual(snd["cloud_high_pct"], 88)
+        self.assertEqual(snd["cloud_low_pct"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1624,6 +1624,9 @@ const VOLUMETRIC_EXTINCTION_CORE_GLSL3 = /* glsl */ `
   uniform float uCirrusDensityGain;
   uniform float uMicroDetailGain;
   uniform float uGodRayGain;
+  uniform float uAodHaze;
+  uniform float uBeamTrans;
+  uniform float uShaftCloudGate;
 
   const float EARTH_R_EFF = 7350000.0;
 
@@ -1793,17 +1796,18 @@ const VOLUMETRIC_EXTINCTION_CORE_GLSL3 = /* glsl */ `
         float tuftHeads = ciTex.g * (0.55 + 0.55 * ciFine.r);
         float filaments = mix(silkStrands, tuftHeads, 0.48 * headWeight);
 
-        float coreStrand = smoothstep(0.32, 0.84, filaments);
-        float haloStrand = smoothstep(0.14, 0.52, filaments) * 0.28;
-        float macroGate = smoothstep(0.04, 0.50, qiMacro);
-        float iceSculpt = qiMacro * macroGate * (0.14 + 1.48 * coreStrand + haloStrand);
-        sigmaIce = iceSculpt * 0.0048;
-        gossamerFrac = max(gossamerFrac, 0.68 * clamp(sigmaIce / max(1.0e-6, sigmaLiq + sigmaIce), 0.0, 1.0));
+        float coreStrand = smoothstep(0.28, 0.82, filaments);
+        float haloStrand = smoothstep(0.10, 0.50, filaments) * 0.36;
+        float macroGate = smoothstep(0.03, 0.45, qiMacro);
+        float iceSculpt = qiMacro * macroGate * (0.24 + 1.55 * coreStrand + haloStrand);
+        sigmaIce = iceSculpt * 0.0062;
+        gossamerFrac = max(gossamerFrac, 0.72 * clamp(sigmaIce / max(1.0e-6, sigmaLiq + sigmaIce), 0.0, 1.0));
       }
     }
 
-    float lowAirWeight = exp(-max(0.0, zAsl - uZBaseM) / 2250.0);
-    float sigmaHaze = (0.0000042 + 0.000074 * rhHaze * lowAirWeight) * uGodRayGain * farHorizonFade;
+    float lowAirWeight = exp(-max(0.0, zAsl - uZBaseM) / 2600.0);
+    float valleyAir = 0.000010 + (0.000085 * rhHaze + 0.000048 * uAodHaze) * lowAirWeight;
+    float sigmaHaze = valleyAir * uGodRayGain * farHorizonFade;
 
     return vec4(sigmaLiq, sigmaIce, sigmaHaze, gossamerFrac);
   }
@@ -1978,21 +1982,22 @@ const VOLUMETRIC_RAYMARCH_FRAGMENT_GLSL3 = /* glsl */ `
 
   float sampleTerrainSunVisibility(vec3 posWorld, vec3 lightDir) {
     if (uHasHeightTex < 0.5 || lightDir.y <= -0.04) return 1.0;
-    if (posWorld.y > uMaxLocalTerrainY && lightDir.y >= 0.0) return 1.0;
+    if (posWorld.y > uMaxLocalTerrainY + 20.0 && lightDir.y >= 0.0) return 1.0;
     float halfSpan = uSpanM * 0.5;
     if (abs(posWorld.x) > halfSpan * 1.35 || abs(posWorld.z) > halfSpan * 1.35) return 1.0;
 
-    const float dists[3] = float[3](210.0, 820.0, 2450.0);
+    // 4 geometrically-spaced DEM taps resolve sharp volumetric god-ray curtains peeking past cliffs & ridge notches
+    const float dists[4] = float[4](110.0, 340.0, 1050.0, 3200.0);
     float vis = 1.0;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
       vec3 sp = posWorld + lightDir * dists[i];
-      if (lightDir.y > 0.0 && sp.y > uMaxLocalTerrainY) break;
+      if (lightDir.y > 0.0 && sp.y > uMaxLocalTerrainY + 15.0) break;
       float inside = 0.0;
       float ty = sampleTerrainLocalY(sp.xz, inside);
       if (inside > 0.5) {
         float margin = sp.y - ty;
-        vis = min(vis, smoothstep(-28.0, 24.0, margin));
-        if (vis < 0.02) return 0.0;
+        vis = min(vis, smoothstep(-14.0, 20.0, margin));
+        if (vis < 0.015) return 0.0;
       }
     }
     return vis;
@@ -2222,7 +2227,9 @@ const VOLUMETRIC_RAYMARCH_FRAGMENT_GLSL3 = /* glsl */ `
         float curvDrop = horizDist2 / (2.0 * EARTH_R_EFF);
         float zAsl = pos.y + uMinElevM - curvDrop;
 
-        vec4 sigmas = sampleAtmosphereExtinction(pos, zAsl, tMid, dt, 2);
+        vec4 sigmas = (shellDensity <= 1.0e-5)
+          ? vec4(0.0, 0.0, 0.5 * (macroA.z + macroB.z), 0.0)
+          : sampleAtmosphereExtinction(pos, zAsl, tMid, dt, 2);
         float sigmaCloud = sigmas.x + sigmas.y;
         float sigmaTotal = sigmaCloud + sigmas.z;
         float gossamerFrac = sigmas.w;
@@ -2245,8 +2252,16 @@ const VOLUMETRIC_RAYMARCH_FRAGMENT_GLSL3 = /* glsl */ `
         float cloudTauSun = 0.0;
         if (dot(directIrr, directIrr) > 1.0e-5 && transmittance > 0.04) {
           terrainVis = sampleTerrainSunVisibility(pos, primaryLightDir);
-          if (terrainVis > 0.01 && sigmaCloud > 1.0e-5) {
-            cloudTauSun = marchLightOpticalDepth(pos, zAsl, primaryLightDir);
+          if (terrainVis > 0.01) {
+            if (sigmaCloud > 1.0e-5) {
+              cloudTauSun = marchLightOpticalDepth(pos, zAsl, primaryLightDir);
+            } else if (sigmas.z > 1.0e-7 && tMid < 18000.0 && uShaftCloudGate > 0.5) {
+              // Single macro cloud-occluder tap along solar beam so overhead cloud gaps carve true volumetric shafts in valley air!
+              vec3 lpShaft = pos + primaryLightDir * 1350.0;
+              float lzShaft = zAsl + primaryLightDir.y * 1350.0;
+              vec4 sigShaft = sampleAtmosphereExtinction(lpShaft, lzShaft, 8000.0, 900.0, 0);
+              cloudTauSun = (sigShaft.x + sigShaft.y * 0.65) * 950.0;
+            }
           }
         }
 
@@ -2287,8 +2302,10 @@ const VOLUMETRIC_RAYMARCH_FRAGMENT_GLSL3 = /* glsl */ `
         }
 
         if (sigmas.z > 1.0e-7) {
-          float shaftShadow = terrainVis * exp(-cloudTauSun * 0.94);
-          vec3 shaftLum = directIrr * shaftShadow * phaseHaze * 4.8 + skyZenithIrr * 0.24;
+          float shaftShadow = terrainVis * exp(-cloudTauSun * 0.92) * clamp(0.20 + 0.80 * uBeamTrans, 0.0, 1.0);
+          float lowSunRayBoost = 1.0 + 1.45 * smoothstep(22.0, 2.0, localSunEl) * smoothstep(-2.5, 1.0, localSunEl);
+          float fwdShaftPhase = mix(phaseHaze, hgPhase(cosTheta, 0.78), 0.42);
+          vec3 shaftLum = directIrr * shaftShadow * fwdShaftPhase * (5.4 * lowSunRayBoost) + skyZenithIrr * 0.22;
           stepScatter += shaftLum * sigmas.z;
         }
 
@@ -2419,7 +2436,8 @@ const COMPOSITE_FRAGMENT_GLSL3 = /* glsl */ `
   vec3 softHighlightCompress(vec3 col) {
     vec3 x = max(vec3(0.0), col);
     vec3 mapped = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);
-    return mix(x, clamp(mapped, 0.0, 1.0), smoothstep(0.62, 1.35, max(x.r, max(x.g, x.b))));
+    float peak = max(x.r, max(x.g, x.b));
+    return mix(x, clamp(mapped, 0.0, 1.0), smoothstep(0.45, 1.25, peak));
   }
 
   void main() {
@@ -2428,7 +2446,7 @@ const COMPOSITE_FRAGMENT_GLSL3 = /* glsl */ `
     gl_FragDepth = centerDepth;
 
     if (uShowAtmosphere < 0.5) {
-      fragColor = sceneCol;
+      fragColor = vec4(softHighlightCompress(sceneCol.rgb), 1.0);
       return;
     }
 
@@ -2478,14 +2496,22 @@ export class VolumetricAtmosphereEngine {
     this.camera = camera;
 
     this.enabled = true;
-    this.evolveFluid = true;
+    this.evolveFluid = false;
     this.evolutionSpeed = 1.0;
     this.activePreset = 'live';
     this.qualityMode = 'ultra';
     this.resScale = 0.52;
 
-    // Detect WebGL2 floating-point render-target support for native GPU 128x128x48 fluid solver
+    // Detect WebGL2 floating-point render-target support & software rasterizers (e.g. SwiftShader/llvmpipe)
     const gl = renderer.getContext();
+    let glRendererStr = '';
+    try {
+      const dbgExt = gl.getExtension('WEBGL_debug_renderer_info');
+      glRendererStr = String(
+        dbgExt ? gl.getParameter(dbgExt.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER) || ''
+      );
+    } catch (_) {}
+    this.isSoftwareGpu = /swiftshader|llvmpipe|softpipe|software|basic render/i.test(glRendererStr);
     const extColorFloat = renderer.capabilities.isWebGL2 ? gl.getExtension('EXT_color_buffer_float') : null;
     const extColorHalfFloat = renderer.capabilities.isWebGL2 ? gl.getExtension('EXT_color_buffer_half_float') : null;
     this.supportsFloatFBO = Boolean(renderer.capabilities.isWebGL2 && (extColorFloat || extColorHalfFloat));
@@ -2965,13 +2991,22 @@ export class VolumetricAtmosphereEngine {
     this.renderer.clearColor();
     this.divPressIdx = 0;
 
-    // Run 3 warm-up projection + MacCormack microphysics steps so initial 3D cloud/lee-wave field is sculpted & divergence-free
-    this._stepGpuFluidInternal(1.8);
-    this._stepGpuFluidInternal(1.8);
-    this._stepGpuFluidInternal(1.8);
+    if (this.evolveFluid) {
+      // Run 3 warm-up projection + MacCormack microphysics steps when live Navier-Stokes fluid advection is enabled
+      this._stepGpuFluidInternal(1.8);
+      this._stepGpuFluidInternal(1.8);
+      this._stepGpuFluidInternal(1.8);
+    } else {
+      // Fast Spatial HRRR/GOES 3D Cloud Mode: pack the initialized 4-layer 3D cloud & cirrus volume directly (1 pass vs 36!)
+      this.fluidPackAtlasPass.mat.uniforms.uVelTex.value = this.velRT[0].texture;
+      this.fluidPackAtlasPass.mat.uniforms.uThermoTex.value = this.thermoRT[0].texture;
+      this.renderer.setRenderTarget(this.cloudAtlasRT);
+      this.renderer.render(this.fluidPackAtlasPass.scene, this.orthoCam);
+      this._needsShadowBake = true;
+    }
 
     this.renderer.setRenderTarget(prevRT);
-    this._updateGpuTelemetry(true);
+    this._updateGpuTelemetry(false);
   }
 
   _stepGpuFluidInternal(dtSim) {
@@ -2982,6 +3017,22 @@ export class VolumetricAtmosphereEngine {
     const vNext = 1 - vCur;
     const tCur = this.thermoIdx;
     const tNext = 1 - tCur;
+
+    if (!this.evolveFluid) {
+      // Fast 2-pass HRRR/GOES diurnal scrub & P10/P50/P90 realization sync (skipping 10 Jacobi velocity passes!)
+      this.fluidAdvectMicroPass.mat.uniforms.uVelTex.value = this.velRT[vCur].texture;
+      this.fluidAdvectMicroPass.mat.uniforms.uThermoTex.value = this.thermoRT[tCur].texture;
+      this.renderer.setRenderTarget(this.thermoRT[tNext]);
+      this.renderer.render(this.fluidAdvectMicroPass.scene, this.orthoCam);
+      this.thermoIdx = tNext;
+
+      this.fluidPackAtlasPass.mat.uniforms.uVelTex.value = this.velRT[vCur].texture;
+      this.fluidPackAtlasPass.mat.uniforms.uThermoTex.value = this.thermoRT[tNext].texture;
+      this.renderer.setRenderTarget(this.cloudAtlasRT);
+      this.renderer.render(this.fluidPackAtlasPass.scene, this.orthoCam);
+      this._needsShadowBake = true;
+      return;
+    }
 
     // 1. Orographic + Scorer Wave + Slope Thermal + Buoyancy Forcing (vel[vCur] -> vel[vNext])
     this.fluidForcingPass.mat.uniforms.uVelTex.value = this.velRT[vCur].texture;
@@ -3317,8 +3368,11 @@ export class VolumetricAtmosphereEngine {
         uCloudDensityGain: { value: 1.0 },
         uCirrusDensityGain: { value: 1.05 },
         uMicroDetailGain: { value: 1.0 },
-        uGodRayGain: { value: 1.0 },
-        uQualitySteps: { value: 56.0 },
+        uGodRayGain: { value: 1.15 },
+        uAodHaze: { value: 0.16 },
+        uBeamTrans: { value: 0.72 },
+        uShaftCloudGate: { value: 0.0 },
+        uQualitySteps: { value: 38.0 },
       },
       depthTest: false,
       depthWrite: false,
@@ -3668,7 +3722,24 @@ export class VolumetricAtmosphereEngine {
    * Updates 4-layer Lagrangian wind-sheared advection & diurnal coverage scaling
    * continuously as the user drags `#time-scrubber` or runs `Animate`!
    */
-  setScrubberKinematics({ minutesLocal, lowPct, midPct, highPct, fogPct, isScrubbing = false }) {
+  setScrubberKinematics({
+    minutesLocal,
+    lowPct,
+    midPct,
+    highPct,
+    fogPct,
+    aodHaze = null,
+    beamTrans = null,
+    isScrubbing = false,
+  }) {
+    const vu = this.volumetricMat.uniforms;
+    if (typeof aodHaze === 'number' && Number.isFinite(aodHaze)) {
+      vu.uAodHaze.value = Math.max(0.0, Math.min(1.0, aodHaze));
+    }
+    if (typeof beamTrans === 'number' && Number.isFinite(beamTrans)) {
+      vu.uBeamTrans.value = Math.max(0.0, Math.min(1.0, beamTrans));
+    }
+    vu.uShaftCloudGate.value = (Number(lowPct || 0) + Number(midPct || 0)) > 4.0 ? 1.0 : 0.0;
     if (!this._hasLoadedMesoscaleGrid) return;
     const mu = this.mesoscaleUniforms;
     const anchorMin = this._mesoscaleMeta?.anchorMinutesLocal ?? 1038.0;
@@ -3696,24 +3767,35 @@ export class VolumetricAtmosphereEngine {
     mu.uScrubLayerScale.value.set(sL, sM, sH, sF);
     mu.uScrubLayerAdd.value.set(aL, aM, aH, aF);
 
-    if (Math.abs(deltaSec - prevDelta) >= 8.0) {
-      mu.uScrubRelaxBoost.value = isScrubbing ? 0.85 : 0.45;
+    const prevCloudKey = this._lastKinematicsCloudKey || '';
+    const nextCloudKey = `${Math.round(lowPct || 0)}|${Math.round(midPct || 0)}|${Math.round(highPct || 0)}|${Math.round(fogPct || 0)}`;
+    const cloudChanged = prevCloudKey !== nextCloudKey;
+    this._lastKinematicsCloudKey = nextCloudKey;
+
+    if (Math.abs(deltaSec - prevDelta) >= 8.0 || cloudChanged) {
+      mu.uScrubRelaxBoost.value = isScrubbing ? 0.85 : cloudChanged ? 0.92 : 0.45;
       this._pendingScrubFluidStep = true;
       this._needsShadowBake = true;
+      if (cloudChanged && !isScrubbing) {
+        this._historyValid = false;
+      }
     }
   }
 
   setQualityMode(mode) {
     this.qualityMode = mode;
-    if (mode === 'performance') {
-      this.resScale = 0.38;
-      this.volumetricMat.uniforms.uQualitySteps.value = 38.0;
+    if (this.isSoftwareGpu) {
+      this.resScale = 0.24;
+      this.volumetricMat.uniforms.uQualitySteps.value = 22.0;
+    } else if (mode === 'performance') {
+      this.resScale = 0.36;
+      this.volumetricMat.uniforms.uQualitySteps.value = 32.0;
     } else if (mode === 'balanced') {
-      this.resScale = 0.45;
-      this.volumetricMat.uniforms.uQualitySteps.value = 46.0;
+      this.resScale = 0.42;
+      this.volumetricMat.uniforms.uQualitySteps.value = 38.0;
     } else {
       this.resScale = 0.52;
-      this.volumetricMat.uniforms.uQualitySteps.value = 56.0;
+      this.volumetricMat.uniforms.uQualitySteps.value = 54.0;
     }
     this.resize();
   }

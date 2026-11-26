@@ -7,7 +7,7 @@
   <title>LightFinder — 3D Light &amp; Lens Viewfinder</title>
   <meta name="description" content="LightFinder — 3D topographic terrain, 7-archetype probabilistic light engine, and 16–200mm lens viewfinder." />
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23f59e0b' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='8' r='3.5'/%3E%3Cpath d='M3 20l6-8 4 5 3-4 5 7H3z'/%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="/styles.css?v=20261126b" />
+  <link rel="stylesheet" href="/styles.css?v=20261126c" />
   <script type="importmap">
     {
       "imports": {
@@ -775,8 +775,8 @@
       <div class="popover-block">
         <div class="block-caption">Terrain Surface</div>
         <div class="segmented" role="group" aria-label="Terrain Surface Style">
-          <button type="button" class="seg-btn is-active" id="btn-surf-granite" data-surface="0">Relief</button>
-          <button type="button" class="seg-btn" id="btn-surf-aerial" data-surface="1">Satellite</button>
+          <button type="button" class="seg-btn" id="btn-surf-granite" data-surface="0">Relief</button>
+          <button type="button" class="seg-btn is-active" id="btn-surf-aerial" data-surface="1">Satellite</button>
           <button type="button" class="seg-btn" id="btn-surf-topo" data-surface="2">Topo</button>
         </div>
       </div>
@@ -804,11 +804,11 @@
         <div class="block-caption">3D Layers</div>
         <div class="check-list">
           <label class="check-row"><input type="checkbox" id="toggle-sightlines" checked /><span>Trails &amp; Sightlines</span></label>
-          <label class="check-row"><input type="checkbox" id="toggle-alpenglow-zone" checked /><span>Alpenglow Landing Zone</span></label>
+          <label class="check-row"><input type="checkbox" id="toggle-alpenglow-zone" /><span>Alpenglow Landing Zone</span></label>
           <label class="check-row"><input type="checkbox" id="toggle-viewshed" /><span>Unobstructed Viewshed</span></label>
           <label class="check-row"><input type="checkbox" id="toggle-sun-beams" /><span>Grazing Light Vectors</span></label>
           <label class="check-row"><input type="checkbox" id="toggle-light-field" /><span>Valley Ray Lattice</span></label>
-          <label class="check-row"><input type="checkbox" id="toggle-atmosphere" checked /><span>GPU Fluid Lab</span></label>
+          <label class="check-row"><input type="checkbox" id="toggle-atmosphere" checked /><span>3D Clouds &amp; Light Rays</span></label>
         </div>
       </div>
     </div>
@@ -913,6 +913,6 @@
     </div>
   </main>
 
-  <script type="module" src="/app.js?v=20261126b"></script>
+  <script type="module" src="/app.js?v=20261126c"></script>
 </body>
 </html>

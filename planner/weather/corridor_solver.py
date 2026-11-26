@@ -42,6 +42,7 @@ from .hrrr_s3 import (
 from .nwp_corridor import (
     _safe_arr_val,
     build_corridor_coords_meta,
+    build_nwp_bundle_from_hrrr_s3,
     extract_hour_sounding,
     fetch_24h_corridor_and_models,
     local_tz_for_lon,
@@ -1788,10 +1789,60 @@ def solve_weather_and_corridor(
         raob_obs = f_raob.result() if f_raob else None
 
     if not nwp_bundle["ok"]:
-        raise RuntimeError(
-            "Upstream NWP sounding service unreachable; refusing to synthesize fake weather. "
-            f"Details: {'; '.join(nwp_bundle.get('errors') or ['empty point_docs'])}"
+        hrrr_ok = bool(
+            hrrr_s3_data
+            and hrrr_s3_data.get("ok")
+            and len(hrrr_s3_data.get("stations") or []) >= len(pre_coords_meta)
         )
+        if hrrr_ok:
+            # Fetch up to 3 extra diurnal anchor hours from the same rate-limit-free NOAA HRRR 3km S3
+            # cycle so the 24h timeline captures real diurnal cloud evolution even when Open-Meteo 429s!
+            anchor_hrs = [h for h in (6, 12, 17, 21) if abs(h - primary_hr_idx) >= 2][:3]
+            hourly_hrrr_stations: dict[int, list[dict[str, Any]]] = {}
+            if anchor_hrs:
+                def _fetch_anchor(hr_loc: int) -> tuple[int, list[dict[str, Any]] | None]:
+                    try:
+                        anc_local = dt.datetime(
+                            req_date.year, req_date.month, req_date.day, hr_loc, 0, tzinfo=tz_obj
+                        )
+                        anc_utc = anc_local.astimezone(dt.timezone.utc)
+                        anc_res = fetch_hrrr_s3_corridor(
+                            lat,
+                            lon,
+                            pre_coords_meta,
+                            anc_utc,
+                            now_utc,
+                            is_coastal,
+                            replay_mode,
+                            hindcast_lead_days,
+                        )
+                        if anc_res and anc_res.get("ok") and len(anc_res.get("stations") or []) >= len(pre_coords_meta):
+                            return hr_loc, anc_res["stations"]
+                    except Exception:
+                        pass
+                    return hr_loc, None
+
+                with ThreadPoolExecutor(max_workers=len(anchor_hrs)) as anc_pool:
+                    for hr_k, st_list in anc_pool.map(_fetch_anchor, anchor_hrs):
+                        if st_list is not None:
+                            hourly_hrrr_stations[hr_k] = st_list
+
+            nwp_bundle = build_nwp_bundle_from_hrrr_s3(
+                hrrr_s3_data,
+                pre_coords_meta,
+                lat,
+                lon,
+                req_date.isoformat(),
+                primary_hr_idx,
+                is_coastal=is_coastal,
+                hourly_hrrr_stations=hourly_hrrr_stations,
+                upstream_errors=nwp_bundle.get("errors") or [],
+            )
+        else:
+            raise RuntimeError(
+                "Upstream NWP sounding service unreachable; refusing to synthesize fake weather. "
+                f"Details: {'; '.join(nwp_bundle.get('errors') or ['empty point_docs'])}"
+            )
 
     point_docs = nwp_bundle["point_docs"]
     coords_meta = nwp_bundle["coords_meta"]
@@ -3242,15 +3293,50 @@ def solve_weather_and_corridor(
         else {"active": False}
     )
 
+    is_hrrr_fallback = bool(nwp_bundle.get("hrrr_s3_primary_fallback"))
     nwp_src_label = (
-        f"NOAA HRRR 3km Native S3 ({hrrr_s3_data['cycle_tag']}) + {nwp_bundle['source_label']}"
-        if (has_hrrr_s3 and hrrr_s3_data)
-        else nwp_bundle["source_label"]
+        nwp_bundle["source_label"]
+        if is_hrrr_fallback
+        else (
+            f"NOAA HRRR 3km Native S3 ({hrrr_s3_data['cycle_tag']}) + {nwp_bundle['source_label']}"
+            if (has_hrrr_s3 and hrrr_s3_data)
+            else nwp_bundle["source_label"]
+        )
     )
+
+    trust_parts: list[str] = []
+    if has_hrrr_s3 and hrrr_s3_data:
+        cycle_short = str(hrrr_s3_data.get("cycle_tag", "")).split(" ")
+        cyc_lbl = f" {cycle_short[1]}" if len(cycle_short) > 1 else ""
+        trust_parts.append(f"HRRR 3km{cyc_lbl}")
+    if not is_hrrr_fallback:
+        trust_parts.append("IFS/GFS")
+    if nowcast_status.get("active") and goes_data:
+        raw_sat = str(goes_data.get("satellite") or "GOES")
+        if "GOES-18" in raw_sat:
+            trust_parts.append("GOES-18")
+        elif "GOES-19" in raw_sat:
+            trust_parts.append("GOES-19")
+        elif "GOES-16" in raw_sat:
+            trust_parts.append("GOES-16")
+        else:
+            trust_parts.append(raw_sat.split(" ")[0])
+    if station_obs and station_obs.get("station_id"):
+        asos_id = str(station_obs["station_id"])
+        asos_vis = station_obs.get("visibility_mi")
+        asos_ceil = station_obs.get("ceiling_ft")
+        if asos_ceil is not None:
+            trust_parts.append(f"{asos_id} ceil {int(round(asos_ceil)):,}ft")
+        elif asos_vis is not None:
+            trust_parts.append(f"{asos_id} {asos_vis:.0f}mi")
+        else:
+            trust_parts.append(asos_id)
 
     data_provenance = {
         "is_live": not is_past_date and (simulated_now_utc is None),
         "degraded": len(nwp_bundle.get("errors") or []) > 0,
+        "hrrr_s3_primary_fallback": is_hrrr_fallback,
+        "trust_badge": " · ".join(trust_parts) if trust_parts else nwp_src_label,
         "warnings": nwp_bundle.get("errors") or [],
         "timezone": tz_name,
         "compute_backend": rust_out.get("compute_backend"),

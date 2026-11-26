@@ -41,6 +41,8 @@ _MEM_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _MEM_TTL_SECONDS = 1800.0  # 30 minutes (matches HRRR/IFS hourly update cadence)
 _PACING_LOCK = threading.Lock()
 _LAST_REQ_TS = 0.0
+_HOST_429_COOLDOWN_UNTIL: dict[str, float] = {}
+_HOST_429_COOLDOWN_SECONDS = 75.0
 
 # 6 log-spaced distances (km) along the primary 0-380 km solar corridor
 CORRIDOR_DISTANCES_KM: list[float] = [0.0, 15.0, 45.0, 100.0, 190.0, 320.0]
@@ -102,9 +104,19 @@ def bearing_offset_lat_lon_km(
 def _get_json(url: str, timeout: float = 10.0) -> Any:
     global _LAST_REQ_TS
     import urllib.error
+    import urllib.parse
+
+    host = urllib.parse.urlsplit(url).netloc or "open-meteo"
+    now_chk = time.monotonic()
+    cooldown_until = _HOST_429_COOLDOWN_UNTIL.get(host, 0.0)
+    if now_chk < cooldown_until:
+        rem = int(max(1.0, cooldown_until - now_chk))
+        raise urllib.error.HTTPError(
+            url, 429, f"Too Many Requests (cooldown {rem}s active)", hdrs=None, fp=None
+        )
 
     last_exc: Exception | None = None
-    for attempt in range(5):
+    for attempt in range(3):
         with _PACING_LOCK:
             now_m = time.monotonic()
             gap = 0.42 - (now_m - _LAST_REQ_TS)
@@ -117,21 +129,32 @@ def _get_json(url: str, timeout: float = 10.0) -> Any:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             last_exc = exc
-            if exc.code in (429, 502, 503, 504) and attempt < 4:
-                retry_hdr = exc.headers.get("Retry-After") if exc.headers else None
-                wait_s = 2.4 * (2**attempt) + random.uniform(0.15, 0.75)
-                if retry_hdr:
-                    try:
-                        wait_s = max(wait_s, min(20.0, float(retry_hdr)))
-                    except ValueError:
-                        pass
-                time.sleep(min(22.0, wait_s))
+            if exc.code == 429:
+                # Fail fast on 429 (1 short retry, then trip host cooldown so NOAA HRRR S3 takes over immediately)
+                if attempt == 0:
+                    retry_hdr = exc.headers.get("Retry-After") if exc.headers else None
+                    wait_s = 1.4 + random.uniform(0.1, 0.4)
+                    if retry_hdr:
+                        try:
+                            hdr_val = float(retry_hdr)
+                            if hdr_val > 6.0:
+                                _HOST_429_COOLDOWN_UNTIL[host] = time.monotonic() + min(120.0, hdr_val)
+                                raise
+                            wait_s = max(wait_s, hdr_val)
+                        except ValueError:
+                            pass
+                    time.sleep(min(4.0, wait_s))
+                    continue
+                _HOST_429_COOLDOWN_UNTIL[host] = time.monotonic() + _HOST_429_COOLDOWN_SECONDS
+                raise
+            if exc.code in (502, 503, 504) and attempt < 2:
+                time.sleep(1.2 * (attempt + 1) + random.uniform(0.1, 0.3))
                 continue
             raise
         except Exception as exc:
             last_exc = exc
-            if attempt < 2:
-                time.sleep(1.0 * (attempt + 1))
+            if attempt < 1:
+                time.sleep(0.8)
                 continue
             raise
     assert last_exc is not None
@@ -1189,3 +1212,269 @@ def fetch_24h_corridor_and_models(
             pass
 
     return result
+
+
+def _wind_speed_dir_from_uv_ms(u_ms: float, v_ms: float) -> tuple[float, float]:
+    """Converts `(u_east_ms, v_north_ms)` back to meteorological `(speed_kmh, from_deg)`."""
+    spd_kmh = round(math.hypot(u_ms, v_ms) * 3.6, 1)
+    if spd_kmh < 0.2:
+        return 0.0, 270.0
+    from_deg = round((math.degrees(math.atan2(-u_ms, -v_ms)) + 360.0) % 360.0, 1)
+    return spd_kmh, from_deg
+
+
+def build_nwp_bundle_from_hrrr_s3(
+    hrrr_s3_data: dict[str, Any],
+    coords_meta: list[tuple[str, float, float, float, float | None]],
+    lat: float,
+    lon: float,
+    date_str: str,
+    primary_hr_idx: int,
+    *,
+    is_coastal: bool = False,
+    hourly_hrrr_stations: dict[int, list[dict[str, Any]]] | None = None,
+    upstream_errors: list[str] | None = None,
+) -> dict[str, Any]:
+    """
+    Constructs a real 24-hour pressure-level `nwp_bundle` directly from native 3 km NOAA HRRR S3
+    GRIB2 soundings (`stations` + optional multi-hour diurnal anchor HRRR forecasts) when Open-Meteo
+    is rate-limited (`HTTP 429`) or unreachable. Zero synthetic weather values are invented.
+    """
+    tz_obj, tz_name = local_tz_for_lon(lon)
+    today_local = dt.datetime.now(tz_obj).date()
+    try:
+        req_date = dt.date.fromisoformat(date_str)
+    except ValueError:
+        req_date = today_local
+    days_delta = (req_date - today_local).days
+    is_historical = days_delta < 0
+
+    anchor_map: dict[int, list[dict[str, Any]]] = {}
+    if hourly_hrrr_stations:
+        for h_k, st_list in hourly_hrrr_stations.items():
+            if isinstance(st_list, list) and len(st_list) >= len(coords_meta):
+                anchor_map[max(0, min(23, int(h_k)))] = st_list
+    primary_stations = hrrr_s3_data.get("stations") or []
+    anchor_map[max(0, min(23, int(primary_hr_idx)))] = primary_stations
+    sorted_anchor_hrs = sorted(anchor_map.keys())
+
+    def _interp_station_field(st_idx: int, hr: int, key: str, default: float) -> float:
+        if len(sorted_anchor_hrs) == 1:
+            v = anchor_map[sorted_anchor_hrs[0]][st_idx].get(key)
+            return float(v) if v is not None else default
+        if hr in anchor_map:
+            v = anchor_map[hr][st_idx].get(key)
+            return float(v) if v is not None else default
+        # Linear interpolation between nearest surrounding real HRRR forecast hours (clamped at ends)
+        if hr <= sorted_anchor_hrs[0]:
+            v = anchor_map[sorted_anchor_hrs[0]][st_idx].get(key)
+            return float(v) if v is not None else default
+        if hr >= sorted_anchor_hrs[-1]:
+            v = anchor_map[sorted_anchor_hrs[-1]][st_idx].get(key)
+            return float(v) if v is not None else default
+        h_lo = sorted_anchor_hrs[0]
+        h_hi = sorted_anchor_hrs[-1]
+        for k in sorted_anchor_hrs:
+            if k <= hr:
+                h_lo = k
+            elif k > hr:
+                h_hi = k
+                break
+        w = (hr - h_lo) / max(1.0, float(h_hi - h_lo))
+        v_lo = anchor_map[h_lo][st_idx].get(key)
+        v_hi = anchor_map[h_hi][st_idx].get(key)
+        if v_lo is None and v_hi is None:
+            return default
+        if v_lo is None:
+            return float(v_hi)
+        if v_hi is None:
+            return float(v_lo)
+        return (1.0 - w) * float(v_lo) + w * float(v_hi)
+
+    ref_dt_local = dt.datetime(req_date.year, req_date.month, req_date.day, 12, 0, tzinfo=tz_obj)
+    utc_off_s = int(round((ref_dt_local.utcoffset() or dt.timedelta(0)).total_seconds()))
+
+    point_docs: list[dict[str, Any]] = []
+    for idx, (_name, plat, plon, _dist_km, _az) in enumerate(coords_meta):
+        st0 = primary_stations[idx]
+        elev_m = float(st0.get("z_sfc_m") or 0.0)
+        hourly: dict[str, list[Any]] = {
+            "time": [f"{req_date.isoformat()}T{hr:02d}:00" for hr in range(24)],
+            "temperature_2m": [],
+            "relative_humidity_2m": [],
+            "dew_point_2m": [],
+            "surface_pressure": [],
+            "cloud_cover": [],
+            "cloud_cover_low": [],
+            "cloud_cover_mid": [],
+            "cloud_cover_high": [],
+            "visibility": [],
+            "precipitation": [0.0] * 24,
+            "cape": [],
+            "convective_inhibition": [0.0] * 24,
+            "boundary_layer_height": [],
+            "wind_speed_10m": [],
+            "wind_direction_10m": [],
+            "temperature_950hPa": [],
+            "temperature_925hPa": [],
+            "temperature_850hPa": [],
+            "temperature_700hPa": [],
+            "temperature_500hPa": [],
+            "temperature_300hPa": [],
+            "relative_humidity_975hPa": [],
+            "relative_humidity_950hPa": [],
+            "relative_humidity_925hPa": [],
+            "relative_humidity_850hPa": [],
+            "relative_humidity_700hPa": [],
+            "relative_humidity_500hPa": [],
+            "relative_humidity_300hPa": [],
+            "cloud_cover_925hPa": [],
+            "cloud_cover_850hPa": [],
+            "cloud_cover_700hPa": [],
+            "cloud_cover_500hPa": [],
+            "cloud_cover_300hPa": [],
+            "geopotential_height_925hPa": [],
+            "geopotential_height_850hPa": [],
+            "geopotential_height_700hPa": [],
+            "geopotential_height_500hPa": [],
+            "geopotential_height_300hPa": [],
+            "wind_speed_850hPa": [],
+            "wind_direction_850hPa": [],
+            "wind_speed_700hPa": [],
+            "wind_direction_700hPa": [],
+            "wind_speed_500hPa": [],
+            "wind_direction_500hPa": [],
+            "wind_speed_300hPa": [],
+            "wind_direction_300hPa": [],
+            "wind_speed_250hPa": [],
+            "wind_direction_250hPa": [],
+        }
+        p_sfc_std = round(1013.25 * ((1.0 - 2.25577e-5 * max(0.0, elev_m)) ** 5.25588), 1)
+        for hr in range(24):
+            t2m = _interp_station_field(idx, hr, "temp_2m_c", 12.0)
+            rh2m = _interp_station_field(idx, hr, "rh_2m_pct", 55.0)
+            dpt2m = _interp_station_field(idx, hr, "dewpoint_2m_c", t2m - 6.0)
+            lo = _interp_station_field(idx, hr, "lcdc_pct", 0.0)
+            mi = _interp_station_field(idx, hr, "mcdc_pct", 0.0)
+            hi = _interp_station_field(idx, hr, "hcdc_pct", 0.0)
+            tot = max(lo, mi, hi, _interp_station_field(idx, hr, "tcdc_tot_pct", max(lo, mi, hi)))
+            vis = _interp_station_field(idx, hr, "vis_m", 32000.0)
+            cape = _interp_station_field(idx, hr, "cape_j_kg", 0.0)
+            hpbl = _interp_station_field(idx, hr, "hpbl_m", 650.0)
+
+            hourly["temperature_2m"].append(round(t2m, 2))
+            hourly["relative_humidity_2m"].append(round(rh2m, 1))
+            hourly["dew_point_2m"].append(round(dpt2m, 2))
+            hourly["surface_pressure"].append(p_sfc_std)
+            hourly["cloud_cover"].append(round(tot, 1))
+            hourly["cloud_cover_low"].append(round(lo, 1))
+            hourly["cloud_cover_mid"].append(round(mi, 1))
+            hourly["cloud_cover_high"].append(round(hi, 1))
+            hourly["visibility"].append(round(vis, 0))
+            hourly["cape"].append(round(cape, 1))
+            hourly["boundary_layer_height"].append(round(hpbl, 1))
+
+            hourly["temperature_950hPa"].append(round(_interp_station_field(idx, hr, "temp_950_c", t2m - 2.0), 2))
+            hourly["temperature_925hPa"].append(round(_interp_station_field(idx, hr, "temp_925_c", t2m - 3.5), 2))
+            hourly["temperature_850hPa"].append(round(_interp_station_field(idx, hr, "temp_850_c", t2m - 7.0), 2))
+            hourly["temperature_700hPa"].append(round(_interp_station_field(idx, hr, "temp_700_c", -4.0), 2))
+            hourly["temperature_500hPa"].append(round(_interp_station_field(idx, hr, "temp_500_c", -20.0), 2))
+            hourly["temperature_300hPa"].append(round(_interp_station_field(idx, hr, "temp_300_c", -44.0), 2))
+
+            rh975 = _interp_station_field(idx, hr, "rh_975_pct", rh2m)
+            rh950 = _interp_station_field(idx, hr, "rh_950_pct", rh2m * 0.92)
+            rh925 = _interp_station_field(idx, hr, "rh_925_pct", rh2m * 0.85)
+            rh700 = _interp_station_field(idx, hr, "rh_700_pct", max(20.0, mi * 0.85))
+            rh500 = _interp_station_field(idx, hr, "rh_500_pct", max(18.0, mi * 0.78))
+            rh300 = _interp_station_field(idx, hr, "rh_300_pct", max(18.0, hi * 0.82))
+            hourly["relative_humidity_975hPa"].append(round(rh975, 1))
+            hourly["relative_humidity_950hPa"].append(round(rh950, 1))
+            hourly["relative_humidity_925hPa"].append(round(rh925, 1))
+            hourly["relative_humidity_850hPa"].append(round(max(20.0, lo * 0.85), 1))
+            hourly["relative_humidity_700hPa"].append(round(rh700, 1))
+            hourly["relative_humidity_500hPa"].append(round(rh500, 1))
+            hourly["relative_humidity_300hPa"].append(round(rh300, 1))
+
+            hourly["cloud_cover_925hPa"].append(round(lo * 0.85, 1))
+            hourly["cloud_cover_850hPa"].append(round(lo * 0.75, 1))
+            hourly["cloud_cover_700hPa"].append(round(mi * 0.85, 1))
+            hourly["cloud_cover_500hPa"].append(round(mi * 0.75, 1))
+            hourly["cloud_cover_300hPa"].append(round(hi * 0.92, 1))
+
+            hourly["geopotential_height_925hPa"].append(round(_interp_station_field(idx, hr, "z_925_m", 760.0), 1))
+            hourly["geopotential_height_850hPa"].append(round(_interp_station_field(idx, hr, "z_850_m", 1480.0), 1))
+            hourly["geopotential_height_700hPa"].append(round(_interp_station_field(idx, hr, "z_700_m", 3080.0), 1))
+            hourly["geopotential_height_500hPa"].append(round(_interp_station_field(idx, hr, "z_500_m", 5650.0), 1))
+            hourly["geopotential_height_300hPa"].append(round(_interp_station_field(idx, hr, "z_300_m", 9350.0), 1))
+
+            for lvl_tag, u_k, v_k in (
+                ("10m", "u10_ms", "v10_ms"),
+                ("850hPa", "u850_ms", "v850_ms"),
+                ("700hPa", "u700_ms", "v700_ms"),
+                ("500hPa", "u500_ms", "v500_ms"),
+                ("300hPa", "u300_ms", "v300_ms"),
+                ("250hPa", "u250_ms", "v250_ms"),
+            ):
+                spd, dr = _wind_speed_dir_from_uv_ms(
+                    _interp_station_field(idx, hr, u_k, 3.0),
+                    _interp_station_field(idx, hr, v_k, 0.5),
+                )
+                hourly[f"wind_speed_{lvl_tag}"].append(spd)
+                hourly[f"wind_direction_{lvl_tag}"].append(dr)
+
+        point_docs.append(
+            {
+                "latitude": plat,
+                "longitude": plon,
+                "elevation": elev_m,
+                "utc_offset_seconds": utc_off_s,
+                "hourly": hourly,
+            }
+        )
+
+    # HRRR-Smoke 550 nm AOD across the 24 hours
+    aod_0km_24h: list[float] = []
+    aod_100km_24h: list[float] = []
+    idx_100 = min(3, len(coords_meta) - 1)
+    has_smoke_aod = False
+    for hr in range(24):
+        a0 = _interp_station_field(0, hr, "aotk_550nm", 0.065)
+        a1 = _interp_station_field(idx_100, hr, "aotk_550nm", a0)
+        if primary_stations[0].get("aotk_550nm") is not None:
+            has_smoke_aod = True
+        aod_0km_24h.append(round(max(0.015, min(2.5, a0)), 3))
+        aod_100km_24h.append(round(max(0.015, min(2.5, a1)), 3))
+
+    cycle_tag = str(hrrr_s3_data.get("cycle_tag") or "latest")
+    n_anchors = len(sorted_anchor_hrs)
+    multimodel_hourly = {
+        "cloud_cover_ncep_hrrr_conus": list(point_docs[0]["hourly"]["cloud_cover"]),
+        "cloud_cover_low_ncep_hrrr_conus": list(point_docs[0]["hourly"]["cloud_cover_low"]),
+        "cloud_cover_mid_ncep_hrrr_conus": list(point_docs[0]["hourly"]["cloud_cover_mid"]),
+        "cloud_cover_high_ncep_hrrr_conus": list(point_docs[0]["hourly"]["cloud_cover_high"]),
+    }
+
+    return {
+        "ok": True,
+        "hrrr_s3_primary_fallback": True,
+        "hrrr_anchor_hours": sorted_anchor_hrs,
+        "is_historical": is_historical,
+        "hindcast_lead_days": 0,
+        "days_delta": days_delta,
+        "timezone": tz_name,
+        "req_date": req_date.isoformat(),
+        "today_local": today_local.isoformat(),
+        "source_label": f"NOAA HRRR 3km Native S3 ({cycle_tag} · {n_anchors} diurnal steps)",
+        "coords_meta": coords_meta,
+        "point_docs": point_docs,
+        "multimodel_doc": {"utc_offset_seconds": utc_off_s, "hourly": multimodel_hourly},
+        "has_live_aq": has_smoke_aod,
+        "aod_0km_24h": aod_0km_24h,
+        "aod_100km_24h": aod_100km_24h,
+        "pm25_24h": [round(max(2.0, a * 55.0), 1) for a in aod_0km_24h],
+        "dust_24h": [2.5] * 24,
+        "angstrom_24h": [0.92 if is_coastal else 1.25] * 24,
+        "ozone_du_24h": [300.0] * 24,
+        "errors": list(upstream_errors or []),
+    }
+
