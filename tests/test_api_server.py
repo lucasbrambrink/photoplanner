@@ -178,9 +178,14 @@ class TestApiServerAndGridCache(unittest.TestCase):
         self.assertIn('min="0"', html)
         self.assertIn('max="1440"', html)
         self.assertIn('id="btn-export-field-card"', html)
-        # Proposal A Canvas-First Floating Sheet, Hero Verdict, Regional Hunt, GPX Upload & Opt-In Lab Drawer
+        # LightFinder Canvas-First Floating Sheet, 7-Archetype Scenario Switcher, Field Reference & Viewport Pills
         self.assertIn('id="planner-sheet"', html)
-        self.assertIn('id="brief-verdict-badge"', html)
+        self.assertIn('id="archetype-mode-label"', html)
+        self.assertIn('id="scenario-cards-list"', html)
+        self.assertIn('id="archetype-field-ref"', html)
+        self.assertIn('id="archetype-breakdown-details"', html)
+        self.assertIn('id="viewport-scenario-pills"', html)
+        self.assertIn('id="btn-archetype-auto"', html)
         self.assertIn('id="regional-hunt-results"', html)
         self.assertIn('id="gpx-file-input"', html)
         self.assertIn('id="lab-drawer" hidden', html)
@@ -191,7 +196,9 @@ class TestApiServerAndGridCache(unittest.TestCase):
         self.assertIn("showAtmosphere: false", js)
         self.assertIn("function focalLengthToFov(", js)
         self.assertIn("function exportOfflineFieldCard(", js)
-        self.assertIn("function syncBriefVerdictHero(", js)
+        self.assertIn("function renderLightArchetypeScenarioUI(", js)
+        self.assertIn("function selectLightArchetype(", js)
+        self.assertIn("hybridGodRaysGroup", js)
         self.assertIn("fogSeaSliceMesh", js)
 
 

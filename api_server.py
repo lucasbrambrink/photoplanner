@@ -167,6 +167,8 @@ class WatchlistCreateRequest(BaseModel):
     elev_m: float | None = None
     phase: str = "sunset"
     target_phenomena: list[str] | None = None
+    target_archetypes: list[str] | None = None
+    min_archetype_prob_pct: float | None = None
     min_calibrated_p50_pct: float = 50.0
     min_above_fog_prob_pct: float = 0.0
     min_mirror_index: float = 0.0
@@ -890,9 +892,9 @@ def serve_index(
     phase_txt = "Sunrise" if (phase or "").strip().lower() == "sunrise" else "Sunset"
     date_txt = (date or _today_pacific()).strip()
     lens_txt = f" · {int(mm)}mm FF" if mm else ""
-    og_title = f"{spot_label} — {phase_txt} Light & 3D Viewfinder ({date_txt}){lens_txt} | PhotoPlanner"
+    og_title = f"{spot_label} — {phase_txt} Light & 3D Viewfinder ({date_txt}){lens_txt} | LightFinder"
     og_desc = (
-        f"3D raycasted terrain, calibrated P10–P90 light odds, and probabilistic fog-sea lid forecast "
+        f"3D raycasted terrain, 7-archetype probabilistic light forecast, and fog-sea lid height "
         f"for {spot_label} ({date_txt} {phase_txt.lower()})."
     )
     share_url = str(request.url)
@@ -906,7 +908,7 @@ def serve_index(
         f'  <meta name="twitter:description" content="{html.escape(og_desc)}" />\n'
     )
     patched = raw_html.replace(
-        "<title>PhotoPlanner — 3D Light &amp; Lens Viewfinder</title>",
+        "<title>LightFinder — 3D Light &amp; Lens Viewfinder</title>",
         f"<title>{html.escape(og_title)}</title>\n{og_block}",
         1,
     )

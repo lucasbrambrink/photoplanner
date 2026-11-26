@@ -366,7 +366,7 @@ def build_spot_guide_payload(
     canonical_url = f"{canonical_root}{guide['guide_path']}" if canonical_root else guide["guide_path"]
 
     phase_title = "Sunrise" if resolved_phase == "sunrise" else "Sunset"
-    seo_title = f"{guide['name']} {guide['title_focus']} ({resolved_date}) | PhotoPlanner"
+    seo_title = f"{guide['name']} {guide['title_focus']} ({resolved_date}) | LightFinder"
     if forecast_hydrated and m.get("calibrated_p50_pct") is not None:
         seo_description = (
             f"{guide['name']} ({guide['elev_ft']:,} ft) {phase_title.lower()} light forecast for {resolved_date}: "
@@ -650,7 +650,7 @@ def render_spot_guide_html(payload: dict[str, Any]) -> str:
 <body>
   <div class="wrap">
     <nav class="crumb" aria-label="Breadcrumb">
-      <div><a href="/">PhotoPlanner 3D</a> / <a href="/guides">Light Guides</a> / <a href="/guides?region={esc(spot['region'])}">{esc(spot['region_label'])}</a></div>
+      <div><a href="/">LightFinder 3D</a> / <a href="/guides">Light Guides</a> / <a href="/guides?region={esc(spot['region'])}">{esc(spot['region_label'])}</a></div>
       <div class="nav-links">
         <a href="/api/backtest-report">Accuracy Scoreboard</a>
         <a href="{esc(spot['api_path'])}?date={esc(date_str)}&amp;phase={esc(phase)}">JSON API</a>
@@ -718,7 +718,7 @@ def render_spot_guide_html(payload: dict[str, Any]) -> str:
         <h2 style="margin-top:0;">Photographer Field Strategy</h2>
         <p><strong>Optics:</strong> {esc(spot['recommended_lens'])}</p>
         <p>{esc(spot['field_tip'])}</p>
-        <p><strong>Independent Verification:</strong> Every PhotoPlanner light probability is out-of-sample calibrated against NOAA SURFRAD pyrheliometers and 2 km GOES-18 NSRDB irradiance (<a href="/api/backtest-report">inspect public scoreboard</a>).</p>
+        <p><strong>Independent Verification:</strong> Every LightFinder light probability is out-of-sample calibrated against NOAA SURFRAD pyrheliometers and 2 km GOES-18 NSRDB irradiance (<a href="/api/backtest-report">inspect public scoreboard</a>).</p>
       </article>
     </section>
 
@@ -733,7 +733,7 @@ def render_spot_guide_html(payload: dict[str, Any]) -> str:
     </section>
 
     <footer>
-      <span>PhotoPlanner 3D · Raycasted Terrain + Calibrated Atmospheric Physics</span>
+      <span>LightFinder 3D · Raycasted Terrain + Calibrated Atmospheric Physics</span>
       <span>B2B Workshop &amp; Outdoor App API: <a href="/api/v1/guides">/api/v1/guides</a> · <a href="/sitemap.xml">Sitemap</a></span>
     </footer>
   </div>
@@ -795,7 +795,7 @@ def render_guides_directory_html(
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Daily Landscape Photography Light Guides ({html.escape(resolved_date)}) | PhotoPlanner 3D</title>
+  <title>Daily Landscape Photography Light Guides ({html.escape(resolved_date)}) | LightFinder 3D</title>
   <meta name="description" content="Daily calibrated sunrise, sunset, cloud-sea breakout, alpenglow, and mirror lake light forecasts for {len(list_seo_guides())} iconic US landscape photography destinations." />
   <link rel="canonical" href="{html.escape(canonical_url)}" />
   <style>
@@ -827,7 +827,7 @@ def render_guides_directory_html(
 <body>
   <div class="wrap">
     <nav>
-      <div><a href="/">← PhotoPlanner 3D Viewfinder</a></div>
+      <div><a href="/">← LightFinder 3D Viewfinder</a></div>
       <div style="display:flex;gap:14px;">
         <a href="/api/backtest-report">Public Accuracy Scoreboard</a>
         <a href="/api/v1/guides">B2B JSON API</a>

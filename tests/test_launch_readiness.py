@@ -190,7 +190,7 @@ class TestLaunchReadinessGoals(unittest.TestCase):
         )
         self.assertEqual(st_og, 200)
         og_html = body_og.decode("utf-8")
-        self.assertIn('property="og:title" content="Half Dome — Sunset Light &amp; 3D Viewfinder (2026-11-20) · 70mm FF | PhotoPlanner"', og_html)
+        self.assertIn('property="og:title" content="Half Dome — Sunset Light &amp; 3D Viewfinder (2026-11-20) · 70mm FF | LightFinder"', og_html)
         self.assertIn('name="twitter:card"', og_html)
 
         # 1-tap crowd field report submission & summary over ASGI

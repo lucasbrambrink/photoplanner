@@ -39,37 +39,144 @@ def build_alert_message(
     date_str: str,
     base_url: str = "https://photoplanner.app",
 ) -> dict[str, str]:
-    """Formats a crisp photographer-ready subject, plain text, HTML email, and Viewfinder deep link."""
+    """Formats a crisp LightFinder photographer-ready subject, plain text, HTML email, and Viewfinder deep link."""
     spot_name = str(evaluation.get("spot_name") or rule.get("name") or "Target Spot")
     phase = str(evaluation.get("phase") or rule.get("phase") or "sunset").lower()
-    phase_label = "Sunrise" if phase == "sunrise" else "Sunset"
+    best_hour = evaluation.get("best_hour")
+    best_time = evaluation.get("best_time_local")
+    if phase == "sunrise":
+        phase_label = "Sunrise"
+        link_phase = "sunrise"
+    elif phase == "any":
+        phase_label = f"24h Window ({best_time})" if best_time else "24h Window"
+        link_phase = "sunrise" if (isinstance(best_hour, int) and best_hour < 12) else "sunset"
+    else:
+        phase_label = "Sunset"
+        link_phase = "sunset"
+
     decision = str(evaluation.get("decision") or "TRIGGER").upper()
     p10, p50, p90 = evaluation.get("calibrated_p10_p50_p90") or [0.0, 0.0, 0.0]
     opp = int(round(float(evaluation.get("opportunity_score") or 0)))
-    reason = str(evaluation.get("reason") or "")
+    reason = str(
+        evaluation.get("reason")
+        or evaluation.get("headline")
+        or evaluation.get("causal_attribution")
+        or ""
+    )
     phen = str(evaluation.get("primary_phenomenon") or "Golden Hour Light")
 
-    params: dict[str, str] = {"name": spot_name, "date": date_str, "phase": phase}
+    target_archetypes = evaluation.get("target_archetypes") or rule.get("target_archetypes") or []
+    matched_arch_id = evaluation.get("matched_archetype_id")
+    matched_arch_name = str(evaluation.get("matched_archetype_name") or "")
+    combined_arch_pct = evaluation.get("combined_target_prob_pct")
+    if combined_arch_pct is None:
+        combined_arch_pct = evaluation.get("matched_archetype_prob_pct")
+    field_ref = evaluation.get("field_reference") or {}
+    tactical_lever = str(evaluation.get("tactical_lever") or field_ref.get("tactical_lever") or "")
+    viable_list = (evaluation.get("light_archetypes") or {}).get("viable") or []
+    is_archetype_alert = bool(target_archetypes and matched_arch_id and combined_arch_pct is not None)
+
+    params: dict[str, str] = {"name": spot_name, "date": date_str, "phase": link_phase}
     if rule.get("lat") is not None and rule.get("lon") is not None:
         params["lat"] = f"{float(rule['lat']):.5f}"
         params["lon"] = f"{float(rule['lon']):.5f}"
+    if matched_arch_id:
+        params["archetype"] = str(matched_arch_id)
+    if best_hour is not None:
+        params["hour"] = str(int(best_hour))
     deep_link = f"{base_url.rstrip('/')}/?{urllib.parse.urlencode(params)}"
 
-    subject = f"[{decision}] {spot_name} {phase_label} ({date_str}): {p50:.0f}% Light Odds — {phen}"
-    text_body = (
-        f"PhotoPlanner Calibrated Light Alert ({decision})\n"
-        f"Spot: {spot_name} ({date_str} · {phase_label})\n"
-        f"Phenomenon: {phen} (Opportunity {opp}/100)\n"
-        f"Calibrated Beam Odds: P50 {p50:.0f}% (80% band: P10 {p10:.0f}% – P90 {p90:.0f}%)\n"
-        f"Why: {reason}\n\n"
-        f"Open in 3D Lens Viewfinder: {deep_link}\n"
-    )
-    html_body = f"""<!DOCTYPE html>
+    if is_archetype_alert:
+        comb_val = float(combined_arch_pct)
+        subject = f"[{decision}] {spot_name} {phase_label} ({date_str}): {comb_val:.0f}% {matched_arch_name}"
+        viable_summary = ", ".join(
+            f"{v.get('name')} {int(round(float(v.get('probability_pct', 0))))}%"
+            for v in viable_list[:3]
+            if v.get("name")
+        )
+        text_lines = [
+            f"LightFinder Calibrated Light Alert ({decision})",
+            f"Spot: {spot_name} ({date_str} · {phase_label})",
+            f"Matched Light Archetype: {matched_arch_name} ({comb_val:.0f}% target odds)",
+        ]
+        if viable_summary:
+            text_lines.append(f"Viable Scenarios (≥20%): {viable_summary}")
+        if tactical_lever:
+            text_lines.append(f"Tactical Lever: {tactical_lever}")
+        if field_ref:
+            text_lines.append(
+                f"Field Reference: {field_ref.get('shadow_edge', '')} · "
+                f"{field_ref.get('contrast', '')} · {field_ref.get('color_cast', '')}"
+            )
+        text_lines.extend(
+            [
+                f"Calibrated Corridor Beam: P50 {p50:.0f}% (P10 {p10:.0f}% – P90 {p90:.0f}%)",
+                f"Why: {reason}",
+                "",
+                f"Open in 3D Lens Viewfinder: {deep_link}",
+                "",
+            ]
+        )
+        text_body = "\n".join(text_lines)
+
+        ref_html = ""
+        if field_ref or tactical_lever:
+            ref_html = f"""
+    <div style="background:#0f172a;border:1px solid #24324a;border-radius:10px;padding:12px 14px;margin-bottom:14px;font-size:12px;color:#cbd5e1;">
+      <div style="font-size:10px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#94a3b8;margin-bottom:6px;">Field Reference · {html.escape(matched_arch_name)}</div>
+      <div><strong>Shadow Edge:</strong> {html.escape(str(field_ref.get('shadow_edge', '—')))} · <strong>Contrast:</strong> {html.escape(str(field_ref.get('contrast', '—')))}</div>
+      <div style="margin-top:3px;"><strong>Color Cast:</strong> {html.escape(str(field_ref.get('color_cast', '—')))}</div>
+      <div style="margin-top:6px;color:#fde68a;"><strong>Lever:</strong> {html.escape(tactical_lever)}</div>
+    </div>"""
+        viable_html = (
+            f'<div style="font-size:12px;color:#cbd5e1;margin-top:5px;">Viable (≥20%): {html.escape(viable_summary)}</div>'
+            if viable_summary
+            else ""
+        )
+        html_body = f"""<!DOCTYPE html>
 <html lang="en">
 <body style="margin:0;padding:24px;background:#0a0f1a;color:#f1f5f9;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;">
   <div style="max-width:560px;margin:0 auto;background:#111827;border:1px solid #24324a;border-radius:14px;padding:22px;">
     <div style="font-size:11px;font-weight:700;letter-spacing:0.09em;text-transform:uppercase;color:#f59e0b;">
-      PhotoPlanner · Calibrated {html.escape(decision)} Alert
+      LightFinder · Calibrated {html.escape(decision)} Alert
+    </div>
+    <h1 style="margin:6px 0 8px;font-size:20px;color:#f8fafc;">{html.escape(spot_name)} — {html.escape(phase_label)}</h1>
+    <p style="margin:0 0 14px;font-size:13px;color:#94a3b8;">{html.escape(date_str)} · {html.escape(matched_arch_name)}</p>
+    <div style="background:#162033;border:1px solid #24324a;border-radius:10px;padding:14px;margin-bottom:14px;">
+      <div style="font-size:24px;font-weight:800;color:#fde68a;">{comb_val:.0f}% {html.escape(matched_arch_name)}</div>
+      <div style="font-size:12px;color:#94a3b8;margin-top:4px;">Corridor Beam: P50 {p50:.0f}% (P10 {p10:.0f}% – P90 {p90:.0f}%)</div>
+      {viable_html}
+    </div>{ref_html}
+    <p style="margin:0 0 18px;font-size:14px;line-height:1.5;color:#e2e8f0;">{html.escape(reason)}</p>
+    <a href="{html.escape(deep_link)}" style="display:inline-block;padding:10px 16px;border-radius:8px;background:#f59e0b;color:#0a0f1a;font-weight:700;font-size:13px;text-decoration:none;">
+      Open 3D Lens Viewfinder
+    </a>
+  </div>
+</body>
+</html>"""
+    else:
+        subject = f"[{decision}] {spot_name} {phase_label} ({date_str}): {p50:.0f}% Light Odds — {phen}"
+        arch_line = (
+            f"Dominant Archetype: {matched_arch_name} ({float(combined_arch_pct):.0f}%)\n"
+            if matched_arch_name and combined_arch_pct is not None
+            else ""
+        )
+        lever_line = f"Tactical Lever: {tactical_lever}\n" if tactical_lever else ""
+        text_body = (
+            f"LightFinder Calibrated Light Alert ({decision})\n"
+            f"Spot: {spot_name} ({date_str} · {phase_label})\n"
+            f"Phenomenon: {phen} (Opportunity {opp}/100)\n"
+            f"{arch_line}{lever_line}"
+            f"Calibrated Beam Odds: P50 {p50:.0f}% (80% band: P10 {p10:.0f}% – P90 {p90:.0f}%)\n"
+            f"Why: {reason}\n\n"
+            f"Open in 3D Lens Viewfinder: {deep_link}\n"
+        )
+        html_body = f"""<!DOCTYPE html>
+<html lang="en">
+<body style="margin:0;padding:24px;background:#0a0f1a;color:#f1f5f9;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;">
+  <div style="max-width:560px;margin:0 auto;background:#111827;border:1px solid #24324a;border-radius:14px;padding:22px;">
+    <div style="font-size:11px;font-weight:700;letter-spacing:0.09em;text-transform:uppercase;color:#f59e0b;">
+      LightFinder · Calibrated {html.escape(decision)} Alert
     </div>
     <h1 style="margin:6px 0 8px;font-size:20px;color:#f8fafc;">{html.escape(spot_name)} — {html.escape(phase_label)}</h1>
     <p style="margin:0 0 14px;font-size:13px;color:#94a3b8;">{html.escape(date_str)} · {html.escape(phen)}</p>
@@ -94,7 +201,10 @@ def build_alert_message(
 
 def _send_email_resend(to_email: str, msg: dict[str, str]) -> dict[str, Any]:
     api_key = os.environ.get("RESEND_API_KEY", "").strip()
-    from_addr = os.environ.get("PHOTOPLANNER_FROM_EMAIL", "alerts@photoplanner.app").strip()
+    from_addr = (
+        os.environ.get("LIGHTFINDER_FROM_EMAIL", "").strip()
+        or os.environ.get("PHOTOPLANNER_FROM_EMAIL", "alerts@photoplanner.app").strip()
+    )
     payload = json.dumps(
         {
             "from": from_addr,
@@ -111,7 +221,7 @@ def _send_email_resend(to_email: str, msg: dict[str, str]) -> dict[str, Any]:
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "User-Agent": "PhotoPlanner/2.0",
+            "User-Agent": "LightFinder/2.0",
         },
     )
     with urllib.request.urlopen(req, timeout=10.0) as resp:
@@ -123,7 +233,10 @@ def _send_email_smtp(to_email: str, msg: dict[str, str]) -> dict[str, Any]:
     port = int(os.environ.get("SMTP_PORT", "587"))
     user = os.environ.get("SMTP_USER", "").strip()
     password = os.environ.get("SMTP_PASS", "").strip()
-    from_addr = os.environ.get("PHOTOPLANNER_FROM_EMAIL", user or "alerts@photoplanner.app").strip()
+    from_addr = (
+        os.environ.get("LIGHTFINDER_FROM_EMAIL", "").strip()
+        or os.environ.get("PHOTOPLANNER_FROM_EMAIL", user or "alerts@photoplanner.app").strip()
+    )
 
     email = EmailMessage()
     email["Subject"] = msg["subject"]
@@ -151,18 +264,24 @@ def _send_webhook(webhook_url: str, rule: dict[str, Any], evaluation: dict[str, 
                 "Title": msg["subject"][:120],
                 "Click": msg["deep_link"],
                 "Tags": "camera,sunrise",
-                "User-Agent": "PhotoPlanner/2.0",
+                "User-Agent": "LightFinder/2.0",
             },
         )
     else:
         # Compatible with Discord (`content`), Slack (`text`), and generic JSON webhooks
+        reason_txt = str(evaluation.get("reason") or evaluation.get("headline") or "")
         body = json.dumps(
             {
-                "content": f"**{msg['subject']}**\n{evaluation.get('reason', '')}\n{msg['deep_link']}",
-                "text": f"*{msg['subject']}*\n{evaluation.get('reason', '')}\n{msg['deep_link']}",
+                "content": f"**{msg['subject']}**\n{reason_txt}\n{msg['deep_link']}",
+                "text": f"*{msg['subject']}*\n{reason_txt}\n{msg['deep_link']}",
                 "rule_id": rule["id"],
                 "decision": evaluation.get("decision"),
                 "spot_name": evaluation.get("spot_name"),
+                "matched_archetype_id": evaluation.get("matched_archetype_id"),
+                "matched_archetype_name": evaluation.get("matched_archetype_name"),
+                "combined_target_prob_pct": evaluation.get("combined_target_prob_pct"),
+                "tactical_lever": evaluation.get("tactical_lever"),
+                "light_archetypes": evaluation.get("light_archetypes"),
                 "calibrated_p10_p50_p90": evaluation.get("calibrated_p10_p50_p90"),
                 "deep_link": msg["deep_link"],
             }
@@ -171,7 +290,7 @@ def _send_webhook(webhook_url: str, rule: dict[str, Any], evaluation: dict[str, 
             webhook_url,
             data=body,
             method="POST",
-            headers={"Content-Type": "application/json", "User-Agent": "PhotoPlanner/2.0"},
+            headers={"Content-Type": "application/json", "User-Agent": "LightFinder/2.0"},
         )
     with urllib.request.urlopen(req, timeout=10.0) as resp:
         return {"channel": "webhook", "status": resp.status}
@@ -279,7 +398,12 @@ def dispatch_due_alerts(
             )
             if outcome["delivered"] and not dry_run:
                 mark_watchlist_notified(rule["id"], date_str, ev_phase, db_path=resolved_db)
-            sent.append({"rule_id": rule["id"], "spot_name": ev.get("spot_name"), "decision": decision, **outcome})
+            sent_item = {"rule_id": rule["id"], "spot_name": ev.get("spot_name"), "decision": decision, **outcome}
+            if ev.get("matched_archetype_id"):
+                sent_item["matched_archetype_id"] = ev.get("matched_archetype_id")
+                sent_item["matched_archetype_name"] = ev.get("matched_archetype_name")
+                sent_item["combined_target_prob_pct"] = ev.get("combined_target_prob_pct")
+            sent.append(sent_item)
 
     return {
         "date": date_str,

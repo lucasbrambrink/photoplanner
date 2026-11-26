@@ -28,6 +28,10 @@ const paramDate = urlParams.get("date")?.trim();
 const paramLat = parseFloat(urlParams.get("lat") || "");
 const paramLon = parseFloat(urlParams.get("lon") || "");
 const paramMm = parseInt(urlParams.get("mm") || "", 10);
+const paramArchetype = (urlParams.get("archetype") || "").trim().toLowerCase();
+const paramHour = parseInt(urlParams.get("hour") || "", 10);
+let pendingBootArchetype = paramArchetype || null;
+let pendingBootHour = Number.isFinite(paramHour) && paramHour >= 0 && paramHour <= 23 ? paramHour : null;
 const initialCustomCoord =
   Number.isFinite(paramLat) && Number.isFinite(paramLon)
     ? { lat: paramLat, lon: paramLon, name: paramLandmark || `GPS (${paramLat.toFixed(4)}, ${paramLon.toFixed(4)})` }
@@ -73,7 +77,555 @@ const state = {
   showWebcamCard: false,
   webcamGhostEnabled: false,
   webcamGhostOpacity: 0.38,
+  pinnedArchetypeId: null, // null = Auto (Most Likely); string = pinned 3D archetype preview
+  activeArchetypeId: "filtered_gold",
+  activeArchetypeDist: null,
 };
+
+const LIGHT_ARCHETYPE_ORDER = [
+  "filtered_gold",
+  "clearing_storm",
+  "atmospheric_diffusion",
+  "high_thin_veil",
+  "giant_softbox",
+  "blue_hour",
+  "harsh_sun",
+];
+
+const LIGHT_ARCHETYPE_META = {
+  giant_softbox: {
+    id: "giant_softbox",
+    name: "Giant Softbox",
+    short_name: "Softbox",
+    subtitle: "Thick, Uniform Overcast",
+    accent_hex: "#94a3b8",
+    swatch_gradient: "linear-gradient(135deg, #475569 0%, #94a3b8 55%, #cbd5e1 100%)",
+    field_reference: {
+      shadow_edge: "Shadowless wrap-around",
+      contrast: "Very low",
+      color_cast: "Cool 6500–7500K",
+      best_for: "Forests, waterfalls, saturated foliage, intimate rock detail",
+      tactical_lever: "Exclude sky, boost micro-contrast",
+    },
+  },
+  clearing_storm: {
+    id: "clearing_storm",
+    name: "Clearing Storm",
+    short_name: "Storm Breaks",
+    subtitle: "\"God Beams\" & Spotlight Drama",
+    accent_hex: "#f59e0b",
+    swatch_gradient: "linear-gradient(135deg, #1e293b 0%, #334155 48%, #f59e0b 78%, #fde68a 100%)",
+    field_reference: {
+      shadow_edge: "Hard breaks to moody umbra",
+      contrast: "Extreme",
+      color_cast: "Warm / cool split",
+      best_for: "Stormy peaks, spotlighted valleys, dramatic cloud shafts",
+      tactical_lever: "Expose for sunlit highlights, let shadows drop",
+    },
+  },
+  atmospheric_diffusion: {
+    id: "atmospheric_diffusion",
+    name: "Atmospheric Diffusion",
+    short_name: "Mist & Haze",
+    subtitle: "Fog, Mist & Coastal Haze",
+    accent_hex: "#7dd3fc",
+    swatch_gradient: "linear-gradient(135deg, #334e68 0%, #7aa5c2 52%, #d9e8f5 100%)",
+    field_reference: {
+      shadow_edge: "Diffused / graduated",
+      contrast: "Low–moderate layered",
+      color_cast: "Neutral / cool mist",
+      best_for: "Layered ridges, sea stacks, minimalist coastal silhouettes",
+      tactical_lever: "Use distance separation to build depth layers",
+    },
+  },
+  high_thin_veil: {
+    id: "high_thin_veil",
+    name: "High Thin Veil",
+    short_name: "Cirrus Scrim",
+    subtitle: "Cirrus / Bright Overcast Scrim",
+    accent_hex: "#e2e8f0",
+    swatch_gradient: "linear-gradient(135deg, #3b6ea5 0%, #9dbcd4 56%, #f1ece1 100%)",
+    field_reference: {
+      shadow_edge: "Soft-edged (1–2 stop scrim)",
+      contrast: "Moderate",
+      color_cast: "Neutral–warm",
+      best_for: "Midday alpine texture, open vistas, glare-free rock & foliage",
+      tactical_lever: "Ideal for midday subjects without harsh glare",
+    },
+  },
+  filtered_gold: {
+    id: "filtered_gold",
+    name: "Filtered Gold",
+    short_name: "Golden Light",
+    subtitle: "Low-Angle Golden Light & Alpenglow",
+    accent_hex: "#fb923c",
+    swatch_gradient: "linear-gradient(135deg, #1e3a6e 0%, #c2410c 52%, #fbbf24 100%)",
+    field_reference: {
+      shadow_edge: "Long, crisp raking",
+      contrast: "High warm/cool drama",
+      color_cast: "Warm 3000–4500K amber",
+      best_for: "Granite walls, textured cliffs, backlit ridges, alpenglow",
+      tactical_lever: "Side/back-lighting to reveal texture",
+    },
+  },
+  blue_hour: {
+    id: "blue_hour",
+    name: "Blue Hour",
+    short_name: "Blue Hour",
+    subtitle: "Blue Hour & Twilight Glow",
+    accent_hex: "#6366f1",
+    swatch_gradient: "linear-gradient(135deg, #0f172a 0%, #1d4ed8 55%, #8b5cf6 100%)",
+    field_reference: {
+      shadow_edge: "Virtually shadowless",
+      contrast: "Low–silhouetted",
+      color_cast: "Cobalt / violet ambient",
+      best_for: "Alpine mirror lakes, twilight ridgelines, long-exposure surf",
+      tactical_lever: "Balance cool ambient with warm accents or long exposure",
+    },
+  },
+  harsh_sun: {
+    id: "harsh_sun",
+    name: "Harsh Sun",
+    short_name: "Harsh Sun",
+    subtitle: "Clear Midday High-Pressure",
+    accent_hex: "#38bdf8",
+    swatch_gradient: "linear-gradient(135deg, #0369a1 0%, #38bdf8 56%, #fef08a 100%)",
+    field_reference: {
+      shadow_edge: "Razor-sharp",
+      contrast: "Very high",
+      color_cast: "Crisp 5200–5600K",
+      best_for: "Graphic shadows, high-contrast B&W, polarized alpine water",
+      tactical_lever: "Lean into shadows/silhouettes or use a CPL",
+    },
+  },
+};
+
+// Unmistakable 60 FPS Hybrid 3D Visual Signatures for every Light Archetype
+const ARCHETYPE_VISUAL_PROFILES = {
+  giant_softbox: {
+    skyZenith: 0x6f7e90,
+    skyHorizon: 0xa4b2c2,
+    skyBlend: 0.90,
+    skyOvercast: 1.0,
+    skyStorm: 0.0,
+    skyCirrus: 0.0,
+    skyMist: 0.30,
+    sunDiskScale: 0.0,
+    keyTint: 0xdce8f8,
+    shadowTint: 0x8ea0b5,
+    directWeight: 0.16,
+    ambientWeight: 0.88,
+    shadowSharpness: 0.14,
+    microContrast: 1.52,
+    spotlightDrama: 0.0,
+    warmth: 0.0,
+    fogColor: 0x8a9ab0,
+    fogDensity: 0.000022,
+    aerialLayerStrength: 0.35,
+    fogSliceColor: 0x9eb0c4,
+    fogSliceRim: 0xc2d0df,
+    fogSliceOpacity: 0.32,
+    forceMistSlice: false,
+    godRayStrength: 0.0,
+    godRayColor: 0xdbeafe,
+    pinnedSunElRange: [12.0, 42.0],
+  },
+  clearing_storm: {
+    skyZenith: 0x182334,
+    skyHorizon: 0x45556e,
+    skyBlend: 0.84,
+    skyOvercast: 0.12,
+    skyStorm: 1.0,
+    skyCirrus: 0.15,
+    skyMist: 0.16,
+    sunDiskScale: 0.38,
+    keyTint: 0xffd280,
+    shadowTint: 0x14223d,
+    directWeight: 1.38,
+    ambientWeight: 0.24,
+    shadowSharpness: 1.32,
+    microContrast: 1.28,
+    spotlightDrama: 1.0,
+    warmth: 0.58,
+    fogColor: 0x26354d,
+    fogDensity: 0.000018,
+    aerialLayerStrength: 0.25,
+    fogSliceColor: 0x384b66,
+    fogSliceRim: 0xfbbf24,
+    fogSliceOpacity: 0.34,
+    forceMistSlice: false,
+    godRayStrength: 1.0,
+    godRayColor: 0xffd578,
+    pinnedSunElRange: [8.0, 26.0],
+  },
+  atmospheric_diffusion: {
+    skyZenith: 0x6b8aa6,
+    skyHorizon: 0xc4d6e6,
+    skyBlend: 0.88,
+    skyOvercast: 0.24,
+    skyStorm: 0.0,
+    skyCirrus: 0.12,
+    skyMist: 1.0,
+    sunDiskScale: 0.14,
+    keyTint: 0xe6eff8,
+    shadowTint: 0x627a94,
+    directWeight: 0.44,
+    ambientWeight: 0.70,
+    shadowSharpness: 0.36,
+    microContrast: 0.78,
+    spotlightDrama: 0.0,
+    warmth: 0.10,
+    fogColor: 0xa8bfd4,
+    fogDensity: 0.000068,
+    aerialLayerStrength: 1.0,
+    fogSliceColor: 0xd6e6f4,
+    fogSliceRim: 0xf1f7fc,
+    fogSliceOpacity: 0.56,
+    forceMistSlice: true,
+    godRayStrength: 0.0,
+    godRayColor: 0xdbeafe,
+    pinnedSunElRange: [6.0, 28.0],
+  },
+  high_thin_veil: {
+    skyZenith: 0x3b6ea6,
+    skyHorizon: 0xb6cadc,
+    skyBlend: 0.78,
+    skyOvercast: 0.18,
+    skyStorm: 0.0,
+    skyCirrus: 1.0,
+    skyMist: 0.22,
+    sunDiskScale: 0.48,
+    keyTint: 0xfff6e8,
+    shadowTint: 0x5c6a80,
+    directWeight: 0.76,
+    ambientWeight: 0.58,
+    shadowSharpness: 0.52,
+    microContrast: 1.04,
+    spotlightDrama: 0.0,
+    warmth: 0.22,
+    fogColor: 0x8ea9c4,
+    fogDensity: 0.000014,
+    aerialLayerStrength: 0.28,
+    fogSliceColor: 0xc8daea,
+    fogSliceRim: 0xf3ead8,
+    fogSliceOpacity: 0.24,
+    forceMistSlice: false,
+    godRayStrength: 0.0,
+    godRayColor: 0xfef3c7,
+    pinnedSunElRange: [18.0, 48.0],
+  },
+  filtered_gold: {
+    skyZenith: 0x1a386b,
+    skyHorizon: 0xd97236,
+    skyBlend: 0.76,
+    skyOvercast: 0.0,
+    skyStorm: 0.0,
+    skyCirrus: 0.72,
+    skyMist: 0.18,
+    sunDiskScale: 1.05,
+    keyTint: 0xffa042,
+    shadowTint: 0x1b2d56,
+    directWeight: 1.32,
+    ambientWeight: 0.30,
+    shadowSharpness: 1.18,
+    microContrast: 1.24,
+    spotlightDrama: 0.0,
+    warmth: 1.0,
+    fogColor: 0x7a5042,
+    fogDensity: 0.000017,
+    aerialLayerStrength: 0.30,
+    fogSliceColor: 0xe6bfa0,
+    fogSliceRim: 0xff9f38,
+    fogSliceOpacity: 0.42,
+    forceMistSlice: false,
+    godRayStrength: 0.22,
+    godRayColor: 0xffb347,
+    pinnedSunElRange: [3.5, 7.5],
+  },
+  blue_hour: {
+    skyZenith: 0x0b1a44,
+    skyHorizon: 0x3b4d96,
+    skyBlend: 0.90,
+    skyOvercast: 0.0,
+    skyStorm: 0.0,
+    skyCirrus: 0.22,
+    skyMist: 0.15,
+    sunDiskScale: 0.0,
+    keyTint: 0x5c7be0,
+    shadowTint: 0x2c478a,
+    directWeight: 0.12,
+    ambientWeight: 0.82,
+    shadowSharpness: 0.15,
+    microContrast: 0.96,
+    spotlightDrama: 0.0,
+    warmth: -0.35,
+    fogColor: 0x1e3268,
+    fogDensity: 0.000024,
+    aerialLayerStrength: 0.42,
+    fogSliceColor: 0x2e4980,
+    fogSliceRim: 0x8b6bc9,
+    fogSliceOpacity: 0.38,
+    forceMistSlice: false,
+    godRayStrength: 0.0,
+    godRayColor: 0x818cf8,
+    pinnedSunElRange: [-6.0, -3.5],
+  },
+  harsh_sun: {
+    skyZenith: 0x0e4499,
+    skyHorizon: 0x7cb8ee,
+    skyBlend: 0.85,
+    skyOvercast: 0.0,
+    skyStorm: 0.0,
+    skyCirrus: 0.0,
+    skyMist: 0.0,
+    sunDiskScale: 1.35,
+    keyTint: 0xfffef8,
+    shadowTint: 0x101c36,
+    directWeight: 1.48,
+    ambientWeight: 0.20,
+    shadowSharpness: 1.50,
+    microContrast: 1.32,
+    spotlightDrama: 0.0,
+    warmth: 0.02,
+    fogColor: 0x629bd4,
+    fogDensity: 0.000005,
+    aerialLayerStrength: 0.06,
+    fogSliceColor: 0xc8dcf0,
+    fogSliceRim: 0x93c5fd,
+    fogSliceOpacity: 0.16,
+    forceMistSlice: false,
+    godRayStrength: 0.0,
+    godRayColor: 0xfef9c3,
+    pinnedSunElRange: [32.0, 58.0],
+  },
+};
+
+function _lfClamp(v, lo, hi) {
+  return v < lo ? lo : v > hi ? hi : v;
+}
+
+function _lfSmoothstep(e0, e1, x) {
+  if (e0 === e1) return x >= e1 ? 1.0 : 0.0;
+  const t = _lfClamp((x - e0) / (e1 - e0), 0.0, 1.0);
+  return t * t * (3.0 - 2.0 * t);
+}
+
+function largestRemainder100(rawScores) {
+  const cleaned = {};
+  let total = 0;
+  for (const k of LIGHT_ARCHETYPE_ORDER) {
+    const v = Math.max(0, Number(rawScores[k] || 0));
+    cleaned[k] = v;
+    total += v;
+  }
+  if (total <= 1e-12) {
+    for (const k of LIGHT_ARCHETYPE_ORDER) cleaned[k] = k === "high_thin_veil" ? 1 : 0;
+    total = 1;
+  }
+  const exact = {};
+  const floors = {};
+  let floorSum = 0;
+  for (const k of LIGHT_ARCHETYPE_ORDER) {
+    exact[k] = (100 * cleaned[k]) / total;
+    floors[k] = Math.floor(exact[k]);
+    floorSum += floors[k];
+  }
+  const remainder = 100 - floorSum;
+  const remOrder = [...LIGHT_ARCHETYPE_ORDER].sort((a, b) => {
+    const fa = exact[a] - floors[a];
+    const fb = exact[b] - floors[b];
+    if (fb !== fa) return fb - fa;
+    if (exact[b] !== exact[a]) return exact[b] - exact[a];
+    return LIGHT_ARCHETYPE_ORDER.indexOf(a) - LIGHT_ARCHETYPE_ORDER.indexOf(b);
+  });
+  const ints = { ...floors };
+  for (let i = 0; i < remainder; i++) {
+    ints[remOrder[i % remOrder.length]] += 1;
+  }
+  return { ints, exact };
+}
+
+function computeClientLightArchetypes(params) {
+  const el = Number(params.sunElDeg ?? 0);
+  const q10 = _lfClamp(Number(params.p10Pct ?? 20), 0, 100);
+  const q50 = _lfClamp(Number(params.p50Pct ?? 50), q10, 100);
+  const q90 = _lfClamp(Number(params.p90Pct ?? 80), q50, 100);
+  const spread = Math.max(0, q90 - q10);
+
+  const low = _lfClamp(Number(params.cloudLowPct ?? 15) / 100, 0, 1);
+  const mid = _lfClamp(Number(params.cloudMidPct ?? 15) / 100, 0, 1);
+  const high = _lfClamp(Number(params.cloudHighPct ?? 20) / 100, 0, 1);
+  const isCoastal = Boolean(params.isCoastal);
+  const fog = _lfClamp(
+    params.fogPct != null ? Number(params.fogPct) / 100 : low * (isCoastal ? 0.82 : 0.40),
+    0,
+    1
+  );
+  const highTau =
+    params.highOpticalDepth != null
+      ? Math.max(0, Number(params.highOpticalDepth))
+      : high * (0.65 + 1.15 * high);
+  const aod = Math.max(0, Number(params.aod550 ?? 0.07));
+  const visMi = Math.max(0.1, Number(params.visibilityMiles ?? 18));
+  const rh = _lfClamp(Number(params.rhPct ?? 55), 0, 100);
+  const canvas = _lfClamp(Number(params.canvasGlowScore ?? 45) / 100, 0, 1);
+  const direct = _lfClamp(Number(params.directBeamPct ?? q50) / 100, 0, 1);
+  const tDisk = _lfClamp(Number(params.terrainDiskFraction ?? 1.0), 0, 1);
+  const fogTopFt = Number(params.fogTopFt ?? 0);
+  const targetElevFt = Number(params.targetElevFt ?? 0);
+  const invDtF = Number(params.inversionDeltaTF ?? 0);
+
+  const clearanceFt = fogTopFt > 0 ? targetElevFt - fogTopFt : 9999;
+  const aboveFogSea = fogTopFt > 0 && clearanceFt >= 120;
+  const lowOverhead = aboveFogSea && (isCoastal || invDtF >= 1.2) ? low * 0.18 : low;
+  const opaqueOverhead = 1 - (1 - lowOverhead) * (1 - mid);
+  const p50n = q50 / 100;
+  const p90n = q90 / 100;
+  const p10n = q10 / 100;
+  const spreadN = _lfClamp(spread / 70, 0, 1);
+
+  const blueSolarGate = 1 - _lfSmoothstep(-2.2, 1.6, el);
+  const goldSolarGate = _lfSmoothstep(-3.2, -0.4, el) * (1 - _lfSmoothstep(8.5, 14.5, el));
+  const harshSolarGate = _lfSmoothstep(8.5, 17.5, el);
+
+  const twilightSweet = Math.exp(-Math.pow((el + 5.5) / 4.2, 2));
+  const rawBlue =
+    blueSolarGate *
+    (0.85 + 0.65 * twilightSweet) *
+    (0.58 + 0.42 * (1 - 0.55 * opaqueOverhead)) *
+    (1 + 0.28 * canvas * _lfSmoothstep(-9, -2, el)) *
+    1.45;
+
+  const goldBeam = Math.max(
+    0.55 * p50n + 0.30 * p90n + 0.15 * direct,
+    0.72 * canvas * (1 - 0.65 * lowOverhead)
+  );
+  const cloudSeaGoldBonus = aboveFogSea
+    ? 0.28 * fog * _lfSmoothstep(100, 450, clearanceFt) * (0.4 + 0.6 * p90n)
+    : 0;
+  const buriedPen =
+    fogTopFt > 0 ? 1 - 0.68 * _lfSmoothstep(80, -350, clearanceFt) * fog * (1 - p90n) : 1;
+  const diskFactor = Math.max(0.35 + 0.65 * tDisk, 0.78 * canvas);
+  const rawGold =
+    goldSolarGate *
+    Math.pow(Math.max(0.03, goldBeam + cloudSeaGoldBonus), 1.15) *
+    buriedPen *
+    diskFactor *
+    1.65;
+
+  const clearSky = (1 - opaqueOverhead) * (1 - 0.78 * high);
+  const aodClarity = 1 - _lfSmoothstep(0.18, 0.58, aod);
+  const visClarity = _lfSmoothstep(5, 14, visMi);
+  const rawHarsh =
+    harshSolarGate *
+    Math.pow(0.55 * p50n + 0.45 * p10n, 1.25) *
+    Math.pow(clearSky, 1.35) *
+    (0.35 + 0.65 * aodClarity) *
+    (0.40 + 0.60 * visClarity) *
+    1.55;
+
+  const cirrusScrim =
+    _lfSmoothstep(0.18, 0.65, high) *
+    (1 - 0.55 * _lfSmoothstep(3.2, 7.5, highTau)) *
+    (1 - 0.78 * lowOverhead);
+  const thinBrightMid =
+    _lfSmoothstep(0.25, 0.70, mid) *
+    (1 - _lfSmoothstep(0.55, 0.90, lowOverhead)) *
+    _lfSmoothstep(0.25, 0.55, p50n) *
+    (1 - _lfSmoothstep(0.76, 0.94, p50n));
+  const scrimBell = Math.exp(-Math.pow((p50n - 0.58) / 0.30, 2));
+  const veilGate = _lfSmoothstep(1, 9, el) * 0.92 + goldSolarGate * 0.35;
+  const rawVeil =
+    veilGate *
+    Math.max(cirrusScrim * (0.45 + 0.55 * scrimBell), thinBrightMid * 0.85) *
+    (1 - 0.35 * spreadN) *
+    1.25;
+
+  const uniformity = 1 - _lfSmoothstep(18, 56, spread);
+  const lowBeamDark = (1 - _lfSmoothstep(0.15, 0.52, p50n)) * (1 - _lfSmoothstep(0.32, 0.70, p90n));
+  const heavyDeck = _lfSmoothstep(0.55, 0.92, opaqueOverhead);
+  const ceilVsMist = 0.55 + 0.45 * _lfSmoothstep(1.5, 7.0, visMi);
+  const softboxGate = 0.22 * blueSolarGate + 0.95 * _lfSmoothstep(-2, 4, el);
+  const rawSoftbox =
+    softboxGate *
+    heavyDeck *
+    (0.35 + 0.65 * lowBeamDark) *
+    (0.35 + 0.65 * uniformity) *
+    ceilVsMist *
+    1.45;
+
+  const opaqueStorm = _lfSmoothstep(0.18, 0.45, opaqueOverhead);
+  const brokenBell = Math.exp(-Math.pow((opaqueOverhead - 0.56) / 0.30, 2)) * opaqueStorm;
+  const fractureSig = _lfSmoothstep(22, 58, spread) * _lfSmoothstep(0.38, 0.80, p90n);
+  const spotContrast = _lfSmoothstep(0.12, 0.42, p50n) * (1 - _lfSmoothstep(0.74, 0.94, p50n));
+  const sfcFogDamp = 1 - 0.68 * _lfSmoothstep(5.5, 1.5, visMi) * _lfSmoothstep(0.50, 0.85, fog);
+  const stormVert = 0.45 + 0.55 * _lfSmoothstep(0.14, 0.48, mid + 0.55 * Math.max(0, lowOverhead - fog * 0.7));
+  const brokenStruct = brokenBell * (0.48 * fractureSig + 0.34 * spotContrast + 0.18 * canvas);
+  const corrBimodal = fractureSig * opaqueStorm * (0.55 + 0.45 * spotContrast);
+  const rawStorm =
+    _lfSmoothstep(-1, 3.5, el) *
+    Math.max(brokenStruct * 1.40, corrBimodal * 1.42) *
+    sfcFogDamp *
+    stormVert *
+    1.45;
+
+  let invFogSig = 0;
+  if (fogTopFt > 0) {
+    const inOrNear =
+      _lfSmoothstep(0.18, 0.65, fog) *
+      _lfSmoothstep(-900, -100, clearanceFt) *
+      (1 - _lfSmoothstep(240, 980, clearanceFt));
+    const deepIn = _lfSmoothstep(0.35, 0.78, fog) * _lfSmoothstep(120, -220, clearanceFt);
+    const overlooking =
+      _lfSmoothstep(0.40, 0.82, fog) *
+      _lfSmoothstep(120, 420, clearanceFt) *
+      (1 - _lfSmoothstep(1500, 3200, clearanceFt)) *
+      0.58;
+    invFogSig = Math.max(inOrNear, deepIn * 0.96, overlooking);
+  }
+  const aodHaze = _lfSmoothstep(0.15, 0.52, aod) * 0.98;
+  const visMist = _lfSmoothstep(12, 2.2, visMi) * 1.05;
+  const humidMist = _lfSmoothstep(78, 95, rh) * (isCoastal ? 0.50 : 0.28) * (0.35 + 0.65 * fog);
+  const diffCore = Math.max(invFogSig, aodHaze, visMist, humidMist);
+  const diffCombo = _lfClamp(diffCore + 0.24 * Math.min(invFogSig, aodHaze + visMist), 0, 1.25);
+  const diffGate = 0.35 * blueSolarGate + 1.0 * _lfSmoothstep(-3, 2.5, el);
+  const rawDiff = diffGate * Math.pow(diffCombo, 1.05) * 1.50;
+
+  const { ints, exact } = largestRemainder100({
+    filtered_gold: rawGold,
+    clearing_storm: rawStorm,
+    atmospheric_diffusion: rawDiff,
+    high_thin_veil: rawVeil,
+    giant_softbox: rawSoftbox,
+    blue_hour: rawBlue,
+    harsh_sun: rawHarsh,
+  });
+
+  const rankedIds = [...LIGHT_ARCHETYPE_ORDER].sort((a, b) => {
+    if (ints[b] !== ints[a]) return ints[b] - ints[a];
+    if (exact[b] !== exact[a]) return exact[b] - exact[a];
+    return LIGHT_ARCHETYPE_ORDER.indexOf(a) - LIGHT_ARCHETYPE_ORDER.indexOf(b);
+  });
+  const dominantId = rankedIds[0];
+  const viableIds = rankedIds.filter((k) => ints[k] >= 20);
+  if (viableIds.length === 0) viableIds.push(dominantId);
+
+  return {
+    dominant_id: dominantId,
+    dominant_name: LIGHT_ARCHETYPE_META[dominantId].name,
+    dominant_probability_pct: ints[dominantId],
+    viable_threshold_pct: 20,
+    viable_ids: viableIds,
+    ranked_ids: rankedIds,
+    probabilities: ints,
+    probabilities_exact: exact,
+  };
+}
+
+function getArchetypeMeta(id) {
+  const fromServer = state.weatherReport?.light_archetype_catalog?.[id];
+  return fromServer || LIGHT_ARCHETYPE_META[id] || LIGHT_ARCHETYPE_META.filtered_gold;
+}
 
 function gridSizeForTerrainSpan(spanM) {
   if (spanM >= 40000) return 768;
@@ -216,6 +768,8 @@ const fogSeaSliceMat = new THREE.ShaderMaterial({
     uRimColor: { value: new THREE.Color(0xfbbf24) },
     uOpacity: { value: 0.42 },
     uBandTint: { value: 0.5 }, // 0.0 = P10, 0.5 = P50, 1.0 = P90
+    uCloudTime: { value: 0.0 },
+    uDiffusionMode: { value: 0.0 }, // 1.0 = multi-band organic coastal mist
   },
   vertexShader: /* glsl */ `
     varying vec2 vUv;
@@ -231,14 +785,36 @@ const fogSeaSliceMat = new THREE.ShaderMaterial({
     uniform vec3 uRimColor;
     uniform float uOpacity;
     uniform float uBandTint;
+    uniform float uCloudTime;
+    uniform float uDiffusionMode;
+
+    float fogHash(vec2 p) {
+      p = fract(p * vec2(123.34, 456.21));
+      p += dot(p, p + 45.32);
+      return fract(p.x * p.y);
+    }
+
+    float fogNoise(vec2 p) {
+      vec2 i = floor(p);
+      vec2 f = fract(p);
+      vec2 u = f * f * (3.0 - 2.0 * f);
+      return mix(
+        mix(fogHash(i), fogHash(i + vec2(1.0, 0.0)), u.x),
+        mix(fogHash(i + vec2(0.0, 1.0)), fogHash(i + vec2(1.0, 1.0)), u.x),
+        u.y
+      );
+    }
 
     void main() {
       vec2 centered = (vUv - 0.5) * 2.0;
       float r = length(centered);
-      float edgeFade = 1.0 - smoothstep(0.55, 1.0, r);
-      float subtleRipple = 0.04 * sin(vUv.x * 24.0) * cos(vUv.y * 24.0);
-      vec3 col = mix(uColor, uRimColor, 0.12 + 0.08 * (1.0 - edgeFade));
-      float alpha = clamp((uOpacity + subtleRipple) * edgeFade, 0.0, 0.62);
+      float edgeFade = 1.0 - smoothstep(0.48, 1.0, r);
+      vec2 drift = vec2(uCloudTime * 0.018, -uCloudTime * 0.011);
+      float n1 = fogNoise(vUv * 8.5 + drift);
+      float n2 = fogNoise(vUv * 19.0 - drift * 1.4);
+      float mistTex = mix(0.84 + 0.16 * n1, 0.52 + 0.48 * (n1 * 0.65 + n2 * 0.35), uDiffusionMode);
+      vec3 col = mix(uColor, uRimColor, (0.14 + 0.22 * (1.0 - edgeFade)) * (0.7 + 0.3 * n1));
+      float alpha = clamp(uOpacity * mistTex * edgeFade, 0.0, 0.72);
       if (alpha < 0.01) discard;
       gl_FragColor = vec4(col, alpha);
     }
@@ -251,9 +827,17 @@ fogSeaSliceMesh.visible = false;
 fogSeaSliceGroup.add(fogSeaSliceMesh);
 atmosphereGroup.add(fogSeaSliceGroup);
 
+// Lightweight 60 FPS Hybrid Volumetric God-Ray Shafts (always-on for Clearing Storm & grazing breaks
+// in BOTH 3D Map and Tripod views — zero WebGL2 fluid solver overhead!)
+const hybridGodRaysGroup = new THREE.Group();
+hybridGodRaysGroup.visible = false;
+atmosphereGroup.add(hybridGodRaysGroup);
+let activeHybridGodRayMaterials = [];
+let _lastHybridGodRaysKey = "";
+
 // ============================================================================
-// Physical Atmospheric Sky Dome (with Limb-Darkened Solar & Lunar Disks)
-// Rendered behind 3D clouds & terrain so clouds naturally attenuate & silver-line the Sun!
+// Hybrid Physical + 7-Archetype Atmospheric Sky Dome (60 FPS Always-On)
+// Renders unmistakable sky canopies for all 7 Light Archetypes in 3D Map & Tripod views.
 // ============================================================================
 const SKY_DOME_VERTEX = /* glsl */ `
   varying vec3 vWorldDir;
@@ -269,9 +853,19 @@ const SKY_DOME_FRAGMENT = /* glsl */ `
   varying vec3 vWorldDir;
   uniform vec3 uSunDirWorld;
   uniform float uSunElDeg;
+  uniform float uVisualSunElDeg;
   uniform vec3 uMoonDirWorld;
   uniform float uMoonElDeg;
   uniform float uMoonIllum;
+  uniform float uCloudTime;
+  uniform vec3 uArchSkyZenith;
+  uniform vec3 uArchSkyHorizon;
+  uniform float uArchSkyBlend;
+  uniform float uArchOvercast;
+  uniform float uArchStorm;
+  uniform float uArchCirrus;
+  uniform float uArchMist;
+  uniform float uArchSunDiskScale;
 
   float starHash(vec3 p) {
     p = fract(p * vec3(443.897, 441.423, 437.195));
@@ -279,18 +873,48 @@ const SKY_DOME_FRAGMENT = /* glsl */ `
     return fract((p.x + p.y) * p.z);
   }
 
+  float skyHash2(vec2 p) {
+    p = fract(p * vec2(234.34, 435.345));
+    p += dot(p, p + 34.23);
+    return fract(p.x * p.y);
+  }
+
+  float skyNoise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    return mix(
+      mix(skyHash2(i), skyHash2(i + vec2(1.0, 0.0)), u.x),
+      mix(skyHash2(i + vec2(0.0, 1.0)), skyHash2(i + vec2(1.0, 1.0)), u.x),
+      u.y
+    );
+  }
+
+  float skyFbm(vec2 p) {
+    float v = 0.0;
+    float a = 0.5;
+    mat2 rot = mat2(0.80, 0.60, -0.60, 0.80);
+    for (int i = 0; i < 4; i++) {
+      v += a * skyNoise(p);
+      p = rot * p * 2.08;
+      a *= 0.5;
+    }
+    return v;
+  }
+
   void main() {
     vec3 dir = normalize(vWorldDir);
     float y = clamp(dir.y, -0.15, 1.0);
-    float horizonFactor = pow(1.0 - clamp(y, 0.0, 1.0), 3.2);
+    float horizonFactor = pow(1.0 - clamp(y, 0.0, 1.0), 2.8);
     vec3 sunDir = normalize(uSunDirWorld);
     float sunCos = clamp(dot(dir, sunDir), -1.0, 1.0);
     float antiSunCos = clamp(dot(dir, -sunDir), 0.0, 1.0);
+    float effEl = uVisualSunElDeg;
 
-    float tBlueHour = smoothstep(-8.5, -1.5, uSunElDeg) * (1.0 - smoothstep(1.0, 7.5, uSunElDeg));
-    float tGolden = smoothstep(-1.5, 3.0, uSunElDeg) * (1.0 - smoothstep(9.0, 18.0, uSunElDeg));
-    float tDay = smoothstep(8.0, 20.0, uSunElDeg);
-    float tNight = 1.0 - smoothstep(-8.0, -1.0, uSunElDeg);
+    float tBlueHour = smoothstep(-8.5, -1.5, effEl) * (1.0 - smoothstep(1.0, 7.5, effEl));
+    float tGolden = smoothstep(-1.5, 3.0, effEl) * (1.0 - smoothstep(9.0, 18.0, effEl));
+    float tDay = smoothstep(8.0, 20.0, effEl);
+    float tNight = 1.0 - smoothstep(-8.0, -1.0, effEl);
 
     vec3 zenithNight = vec3(0.015, 0.030, 0.072);
     vec3 zenithBlueHour = vec3(0.045, 0.145, 0.35);
@@ -308,36 +932,99 @@ const SKY_DOME_FRAGMENT = /* glsl */ `
     zenithCol /= weightSum;
     horizCol /= weightSum;
 
+    // Blend in active Light Archetype atmospheric palette
+    zenithCol = mix(zenithCol, uArchSkyZenith, uArchSkyBlend);
+    horizCol = mix(horizCol, uArchSkyHorizon, uArchSkyBlend);
+
     vec3 skyCol = mix(zenithCol, horizCol, horizonFactor);
 
-    // Belt of Venus & Earth's twilight shadow wedge
-    float beltBand = exp(-pow((y - 0.09) / 0.085, 2.0)) * pow(antiSunCos, 1.4);
-    skyCol = mix(skyCol, vec3(0.68, 0.42, 0.66), beltBand * (tBlueHour * 0.65 + tGolden * 0.35));
+    // Belt of Venus & Earth's twilight shadow wedge (strong in Blue Hour & Filtered Gold)
+    float clearBelts = 1.0 - max(uArchOvercast, uArchStorm * 0.8);
+    float beltBand = exp(-pow((y - 0.09) / 0.09, 2.0)) * pow(antiSunCos, 1.3);
+    skyCol = mix(skyCol, vec3(0.72, 0.42, 0.70), beltBand * (tBlueHour * 0.72 + tGolden * 0.38) * clearBelts);
 
     float earthShadowBand = smoothstep(0.08, -0.02, y) * pow(antiSunCos, 1.2);
-    skyCol = mix(skyCol, vec3(0.045, 0.095, 0.22), earthShadowBand * (tBlueHour * 0.72 + tGolden * 0.45));
+    skyCol = mix(skyCol, vec3(0.045, 0.095, 0.24), earthShadowBand * (tBlueHour * 0.72 + tGolden * 0.42) * clearBelts);
 
     // Circumsolar Mie forward scattering & golden-crimson twilight glow
-    float sunGlowVis = smoothstep(-6.5, 2.0, uSunElDeg);
-    float mieCore = pow(max(sunCos, 0.0), 9.0) * exp(-abs(y) * 3.2);
-    float mieBroad = pow(max(sunCos, 0.0), 2.3) * horizonFactor;
-    vec3 dawnDuskGlow = mix(vec3(0.98, 0.34, 0.18), vec3(1.0, 0.74, 0.34), smoothstep(-3.0, 6.5, uSunElDeg));
-    skyCol += dawnDuskGlow * (mieCore * 0.68 + mieBroad * 0.38) * sunGlowVis;
+    float sunGlowVis = smoothstep(-7.5, 2.0, effEl);
+    float mieCore = pow(max(sunCos, 0.0), 8.0) * exp(-abs(y) * 2.8);
+    float mieBroad = pow(max(sunCos, 0.0), 2.1) * horizonFactor;
+    vec3 dawnDuskGlow = mix(vec3(0.98, 0.36, 0.20), vec3(1.0, 0.78, 0.38), smoothstep(-3.0, 7.0, effEl));
+    float glowSuppression = 1.0 - uArchOvercast * 0.88;
+    skyCol += dawnDuskGlow * (mieCore * 0.72 + mieBroad * 0.42) * sunGlowVis * glowSuppression;
 
-    // Physical limb-darkened Solar Disk & inner corona (occluded naturally by 3D clouds & terrain!)
-    if (uSunElDeg > -1.4 && y > -0.04) {
+    // Procedural Sky-Dome Cloud Canopies (projected onto upper dome — < 0.08ms GPU at 60 FPS)
+    if (y > -0.02 && (uArchOvercast > 0.02 || uArchStorm > 0.02 || uArchCirrus > 0.02)) {
+      vec2 skyUv = dir.xz / max(0.14, y + 0.16);
+      float drift = uCloudTime * 0.015;
+      float horizonFade = smoothstep(-0.02, 0.12, y);
+
+      // 1. Giant Softbox: Thick, uniform cool 6500-7500K overcast stratus blanket
+      if (uArchOvercast > 0.02) {
+        float ov1 = skyFbm(skyUv * 1.15 + vec2(drift, drift * 0.4));
+        float ov2 = skyFbm(skyUv * 2.8 - vec2(drift * 0.6, 0.0));
+        vec3 ovDark = vec3(0.48, 0.54, 0.62);
+        vec3 ovBright = vec3(0.74, 0.80, 0.87);
+        vec3 ovCol = mix(ovDark, ovBright, smoothstep(0.25, 0.82, ov1 * 0.7 + ov2 * 0.3));
+        ovCol = mix(ovCol, vec3(0.68, 0.74, 0.82), horizonFactor * 0.55);
+        skyCol = mix(skyCol, ovCol, clamp(uArchOvercast * (0.82 + 0.18 * horizonFade), 0.0, 0.98));
+      }
+
+      // 2. Clearing Storm: Brooding dark storm cloud slabs with fractured silver-gold sun breaks
+      if (uArchStorm > 0.02) {
+        float stMacro = skyFbm(skyUv * 1.35 + vec2(drift * 1.2, -drift * 0.5));
+        float stDetail = skyFbm(skyUv * 3.6 - vec2(drift * 1.8, drift * 0.9));
+        float stormCov = smoothstep(0.34, 0.70, stMacro * 0.72 + stDetail * 0.28);
+        float breakEdge = smoothstep(0.28, 0.44, stMacro) * (1.0 - smoothstep(0.48, 0.68, stMacro));
+        vec3 stormBase = mix(vec3(0.10, 0.14, 0.22), vec3(0.24, 0.30, 0.40), stDetail);
+        vec3 silverRim = mix(vec3(0.95, 0.88, 0.74), vec3(1.0, 0.70, 0.28), clamp(pow(max(sunCos, 0.0), 1.6), 0.0, 1.0));
+        vec3 stormCol = mix(stormBase, silverRim, clamp(breakEdge * (0.55 + 0.85 * pow(max(sunCos, 0.0), 2.0)), 0.0, 0.95));
+        // Bright glowing sun-break windows between dark storm slabs
+        float sunWindow = (1.0 - stormCov) * pow(max(sunCos, 0.0), 3.0);
+        skyCol += vec3(1.0, 0.82, 0.44) * sunWindow * uArchStorm * 0.65;
+        skyCol = mix(skyCol, stormCol, stormCov * uArchStorm * (0.72 + 0.24 * horizonFade));
+      }
+
+      // 3. High Thin Veil & Filtered Gold Alpenglow Cirrus: Silky upper-tropospheric streaks
+      if (uArchCirrus > 0.02) {
+        vec2 ciUv = vec2(skyUv.x * 2.4 + skyUv.y * 0.65, skyUv.y * 0.85 - skyUv.x * 0.35);
+        float ci1 = skyFbm(ciUv * 1.4 + vec2(drift * 1.6, 0.0));
+        float ci2 = skyFbm(ciUv * 3.2 - vec2(drift * 0.8, 0.2));
+        float veilMask = smoothstep(0.32, 0.76, ci1 * 0.65 + ci2 * 0.35) * horizonFade;
+        vec3 cirrusDayCol = mix(vec3(0.84, 0.88, 0.92), vec3(0.98, 0.95, 0.89), pow(max(sunCos, 0.0), 2.0));
+        vec3 cirrusGoldCol = mix(vec3(0.96, 0.46, 0.26), vec3(1.0, 0.80, 0.42), pow(max(sunCos, 0.0), 1.5));
+        vec3 cirrusCol = mix(cirrusDayCol, cirrusGoldCol, clamp(tGolden * 0.92 + tBlueHour * 0.55, 0.0, 1.0));
+        // High thin veil creates a continuous 1-2 stop luminous scrim across the sky
+        float scrimFloor = 0.26 * uArchCirrus * (1.0 - tGolden * 0.5);
+        skyCol = mix(skyCol, cirrusCol, clamp((veilMask * 0.72 + scrimFloor) * uArchCirrus, 0.0, 0.82));
+      }
+    }
+
+    // 4. Atmospheric Diffusion: Luminous milky pearl-mist veil lifting from horizon
+    if (uArchMist > 0.02) {
+      float mistBand = pow(1.0 - clamp(y, 0.0, 1.0), 1.45);
+      vec3 mistCol = mix(vec3(0.76, 0.84, 0.90), vec3(0.88, 0.92, 0.95), mistBand);
+      skyCol = mix(skyCol, mistCol, clamp(uArchMist * (0.25 + 0.68 * mistBand), 0.0, 0.92));
+      // Broad soft diffused solar halo through mist
+      float mistHalo = pow(max(sunCos, 0.0), 3.2) * uArchMist * smoothstep(-2.0, 6.0, effEl);
+      skyCol += vec3(0.96, 0.93, 0.86) * mistHalo * 0.32;
+    }
+
+    // Physical limb-darkened Solar Disk & inner corona (scaled by archetype cloud screening)
+    if (effEl > -1.4 && y > -0.04 && uArchSunDiskScale > 0.01) {
       float angDeg = degrees(acos(clamp(sunCos, -1.0, 1.0)));
       float diskMask = 1.0 - smoothstep(0.24, 0.34, angDeg);
       float aureole = exp(-angDeg / 1.35) * 0.55 + exp(-angDeg / 4.2) * 0.18;
-      float sinEl = sin(radians(max(uSunElDeg, 0.12)));
-      float airMass = clamp(1.0 / (sinEl + 0.12 * pow(max(0.0, uSunElDeg + 2.8), -0.75)), 1.0, 28.0);
+      float sinEl = sin(radians(max(effEl, 0.12)));
+      float airMass = clamp(1.0 / (sinEl + 0.12 * pow(max(0.0, effEl + 2.8), -0.75)), 1.0, 28.0);
       vec3 sunExt = exp(-vec3(0.048, 0.122, 0.255) * airMass);
-      float horizonCut = smoothstep(-1.2, 0.15, uSunElDeg);
-      skyCol += sunExt * (diskMask * 4.2 + aureole * 1.15) * horizonCut;
+      float horizonCut = smoothstep(-1.2, 0.15, effEl);
+      skyCol += sunExt * (diskMask * 4.2 + aureole * 1.15) * horizonCut * uArchSunDiskScale;
     }
 
     // Physical Lunar Disk & soft nocturnal aureole
-    if (uMoonElDeg > -0.8 && uMoonIllum > 0.03 && uSunElDeg < -2.0 && y > -0.02) {
+    if (uMoonElDeg > -0.8 && uMoonIllum > 0.03 && effEl < -2.0 && y > -0.02 && uArchOvercast < 0.6) {
       vec3 moonDir = normalize(uMoonDirWorld);
       float moonCos = clamp(dot(dir, moonDir), -1.0, 1.0);
       float mAng = degrees(acos(moonCos));
@@ -347,17 +1034,22 @@ const SKY_DOME_FRAGMENT = /* glsl */ `
     }
 
     if (y < 0.0) {
-      skyCol = mix(skyCol, vec3(0.025, 0.05, 0.10), clamp(-y * 8.0, 0.0, 1.0));
+      vec3 belowHorizCol = mix(
+        skyCol * 0.72,
+        uArchSkyHorizon * mix(0.72, 0.92, clamp(uArchMist + uArchOvercast * 0.65, 0.0, 1.0)),
+        clamp(0.45 + uArchSkyBlend * 0.45, 0.0, 0.92)
+      );
+      skyCol = mix(skyCol, belowHorizCol, clamp(-y * 4.5, 0.0, 1.0));
     }
 
-    // Procedural starfield + faint Milky Way band in deep twilight / night
-    float starVis = smoothstep(-0.8, -6.8, uSunElDeg) * smoothstep(0.03, 0.32, y);
+    // Procedural starfield in deep twilight / Blue Hour / night
+    float starVis = smoothstep(-1.2, -5.5, effEl) * smoothstep(0.04, 0.32, y) * (1.0 - max(uArchOvercast, uArchStorm * 0.85));
     if (starVis > 0.01) {
       vec3 starCell = floor(dir * 420.0);
       float h = starHash(starCell);
-      if (h > 0.9962) {
-        float brightness = (h - 0.9962) / 0.0038;
-        skyCol += vec3(0.84, 0.91, 1.0) * brightness * starVis * 0.92;
+      if (h > 0.9960) {
+        float brightness = (h - 0.9960) / 0.0040;
+        skyCol += vec3(0.84, 0.91, 1.0) * brightness * starVis * 0.95;
       }
     }
 
@@ -371,9 +1063,19 @@ const skyDomeMat = new THREE.ShaderMaterial({
   uniforms: {
     uSunDirWorld: { value: new THREE.Vector3(-0.9, 0.05, 0.2).normalize() },
     uSunElDeg: { value: 0.5 },
+    uVisualSunElDeg: { value: 0.5 },
     uMoonDirWorld: { value: new THREE.Vector3(-0.6, 0.35, 0.4).normalize() },
     uMoonElDeg: { value: -10.0 },
     uMoonIllum: { value: 0.25 },
+    uCloudTime: { value: 0.0 },
+    uArchSkyZenith: { value: new THREE.Color(0x1a386b) },
+    uArchSkyHorizon: { value: new THREE.Color(0xd97236) },
+    uArchSkyBlend: { value: 0.72 },
+    uArchOvercast: { value: 0.0 },
+    uArchStorm: { value: 0.0 },
+    uArchCirrus: { value: 0.65 },
+    uArchMist: { value: 0.15 },
+    uArchSunDiskScale: { value: 1.0 },
   },
   side: THREE.BackSide,
   depthWrite: false,
@@ -483,16 +1185,16 @@ const GODRAY_FRAGMENT_SHADER = /* glsl */ `
     vec3 N = normalize(vNormalWorld);
     vec3 V = normalize(cameraPosition - vWorldPos);
     // Smooth cylindrical Fresnel falloff so the sunbeam has zero hard polygon edges
-    float fresnel = pow(clamp(abs(dot(N, V)), 0.0, 1.0), 1.45);
-    // Vertical atmospheric profile: intense near the 3D cloud hole (vUv.y -> 1), soft taper into sea-mist spotlight
-    float vertProfile = smoothstep(0.0, 0.14, vUv.y) * mix(0.62, 1.0, vUv.y);
+    float fresnel = pow(clamp(abs(dot(N, V)), 0.0, 1.0), 1.10);
+    // Vertical atmospheric profile: intense near the 3D cloud hole (vUv.y -> 1), soft taper into spotlight
+    float vertProfile = smoothstep(0.0, 0.10, vUv.y) * mix(0.58, 1.0, vUv.y);
     // Subtle wind-advected Tyndall aerosol / marine mist striations drifting across the light shaft
     float drift = uCloudTime * 0.55;
     float striation = 0.84 + 0.16 * sin(vUv.x * 25.1327 + drift + vWorldPos.y * 0.012)
                            * cos(vWorldPos.x * 0.0045 - uWindDirENU.x * drift);
-    float alpha = uBaseOpacity * fresnel * vertProfile * striation;
+    float alpha = clamp(uBaseOpacity * fresnel * vertProfile * striation, 0.0, 0.85);
     if (alpha <= 0.003) discard;
-    gl_FragColor = vec4(uBeamColor * (1.05 + 0.25 * fresnel), alpha);
+    gl_FragColor = vec4(uBeamColor * (1.18 + 0.34 * fresnel), alpha);
   }
 `;
 
@@ -581,6 +1283,18 @@ const TERRAIN_FRAGMENT_SHADER = /* glsl */ `
   uniform float uNumCloudGaps;
   uniform float uMeanCloudTau;
   uniform float uCloudTime;
+  // 7-Archetype Hybrid 60 FPS Light & Aerial Perspective Uniforms
+  uniform vec3 uArchKeyTint;
+  uniform vec3 uArchShadowTint;
+  uniform float uArchDirectWeight;
+  uniform float uArchAmbientWeight;
+  uniform float uArchShadowSharpness;
+  uniform float uArchMicroContrast;
+  uniform float uArchSpotlightDrama;
+  uniform float uArchWarmth;
+  uniform vec3 uSceneFogColor;
+  uniform float uSceneFogDensity;
+  uniform float uAerialLayerStrength;
   ${CORRIDOR_LUT_GLSL1}
 
   varying vec2 vUv;
@@ -775,48 +1489,80 @@ const TERRAIN_FRAGMENT_SHADER = /* glsl */ `
     float ambientFloor = mix(0.38, 0.16, isThickOvercast);
     float effectiveCloudLight = ambientFloor + (1.0 - ambientFloor) * cloudTransmittance;
 
-    // Low-sun Golden Hour factor
+    // Low-sun Golden Hour factor (modulated by active archetype warmth)
     float sunElDeg = degrees(asin(clamp(uSunDirENU.z, -1.0, 1.0)));
-    float goldenFactor = smoothstep(-0.5, 1.5, sunElDeg) * (1.0 - smoothstep(9.5, 18.0, sunElDeg));
+    float baseGolden = smoothstep(-0.5, 1.5, sunElDeg) * (1.0 - smoothstep(9.5, 18.0, sunElDeg));
+    float goldenFactor = clamp(mix(baseGolden, max(0.0, uArchWarmth), 0.72), 0.0, 1.0);
 
-    // High-contrast Shadowed Umbra vs. Sunlit Area coloring for a razor-sharp light/dark border
-    vec3 shadowColor = rockBase * vec3(0.12, 0.19, 0.35) * (0.34 + 0.50 * relZ);
-    vec3 warmSunColor = mix(vec3(1.0, 0.92, 0.78), vec3(1.0, 0.58, 0.22), goldenFactor) * corrChromaTint;
-    vec3 sunlitColor = rockBase * (0.46 + 0.88 * ndotl) * warmSunColor * effectiveCloudLight;
+    // Micro-contrast boost (e.g. Giant Softbox enhances foliage/rock cavity relief without hard shadows)
+    float archCavity = clamp(1.0 + (cavityAO - 1.0) * uArchMicroContrast, 0.42, 1.55);
+    vec3 archRockBase = rockBase * (archCavity / max(cavityAO, 0.01));
 
-    // Dramatic molten-gold crepuscular spotlight patch where a 3D cloud-gap sunbeam strikes the bluffs/ridges
-    vec3 crepuscularGold = mix(vec3(1.0, 0.88, 0.42), vec3(1.0, 0.62, 0.16), goldenFactor);
+    // Synthesize dramatic moving/positioned broken-cloud spotlight pools for Clearing Storm ("God Beams")
+    float stormSpot = 0.0;
+    float stormUmbraMask = 1.0;
+    if (uArchSpotlightDrama > 0.02) {
+      vec2 driftSpot = uWindDirENU * (uCloudTime * 14.0);
+      float sMacro = rockFbm((posEN - driftSpot) * 0.00052 + vec2(3.1, -1.7));
+      float sBreak = smoothstep(0.50, 0.72, sMacro);
+      float targetSpot = 1.0 - smoothstep(320.0, 1650.0, distToTarget);
+      stormSpot = clamp(max(max(gapSpotlight, sBreak), targetSpot * 0.92), 0.0, 1.0) * uArchSpotlightDrama;
+      stormUmbraMask = mix(1.0, 0.22 + 0.78 * stormSpot, uArchSpotlightDrama);
+    }
+
+    // Shadow edge sharpness:
+    // - Shadowless wrap-around (Giant Softbox / Blue Hour): softens topoLit & ndotl into even ambient illumination
+    // - Razor-sharp / extreme contrast (Harsh Sun / Clearing Storm / Filtered Gold): crisp hard shadow terminator
+    float litEffective = mix(0.55 + 0.45 * topoLit, pow(clamp(topoLit, 0.0, 1.0), mix(0.65, 1.45, clamp(uArchShadowSharpness * 0.75, 0.0, 1.0))), clamp(uArchShadowSharpness, 0.0, 1.0));
+    float ndotlShaped = mix(0.62 + 0.38 * ndotl, ndotl, clamp(uArchShadowSharpness, 0.0, 1.0));
+
+    // Ambient / Shadowed Umbra vs. Sunlit Direct Key driven by active Light Archetype
+    vec3 shadowColor = archRockBase * uArchShadowTint * (0.48 + 0.52 * uArchAmbientWeight) * (0.55 + 0.45 * relZ);
+    vec3 warmSunColor = uArchKeyTint * corrChromaTint;
+    float cloudMod = mix(1.0, effectiveCloudLight, clamp(uArchShadowSharpness * 0.65, 0.0, 0.85));
+    vec3 sunlitColor = archRockBase * (uArchAmbientWeight * 0.52 + uArchDirectWeight * (0.28 + 0.92 * ndotlShaped) * stormUmbraMask) * warmSunColor * cloudMod;
+
+    // Dramatic molten-gold crepuscular spotlight patch where a storm break / god beam strikes the bluffs/ridges
+    vec3 crepuscularGold = mix(vec3(1.0, 0.88, 0.46), vec3(1.0, 0.62, 0.18), goldenFactor);
+    float combinedSpot = clamp(max(gapSpotlight * 0.78 + gapCoreBeam * 0.35, stormSpot * 0.88), 0.0, 0.96);
     sunlitColor = mix(
       sunlitColor,
-      sunlitColor * 1.45 + crepuscularGold * 0.42,
-      clamp(gapSpotlight * 0.78 + gapCoreBeam * 0.35, 0.0, 0.96)
+      sunlitColor * 1.42 + crepuscularGold * 0.44 * (0.35 + 0.65 * ndotl),
+      combinedSpot
     );
 
-    // Illuminate EVERY shadow-producing grazing ray by area (and trace a razor-sharp golden terminator border
-    // right where the sunlit grazing ray meets the cast shadow of any ridge/cliff/headland), modulated by cloud transmittance
+    // Illuminate shadow-producing grazing rays & crisp terminator when direct beam contrast is active
     float isGrazingShadowRay = step(40.0, closestOccluderDist) * step(0.01, topoLit);
-    float grazingRayAreaBand = isGrazingShadowRay * (1.0 - smoothstep(0.0, 58.0, minClearance)) * cloudTransmittance;
-    float terminatorKnifeEdge = isGrazingShadowRay * (1.0 - smoothstep(0.0, 4.5, minClearance)) * (0.25 + 0.75 * cloudTransmittance);
-    vec3 grazingAreaCol = mix(vec3(1.0, 0.88, 0.44), vec3(1.0, 0.62, 0.16), goldenFactor);
+    float grazingScale = smoothstep(0.22, 0.95, uArchShadowSharpness);
+    float grazingRayAreaBand = isGrazingShadowRay * (1.0 - smoothstep(0.0, 58.0, minClearance)) * cloudTransmittance * grazingScale;
+    float terminatorKnifeEdge = isGrazingShadowRay * (1.0 - smoothstep(0.0, 4.5, minClearance)) * (0.25 + 0.75 * cloudTransmittance) * grazingScale;
+    vec3 grazingAreaCol = mix(vec3(1.0, 0.90, 0.54), vec3(1.0, 0.62, 0.16), goldenFactor);
     sunlitColor = mix(
       sunlitColor,
-      sunlitColor * 1.28 + grazingAreaCol * 0.34,
-      clamp(grazingRayAreaBand * 0.68 + terminatorKnifeEdge * 0.85, 0.0, 0.94)
+      sunlitColor * 1.24 + grazingAreaCol * 0.30,
+      clamp(grazingRayAreaBand * 0.62 + terminatorKnifeEdge * 0.78, 0.0, 0.90)
     );
 
-    // Highlight Golden-Hour Sun Landing Zone on the target landmark's lit face
-    if (uHighlightZone > 0.5 && topoLit > 0.02 && isOcean < 0.5) {
+    // Highlight Golden-Hour Sun Landing Zone on the target landmark's lit face (suppressed in shadowless Softbox/Blue Hour)
+    if (uHighlightZone > 0.5 && topoLit > 0.02 && isOcean < 0.5 && uArchDirectWeight > 0.35) {
       float cliffLanding = targetMask * smoothstep(0.32, 0.76, relZ) * (0.35 + 0.65 * ndotl) * (0.28 + 0.72 * cloudTransmittance);
       vec3 alpenglowCopper = vec3(1.0, 0.46, 0.11);
       vec3 alpenglowGold   = vec3(1.0, 0.78, 0.26);
       vec3 landingGlow = mix(alpenglowGold, alpenglowCopper, goldenFactor);
-      sunlitColor = mix(sunlitColor, landingGlow, clamp(cliffLanding * 0.74, 0.0, 0.86));
+      sunlitColor = mix(sunlitColor, landingGlow, clamp(cliffLanding * 0.68 * (0.45 + 0.55 * goldenFactor), 0.0, 0.84));
 
       float rimRing = smoothstep(570.0, 610.0, distToTarget) * (1.0 - smoothstep(610.0, 650.0, distToTarget));
-      sunlitColor += vec3(1.0, 0.74, 0.22) * rimRing * 0.48;
+      sunlitColor += vec3(1.0, 0.74, 0.22) * rimRing * 0.42 * (0.4 + 0.6 * goldenFactor);
     }
 
-    vec3 finalColor = mix(shadowColor, sunlitColor, topoLit);
+    vec3 finalColor = mix(shadowColor, sunlitColor, litEffective);
+
+    // Subtle twilight cobalt rim-glow on high ridges during Blue Hour
+    if (uArchWarmth < -0.1) {
+      float twilightAmt = clamp(-uArchWarmth * 2.4, 0.0, 1.0);
+      float ridgeRim = smoothstep(0.35, 0.92, relZ) * (0.35 + 0.65 * max(dot(normalENU.xy, horizSun), 0.0));
+      finalColor += vec3(0.18, 0.20, 0.46) * ridgeRim * twilightAmt * 0.38;
+    }
 
     // Blend Pacific Ocean water surface, live wind-advected swell ripples, coastal surf foam & crepuscular cloud-gap spotlights on water
     if (isOcean > 0.01) {
@@ -825,16 +1571,16 @@ const TERRAIN_FRAGMENT_SHADER = /* glsl */ `
       float wave2 = cos(vWorldPos.x * 0.021 - vWorldPos.z * 0.048 + wavePhase * 0.72) * 0.5 + 0.5;
       float swell = rockNoise(vWorldPos.xz * 0.015 - uWindDirENU * (uCloudTime * 0.12));
       float waveRipple = mix(mix(wave1, wave2, 0.5), swell, 0.42);
-      vec3 oceanShadow = vec3(0.02, 0.06, 0.14);
+      vec3 oceanShadow = mix(vec3(0.02, 0.06, 0.14), uArchShadowTint * 0.42, 0.55);
       vec3 oceanLitBase = mix(vec3(0.05, 0.18, 0.34), vec3(0.11, 0.34, 0.48), clamp((sunElDeg + 6.0) / 20.0, 0.0, 1.0));
-      vec3 oceanLit = mix(oceanLitBase, vec3(0.14, 0.40, 0.52), isSurfZone * 0.65 + waveRipple * 0.16) * effectiveCloudLight;
+      vec3 oceanLit = mix(oceanLitBase, vec3(0.14, 0.40, 0.52), isSurfZone * 0.65 + waveRipple * 0.16) * (0.45 + 0.55 * cloudMod) * mix(vec3(1.0), uArchKeyTint, 0.45);
 
       // Glowing golden-amber crepuscular sunbeam spotlight patch on the dark ocean where a 3D cloud gap punches through!
       vec3 waterSpotCol = mix(vec3(1.0, 0.78, 0.32), vec3(1.0, 0.54, 0.14), goldenFactor) * (0.55 + 0.45 * waveRipple);
       oceanLit = mix(
         oceanLit,
         oceanLit * 1.55 + waterSpotCol * 0.68,
-        clamp(gapSpotlight * 0.88 + gapCoreBeam * 0.45, 0.0, 0.96)
+        clamp(max(gapSpotlight * 0.88 + gapCoreBeam * 0.45, stormSpot * 0.82), 0.0, 0.96)
       );
 
       // Illuminate shadow-producing grazing ray area & sharp terminator across the ocean surface
@@ -843,18 +1589,18 @@ const TERRAIN_FRAGMENT_SHADER = /* glsl */ `
         oceanLit * 1.25 + grazingAreaCol * 0.30,
         clamp(grazingRayAreaBand * 0.62 + terminatorKnifeEdge * 0.82, 0.0, 0.92)
       );
-      vec3 oceanCol = mix(oceanShadow, oceanLit, topoLit);
+      vec3 oceanCol = mix(oceanShadow, oceanLit, litEffective);
 
       // Solar specular glitter path across the sunlit Pacific toward uSunDirENU (occluded under thick clouds except in gaps)
       vec2 sunHoriz = normalize(uSunDirENU.xy + vec2(1e-5));
       vec2 pixHoriz = normalize(-posEN + vec2(1e-5));
       float sunAlign = max(dot(sunHoriz, -pixHoriz), 0.0);
-      float glint = pow(sunAlign, 14.0) * (0.35 + 0.65 * waveRipple) * smoothstep(-2.0, 3.0, sunElDeg) * (0.05 + 0.95 * topoLit) * cloudTransmittance;
+      float glint = pow(sunAlign, 14.0) * (0.35 + 0.65 * waveRipple) * smoothstep(-2.0, 3.0, sunElDeg) * (0.05 + 0.95 * topoLit) * cloudTransmittance * smoothstep(0.25, 1.0, uArchDirectWeight);
       vec3 glintCol = mix(vec3(1.0, 0.58, 0.24), vec3(1.0, 0.88, 0.55), clamp(sunElDeg / 10.0, 0.0, 1.0));
       oceanCol += glintCol * glint * 0.92;
 
       // Whitewater coastal surf line right where waves meet Pedro Point / Devil's Slide bluffs
-      oceanCol = mix(oceanCol, vec3(0.84, 0.92, 0.98) * (0.28 + 0.72 * topoLit * effectiveCloudLight), isSurfZone * (0.38 + 0.38 * wave1));
+      oceanCol = mix(oceanCol, vec3(0.84, 0.92, 0.98) * (0.36 + 0.64 * litEffective * cloudMod), isSurfZone * (0.38 + 0.38 * wave1));
       finalColor = mix(finalColor, oceanCol, isOcean);
     }
 
@@ -886,12 +1632,11 @@ const TERRAIN_FRAGMENT_SHADER = /* glsl */ `
       float aboveBase = smoothstep(uFogBaseM - 120.0, uFogBaseM + 20.0, z);
       float fogNoise = rockFbm(vWorldPos.xz * 0.0018 + vec2(1.7, -2.3));
       float fogVeil = belowTop * aboveBase * clamp(localFogStr * (0.72 + 0.45 * fogNoise), 0.0, 0.86);
-      vec3 fogLitCol = mix(vec3(0.62, 0.72, 0.86), vec3(0.98, 0.80, 0.62), goldenFactor * 0.75);
-      // Keep subtle ground mist dampen here while 3D volumetric raymarcher renders real 1m fog billows above!
-      finalColor = mix(finalColor, fogLitCol, fogVeil * 0.18);
+      vec3 fogLitCol = mix(uSceneFogColor * 1.06, vec3(0.98, 0.80, 0.62), goldenFactor * 0.68);
+      finalColor = mix(finalColor, fogLitCol, fogVeil * mix(0.22, 0.56, uAerialLayerStrength));
 
       float topShore = exp(-pow((z - localFogTop) / 22.0, 2.0)) * (1.0 - isOcean);
-      finalColor = mix(finalColor, fogLitCol * 1.06, topShore * localFogStr * 0.22);
+      finalColor = mix(finalColor, fogLitCol * 1.08, topShore * localFogStr * 0.26);
     }
 
     // 3. GPU-Baked 360-deg Viewshed Heatmap Overlay (bakedViewshedLos from uTerrainBakeTex — 1 fetch vs 77 steps!)
@@ -914,6 +1659,14 @@ const TERRAIN_FRAGMENT_SHADER = /* glsl */ `
       finalColor = mix(finalColor, finalColor * 0.76, contour50 * 0.25);
       finalColor = mix(finalColor, vec3(0.95, 0.82, 0.55), contour200 * 0.18);
     }
+
+    // 4. Graduated Exponential Aerial Perspective & Depth-Layer Mist (synced with scene.fog at 60 FPS)
+    float camDist = length(cameraPosition - vWorldPos);
+    float distFog = 1.0 - exp(-camDist * uSceneFogDensity);
+    // Low-valley mist weighting makes successive ridges separate into crisp graduated layers in Atmospheric Diffusion
+    float valleyLayerBoost = (1.0 - smoothstep(0.10, 0.88, relZ)) * uAerialLayerStrength * 0.48 * smoothstep(400.0, 4800.0, camDist);
+    float totalAerial = clamp(distFog + valleyLayerBoost, 0.0, 0.92);
+    finalColor = mix(finalColor, uSceneFogColor, totalAerial);
 
     gl_FragColor = vec4(finalColor, 1.0);
   }
@@ -1172,6 +1925,17 @@ function buildTerrainMesh() {
       uNumCloudGaps: { value: 0.0 },
       uMeanCloudTau: { value: 0.35 },
       uCloudTime: { value: 0.0 },
+      uArchKeyTint: { value: new THREE.Color(0xffa042) },
+      uArchShadowTint: { value: new THREE.Color(0x1b2d56) },
+      uArchDirectWeight: { value: 1.25 },
+      uArchAmbientWeight: { value: 0.32 },
+      uArchShadowSharpness: { value: 1.15 },
+      uArchMicroContrast: { value: 1.22 },
+      uArchSpotlightDrama: { value: 0.0 },
+      uArchWarmth: { value: 0.9 },
+      uSceneFogColor: { value: new THREE.Color(0x2d466e) },
+      uSceneFogDensity: { value: 0.000014 },
+      uAerialLayerStrength: { value: 0.25 },
       ...volumetricEngine.getCorridorUniforms(),
     },
   });
@@ -2646,10 +3410,192 @@ function applyHourlyWeatherAtMinutes(minutes) {
     canvasGlow: Math.round(lerpNum(row0.canvas_glow_score, row1.canvas_glow_score, wr.canvas_score ?? 50)),
     fogTopFt: Math.round(lerpNum(row0.fog_top_ft, row1.fog_top_ft, wr.fog_top_ft ?? 1250)),
     cloudLowPct: Math.round(lerpNum(row0.cloud_low_pct, row1.cloud_low_pct, wr.cloud_low_pct ?? 15)),
+    cloudMidPct: Math.round(lerpNum(row0.cloud_mid_pct, row1.cloud_mid_pct, wr.cloud_mid_pct ?? 15)),
+    cloudHighPct: Math.round(lerpNum(row0.cloud_high_pct, row1.cloud_high_pct, wr.cloud_high_pct ?? 20)),
+    fogPct: Math.round(lerpNum(row0.fog_pct, row1.fog_pct, row0.cloud_low_pct ?? wr.cloud_low_pct ?? 15)),
+    highOpticalDepth: lerpNum(row0.high_optical_depth, row1.high_optical_depth, wr.fluid_atmosphere_params?.highOpticalDepth ?? 0.5),
+    visibilityMiles: lerpNum(row0.visibility_miles, row1.visibility_miles, wr.visibility_miles ?? 16),
+    rhPct: Math.round(lerpNum(row0.rh_pct, row1.rh_pct, wr.inversion_model?.rh_2m_pct ?? 58)),
+    tempF: Math.round(lerpNum(row0.temp_f, row1.temp_f, wr.temp_sunset_f ?? 58)),
+    windMph: Math.round(lerpNum(row0.wind_mph, row1.wind_mph, wr.wind_mph ?? 8)),
     aod550: lerpNum(row0.aod_550nm, row1.aod_550nm, wr.astro_atmosphere?.aod_550nm ?? 0.06),
     blockerLabel: pickRow?.blocker_label || "clear",
     blockerDistKm: pickRow?.blocker_distance_km || 0,
+    hourlyArchetypes: pickRow?.light_archetypes || null,
   };
+}
+
+function resolveActiveLightArchetype(minutes, elevationDeg, hourlyMet) {
+  const wr = state.weatherReport;
+  const inv = wr?.inversion_model || {};
+  const lmElevFt =
+    state.shootReport?.target_landmark?.summit_elevation_ft ??
+    inv.target_elev_ft ??
+    (state.terrainPatch?.max_elevation_m ? state.terrainPatch.max_elevation_m * 3.28084 : 1500);
+
+  // If scrubbing near the exact primary golden-hour peak and backend provided calibrated primary archetypes, use it directly
+  let dist = null;
+  if (wr?.light_archetypes?.probabilities) {
+    const phaseKey = String(wr.phase || "sunset").toLowerCase().includes("sunrise") ? "sunrise" : "sunset";
+    const win = state.shootReport?.golden_hour_windows?.find((g) => g.phase.toLowerCase().includes(phaseKey));
+    const peakMin = win ? parseHHMMToMinutes(win.peak_time_local) : null;
+    if (peakMin != null && Math.abs(minutes - peakMin) <= 8) {
+      dist = wr.light_archetypes;
+    }
+  }
+
+  if (!dist) {
+    if (hourlyMet) {
+      dist = computeClientLightArchetypes({
+        sunElDeg: elevationDeg,
+        p10Pct: hourlyMet.p10Pct,
+        p50Pct: hourlyMet.p50Pct,
+        p90Pct: hourlyMet.p90Pct,
+        cloudLowPct: hourlyMet.cloudLowPct,
+        cloudMidPct: hourlyMet.cloudMidPct,
+        cloudHighPct: hourlyMet.cloudHighPct,
+        fogPct: hourlyMet.fogPct,
+        fogTopFt: hourlyMet.fogTopFt,
+        targetElevFt: lmElevFt,
+        canvasGlowScore: hourlyMet.canvasGlow,
+        aod550: hourlyMet.aod550,
+        highOpticalDepth: hourlyMet.highOpticalDepth,
+        inversionDeltaTF: inv.inversion_delta_t_f ?? 0,
+        visibilityMiles: hourlyMet.visibilityMiles,
+        rhPct: hourlyMet.rhPct,
+        directBeamPct: hourlyMet.directBeamPct,
+        isCoastal: Boolean(inv.is_coastal),
+      });
+    } else if (wr?.light_archetypes?.probabilities) {
+      dist = wr.light_archetypes;
+    } else {
+      // Clean solar-geometry fallback while weather corridor is still streaming in
+      dist = computeClientLightArchetypes({
+        sunElDeg: elevationDeg,
+        p10Pct: 35,
+        p50Pct: 62,
+        p90Pct: 86,
+        cloudLowPct: 18,
+        cloudMidPct: 15,
+        cloudHighPct: 35,
+        fogTopFt: 0,
+        targetElevFt: lmElevFt,
+        canvasGlowScore: 60,
+        aod550: 0.08,
+      });
+    }
+  }
+
+  state.activeArchetypeDist = dist;
+  const activeId =
+    state.pinnedArchetypeId && ARCHETYPE_VISUAL_PROFILES[state.pinnedArchetypeId]
+      ? state.pinnedArchetypeId
+      : dist.dominant_id;
+  state.activeArchetypeId = activeId;
+  return { dist, activeId };
+}
+
+function updateHybridGodRayShafts(profile, sunDirWorld, visualElDeg, minElevM, maxElevM) {
+  const strength = profile?.godRayStrength || 0;
+  if (strength <= 0.02 || !state.terrainPatch || visualElDeg <= -1.0) {
+    hybridGodRaysGroup.visible = false;
+    return;
+  }
+  hybridGodRaysGroup.visible = true;
+
+  const spanM = state.terrainPatch.span_m || 28000;
+  const lm = state.shootReport?.target_landmark;
+  const targetPos = lm
+    ? latLonElevToWorld(lm.summit_lat, lm.summit_lon, lm.summit_elevation_m)
+    : new THREE.Vector3(0, Math.max(200, (maxElevM - minElevM) * 0.7), 0);
+
+  // Quantize rebuild key so scrubbing & orbiting stays silky 60 FPS with minimal allocations
+  const rayKey = [
+    state.activeArchetypeId,
+    Math.round(spanM),
+    Math.round(targetPos.x / 50),
+    Math.round(targetPos.z / 50),
+    sunDirWorld.x.toFixed(2),
+    sunDirWorld.y.toFixed(2),
+    sunDirWorld.z.toFixed(2),
+    strength.toFixed(2),
+  ].join("_");
+  if (rayKey === _lastHybridGodRaysKey) {
+    return;
+  }
+  _lastHybridGodRaysKey = rayKey;
+
+  activeHybridGodRayMaterials = [];
+  disposeObjectTree(hybridGodRaysGroup);
+
+  const effElRad = (Math.max(7.5, Math.min(48.0, visualElDeg)) * Math.PI) / 180;
+  const horizSun = new THREE.Vector2(sunDirWorld.x, sunDirWorld.z);
+  if (horizSun.lengthSq() < 1e-5) horizSun.set(-0.9, 0.2);
+  horizSun.normalize();
+  const rayDir = new THREE.Vector3(
+    horizSun.x * Math.cos(effElRad),
+    Math.sin(effElRad),
+    horizSun.y * Math.cos(effElRad)
+  ).normalize();
+  const perp = new THREE.Vector2(-horizSun.y, horizSun.x);
+  const scaleR = Math.max(0.75, Math.min(2.2, spanM / 18000));
+  const cloudDeckY = Math.max(1600, (maxElevM - minElevM) + 1750 * scaleR);
+
+  // Use real crepuscular gaps if available, else dramatic breaks framing the target peak & coastal ridges
+  const shaftAnchors =
+    activeCloudGaps.length >= 3 && state.activeArchetypeId === "clearing_storm"
+      ? activeCloudGaps.slice(0, 5).map((g, idx) => ({
+          x: g.wx,
+          z: g.wz,
+          r: Math.max(340, g.radiusM * 0.78),
+          op: idx === 0 ? 1.0 : 0.85,
+        }))
+      : [
+          { x: targetPos.x, z: targetPos.z, r: 460 * scaleR, op: 1.0 },
+          { x: targetPos.x + perp.x * 1350 * scaleR - horizSun.x * 500 * scaleR, z: targetPos.z + perp.y * 1350 * scaleR - horizSun.y * 500 * scaleR, r: 410 * scaleR, op: 0.90 },
+          { x: targetPos.x - perp.x * 1550 * scaleR + horizSun.x * 450 * scaleR, z: targetPos.z - perp.y * 1550 * scaleR + horizSun.y * 450 * scaleR, r: 430 * scaleR, op: 0.92 },
+          { x: targetPos.x + perp.x * 3100 * scaleR + horizSun.x * 1000 * scaleR, z: targetPos.z + perp.y * 3100 * scaleR + horizSun.y * 1000 * scaleR, r: 510 * scaleR, op: 0.78 },
+          { x: targetPos.x - perp.x * 2900 * scaleR - horizSun.x * 950 * scaleR, z: targetPos.z - perp.y * 2900 * scaleR - horizSun.y * 950 * scaleR, r: 490 * scaleR, op: 0.76 },
+        ];
+
+  const nowSec = performance.now() * 0.001;
+  const beamHex = profile.godRayColor || 0xffd578;
+  const baseOpacity = strength * (state.activeArchetypeId === "clearing_storm" ? 0.58 : 0.20);
+
+  for (const a of shaftAnchors) {
+    const groundY = sampleLocalTerrainY(a.x, -a.z);
+    const landPt = new THREE.Vector3(a.x, groundY + 4.0, a.z);
+    const riseY = Math.max(900, cloudDeckY - landPt.y);
+    const tRay = riseY / Math.max(0.14, rayDir.y);
+    const originPt = landPt.clone().addScaledVector(rayDir, Math.min(tRay, spanM * 0.75));
+    const beamVec = landPt.clone().sub(originPt);
+    const beamLen = beamVec.length();
+    if (beamLen < 120) continue;
+
+    const topR = Math.max(150, a.r * 0.42);
+    const botR = Math.max(360, a.r * 1.28);
+    const coneGeo = new THREE.CylinderGeometry(topR, botR, beamLen, 20, 1, true);
+    const coneMat = new THREE.ShaderMaterial({
+      vertexShader: GODRAY_VERTEX_SHADER,
+      fragmentShader: GODRAY_FRAGMENT_SHADER,
+      uniforms: {
+        uBeamColor: { value: new THREE.Color(beamHex) },
+        uBaseOpacity: { value: baseOpacity * a.op },
+        uCloudTime: { value: nowSec },
+        uWindDirENU: { value: activeWindDirENU.clone() },
+      },
+      transparent: true,
+      side: THREE.DoubleSide,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+    });
+    activeHybridGodRayMaterials.push(coneMat);
+    const mesh = new THREE.Mesh(coneGeo, coneMat);
+    mesh.renderOrder = 3;
+    mesh.position.copy(originPt).addScaledVector(beamVec, 0.5);
+    mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, -1, 0), beamVec.clone().normalize());
+    hybridGodRaysGroup.add(mesh);
+  }
 }
 
 const _hudTextCache = {
@@ -2671,21 +3617,55 @@ function setTextIfChanged(el, cacheField, nextVal) {
 function updateSunRaysAndShader() {
   const hourlyMet = applyHourlyWeatherAtMinutes(state.currentMinutes);
   const { azimuthDeg, elevationDeg } = getSolarAnglesAtMinutes(state.currentMinutes);
+  const { dist: archDist, activeId: activeArchId } = resolveActiveLightArchetype(
+    state.currentMinutes,
+    elevationDeg,
+    hourlyMet
+  );
+  const archProfile = ARCHETYPE_VISUAL_PROFILES[activeArchId] || ARCHETYPE_VISUAL_PROFILES.filtered_gold;
+
+  // When a scenario is pinned, clamp the visual solar elevation into its physically valid regime so every
+  // archetype looks unmistakable live in 3D while preserving real azimuth and scrubber continuity.
+  let visualElDeg = elevationDeg;
+  if (state.pinnedArchetypeId && Array.isArray(archProfile.pinnedSunElRange)) {
+    const [elLo, elHi] = archProfile.pinnedSunElRange;
+    visualElDeg = _lfClamp(elevationDeg, elLo, elHi);
+  }
+
   const azRad = (azimuthDeg * Math.PI) / 180;
-  const elRad = (elevationDeg * Math.PI) / 180;
+  const elRad = (visualElDeg * Math.PI) / 180;
 
   const sunEast = Math.sin(azRad) * Math.cos(elRad);
   const sunNorth = Math.cos(azRad) * Math.cos(elRad);
   const sunUp = Math.sin(elRad);
   const sunDirWorld = new THREE.Vector3(sunEast, sunUp, -sunNorth).normalize();
 
+  const wr = state.weatherReport;
+  const inv = wr?.inversion_model;
+  const aodVal = hourlyMet?.aod550 ?? wr?.astro_atmosphere?.aod_550nm ?? 0.06;
+  const archFogDensity =
+    archProfile.fogDensity +
+    Math.min(0.28, aodVal) * (activeArchId === "atmospheric_diffusion" ? 0.000045 : 0.000018);
+
   if (terrainShaderMaterial) {
-    terrainShaderMaterial.uniforms.uSunDirENU.value.set(sunEast, sunNorth, sunUp).normalize();
-    terrainShaderMaterial.uniforms.uHighlightZone.value = state.highlightLandingZone ? 1.0 : 0.0;
-    terrainShaderMaterial.uniforms.uShowViewshed.value = state.showViewshed ? 1.0 : 0.0;
-    terrainShaderMaterial.uniforms.uSurfaceStyle.value = state.surfaceStyle;
+    const tu = terrainShaderMaterial.uniforms;
+    tu.uSunDirENU.value.set(sunEast, sunNorth, sunUp).normalize();
+    tu.uHighlightZone.value = state.highlightLandingZone ? 1.0 : 0.0;
+    tu.uShowViewshed.value = state.showViewshed ? 1.0 : 0.0;
+    tu.uSurfaceStyle.value = state.surfaceStyle;
+    tu.uArchKeyTint.value.setHex(archProfile.keyTint);
+    tu.uArchShadowTint.value.setHex(archProfile.shadowTint);
+    tu.uArchDirectWeight.value = archProfile.directWeight;
+    tu.uArchAmbientWeight.value = archProfile.ambientWeight;
+    tu.uArchShadowSharpness.value = archProfile.shadowSharpness;
+    tu.uArchMicroContrast.value = archProfile.microContrast;
+    tu.uArchSpotlightDrama.value = archProfile.spotlightDrama;
+    tu.uArchWarmth.value = archProfile.warmth;
+    tu.uSceneFogColor.value.setHex(archProfile.fogColor);
+    tu.uSceneFogDensity.value = archFogDensity;
+    tu.uAerialLayerStrength.value = archProfile.aerialLayerStrength;
     volumetricEngine.updateTerrainBakeUniforms({
-      sunDirENU: terrainShaderMaterial.uniforms.uSunDirENU.value,
+      sunDirENU: tu.uSunDirENU.value,
       showViewshed: state.showViewshed,
       isScrubbing: isScrubbingTime || state.isPlayingSun,
     });
@@ -2715,25 +3695,33 @@ function updateSunRaysAndShader() {
     -Math.cos(mAzRad) * Math.cos(mElRad)
   ).normalize();
 
-  // Update Physical Sky Dome (keep sky dome visible even if Volumetric Clouds toggle is off)
+  // Update Hybrid Physical + 7-Archetype Sky Dome (always-on 60 FPS)
   atmosphereGroup.visible = true;
-  skyDomeMat.uniforms.uSunDirWorld.value.copy(sunDirWorld);
-  skyDomeMat.uniforms.uSunElDeg.value = elevationDeg;
-  skyDomeMat.uniforms.uMoonDirWorld.value.copy(moonDirWorld);
-  skyDomeMat.uniforms.uMoonElDeg.value = moonEl;
-  skyDomeMat.uniforms.uMoonIllum.value = moonIllum;
+  const su = skyDomeMat.uniforms;
+  su.uSunDirWorld.value.copy(sunDirWorld);
+  su.uSunElDeg.value = elevationDeg;
+  su.uVisualSunElDeg.value = visualElDeg;
+  su.uMoonDirWorld.value.copy(moonDirWorld);
+  su.uMoonElDeg.value = moonEl;
+  su.uMoonIllum.value = moonIllum;
+  su.uArchSkyZenith.value.setHex(archProfile.skyZenith);
+  su.uArchSkyHorizon.value.setHex(archProfile.skyHorizon);
+  su.uArchSkyBlend.value = archProfile.skyBlend;
+  su.uArchOvercast.value = archProfile.skyOvercast;
+  su.uArchStorm.value = archProfile.skyStorm;
+  su.uArchCirrus.value = archProfile.skyCirrus;
+  su.uArchMist.value = archProfile.skyMist;
+  su.uArchSunDiskScale.value = archProfile.sunDiskScale;
 
-  // Sync Solar & Lunar Vectors to the GPU WebGL2 Volumetric Raymarcher (0–12.2 km column + 3D Cirrus)
+  // Sync Solar & Lunar Vectors to the opt-in GPU WebGL2 Volumetric Raymarcher (0–12.2 km column + 3D Cirrus)
   volumetricEngine.updateCelestialUniforms({
     sunDirWorld,
-    sunElDeg: elevationDeg,
+    sunElDeg: visualElDeg,
     moonDirWorld,
     moonElDeg: moonEl,
     moonIllum,
   });
 
-  const wr = state.weatherReport;
-  const inv = wr?.inversion_model;
   const activeLowPct = hourlyMet ? hourlyMet.cloudLowPct : (wr?.cloud_low_pct || 15);
   const mistCov = wr
     ? Math.max(
@@ -2747,6 +3735,10 @@ function updateSunRaysAndShader() {
 
   if (state.terrainPatch) {
     const minElevM = state.terrainPatch.min_elevation_m ?? 0.0;
+    const maxElevM =
+      state.terrainPatch.max_elevation_m ??
+      state.shootReport?.target_landmark?.summit_elevation_m ??
+      (minElevM + 800);
     const p50Ft =
       hourlyMet?.fogTopFt ??
       inv?.fog_top_p50_ft ??
@@ -2757,48 +3749,49 @@ function updateSunRaysAndShader() {
     const band = state.fogSliceBand || "p50";
     const activeFogTopFt = band === "p10" ? p10Ft : band === "p90" ? p90Ft : p50Ft;
     const fogBaseFt = inv?.fog_base_ft ?? Math.max(80, activeFogTopFt - 650);
-    const fogTopM = activeFogTopFt / 3.28084;
+    let fogTopM = activeFogTopFt / 3.28084;
     const fogBaseM = fogBaseFt / 3.28084;
 
-    update3DPositionalClouds(sunDirWorld, elevationDeg, minElevM, fogBaseM, fogTopM, mistCov);
+    update3DPositionalClouds(sunDirWorld, visualElDeg, minElevM, fogBaseM, fogTopM, mistCov);
+    updateHybridGodRayShafts(archProfile, sunDirWorld, visualElDeg, minElevM, maxElevM);
 
     volumetricEngine.setScrubberKinematics?.({
       minutesLocal: state.currentMinutes,
       lowPct: hourlyMet?.cloudLowPct ?? wr?.cloud_low_pct,
-      midPct: wr?.cloud_mid_pct,
-      highPct: wr?.cloud_high_pct,
-      fogPct: wr?.valley_inversion_fog_pct,
+      midPct: hourlyMet?.cloudMidPct ?? wr?.cloud_mid_pct,
+      highPct: hourlyMet?.cloudHighPct ?? wr?.cloud_high_pct,
+      fogPct: hourlyMet?.fogPct ?? wr?.valley_inversion_fog_pct,
       isScrubbing: isScrubbingTime || state.isPlayingSun,
     });
 
-    // Lightweight translucent 3D Fog-Sea Elevation Slice — only show when fog top is a true
-    // low-level valley/marine layer near terrain elevations (not a 6,500+ ft mid-level rain deck!)
-    const maxElevM =
-      state.terrainPatch.max_elevation_m ??
-      state.shootReport?.target_landmark?.summit_elevation_m ??
-      (minElevM + 800);
+    // Lightweight translucent 3D Fog-Sea / Atmospheric Diffusion Elevation Slice
     const isLowInversionLayer = fogTopM <= maxElevM + 260.0;
+    const forceMistSlice = Boolean(archProfile.forceMistSlice);
+    const suppressForHarsh = activeArchId === "harsh_sun" && !state.pinnedArchetypeId && activeLowPct < 20;
     const fogSliceVisible =
       band !== "off" &&
-      isLowInversionLayer &&
-      activeFogTopFt > (minElevM * 3.28084 + 35);
-    const spanM = state.terrainPatch.span_m || 16000;
+      !suppressForHarsh &&
+      (forceMistSlice || (isLowInversionLayer && activeFogTopFt > minElevM * 3.28084 + 35));
+    const spanM = state.terrainPatch.span_m || 28000;
     fogSeaSliceMesh.visible = fogSliceVisible;
     if (fogSliceVisible) {
-      fogSeaSliceMesh.scale.set(spanM * 1.04, spanM * 1.04, 1);
-      fogSeaSliceMesh.position.set(0, Math.max(8.0, fogTopM - minElevM), 0);
-      const isNight = elevationDeg < -6.0;
-      const isGolden = elevationDeg >= -3.5 && elevationDeg <= 10.5;
-      fogSeaSliceMat.uniforms.uColor.value.setHex(
-        isNight ? 0x1e2d48 : isGolden ? 0xd8c6b8 : 0xc8dcf0
-      );
+      const sliceY = forceMistSlice && !isLowInversionLayer
+        ? Math.max(35.0, (maxElevM - minElevM) * 0.42)
+        : Math.max(8.0, fogTopM - minElevM);
+      if (forceMistSlice && !isLowInversionLayer) {
+        fogTopM = minElevM + sliceY;
+      }
+      fogSeaSliceMesh.scale.set(spanM * 1.06, spanM * 1.06, 1);
+      fogSeaSliceMesh.position.set(0, sliceY, 0);
+      fogSeaSliceMat.uniforms.uColor.value.setHex(archProfile.fogSliceColor);
       fogSeaSliceMat.uniforms.uRimColor.value.setHex(
-        band === "p90" ? 0xf87171 : band === "p10" ? 0x38bdf8 : isGolden ? 0xfbbf24 : 0x93c5fd
+        band === "p90" ? 0xf87171 : band === "p10" ? 0x38bdf8 : archProfile.fogSliceRim
       );
       fogSeaSliceMat.uniforms.uBandTint.value = band === "p10" ? 0.0 : band === "p90" ? 1.0 : 0.5;
+      fogSeaSliceMat.uniforms.uDiffusionMode.value = activeArchId === "atmospheric_diffusion" ? 1.0 : 0.0;
       fogSeaSliceMat.uniforms.uOpacity.value = state.showAtmosphere
-        ? 0.14
-        : Math.max(0.20, Math.min(0.48, mistCov * 0.65));
+        ? Math.min(0.24, archProfile.fogSliceOpacity * 0.45)
+        : Math.max(archProfile.fogSliceOpacity, Math.min(0.62, mistCov * 0.68));
     }
 
     const hudFogLabel = document.getElementById("hud-fog-alt-readout");
@@ -2818,29 +3811,18 @@ function updateSunRaysAndShader() {
       terrainShaderMaterial.uniforms.uFogStrength.value = state.showAtmosphere
         ? Math.min(0.92, mistCov * 1.1)
         : fogSliceVisible
-          ? Math.min(0.62, mistCov * 0.78)
+          ? Math.min(0.86, Math.max(activeArchId === "atmospheric_diffusion" ? 0.72 : 0.0, mistCov * 0.80))
           : 0.0;
     }
   }
 
-  // Match scene background & far-field fog to the physical sky horizon phase (Night / Blue Hour / Golden Hour / Day)
-  // and modulate volumetric Mie scattering density by live CAMS Aerosol Optical Depth (AOD 550nm)
-  const aodVal = hourlyMet?.aod550 ?? wr?.astro_atmosphere?.aod_550nm ?? 0.06;
-  scene.fog.density = 0.0000042 + Math.min(0.25, aodVal) * 0.000024;
+  // Sync scene.fog & scene.background to active Light Archetype + live CAMS Aerosol Optical Depth
+  scene.fog.density = archFogDensity;
+  scene.fog.color.setHex(archProfile.fogColor);
+  scene.background.setHex(archProfile.skyHorizon);
 
-  if (elevationDeg < -7.0) {
-    scene.background.setHex(0x04070e);
-    scene.fog.color.setHex(aodVal > 0.16 ? 0x161422 : 0x070d1b);
-  } else if (elevationDeg <= 1.5) {
-    scene.background.setHex(0x0d2147);
-    scene.fog.color.setHex(0x1b3668);
-  } else if (elevationDeg <= 12.0) {
-    scene.background.setHex(0x152c55);
-    scene.fog.color.setHex(0x2d466e);
-  } else {
-    scene.background.setHex(0x214c86);
-    scene.fog.color.setHex(0x4a72a8);
-  }
+  // Sync Scenario Switcher cards, Field Reference, Full 7-Archetype Breakdown & Floating Viewport Pills live
+  renderLightArchetypeScenarioUI(archDist, activeArchId, hourlyMet);
 
   // Update Valley-Wide 3D Solar Light Field on GPU when enabled
   updateValleyLightField(sunDirWorld, elevationDeg);
@@ -3915,60 +4897,237 @@ function renderWeatherCard(w) {
   syncBriefVerdictHero(w);
 }
 
+let _lastArchetypeUiKey = "";
+let _archetypeDelegationBound = false;
+
+function selectLightArchetype(archetypeIdOrNull) {
+  const nextPin =
+    archetypeIdOrNull && ARCHETYPE_VISUAL_PROFILES[archetypeIdOrNull]
+      ? archetypeIdOrNull
+      : null;
+  if (state.pinnedArchetypeId === nextPin && nextPin !== null) {
+    // Clicking an already-pinned card keeps it pinned (use 1-click Auto pill/btn to reset)
+  }
+  state.pinnedArchetypeId = nextPin;
+  _lastArchetypeUiKey = "";
+  _lastHybridGodRaysKey = "";
+  updateSunRaysAndShader();
+  wakeRenderLoop(true);
+}
+
+function bindArchetypeSwitcherEvents() {
+  if (_archetypeDelegationBound) return;
+  _archetypeDelegationBound = true;
+
+  const autoBtn = document.getElementById("btn-archetype-auto");
+  autoBtn?.addEventListener("click", () => selectLightArchetype(null));
+
+  const onScenarioClick = (e) => {
+    const btn = e.target.closest("[data-archetype-action]");
+    if (!btn) return;
+    const act = btn.dataset.archetypeAction;
+    if (act === "auto") {
+      selectLightArchetype(null);
+    } else if (ARCHETYPE_VISUAL_PROFILES[act]) {
+      selectLightArchetype(act);
+    }
+  };
+
+  document.getElementById("scenario-cards-list")?.addEventListener("click", onScenarioClick);
+  document.getElementById("archetype-all7-list")?.addEventListener("click", onScenarioClick);
+  document.getElementById("viewport-scenario-pills")?.addEventListener("click", onScenarioClick);
+}
+
+function renderLightArchetypeScenarioUI(dist, activeId, hourlyMet = null) {
+  if (!dist || !dist.probabilities) return;
+  bindArchetypeSwitcherEvents();
+
+  const isPinned = Boolean(state.pinnedArchetypeId);
+  const timeTxt = formatMinutesToHHMM(state.currentMinutes);
+  const probs = dist.probabilities;
+  const rankedIds =
+    Array.isArray(dist.ranked_ids) && dist.ranked_ids.length === 7
+      ? dist.ranked_ids
+      : [...LIGHT_ARCHETYPE_ORDER].sort((a, b) => (probs[b] || 0) - (probs[a] || 0));
+  const viableIds =
+    Array.isArray(dist.viable_ids) && dist.viable_ids.length > 0
+      ? dist.viable_ids
+      : [rankedIds[0]];
+
+  const uiKey = `${activeId}|${isPinned ? 1 : 0}|${timeTxt}|${rankedIds.map((k) => `${k}:${probs[k]}`).join(",")}`;
+  if (uiKey === _lastArchetypeUiKey) return;
+  _lastArchetypeUiKey = uiKey;
+
+  const activeMeta = getArchetypeMeta(activeId);
+  const activeProb = probs[activeId] ?? 0;
+
+  // 1. Header row (Auto vs Pinned + time chip + 1-click Auto reset)
+  const dotEl = document.getElementById("archetype-active-dot");
+  if (dotEl) {
+    dotEl.style.background = activeMeta.accent_hex;
+    dotEl.style.boxShadow = `0 0 8px ${activeMeta.accent_hex}88`;
+  }
+  const modeLabelEl = document.getElementById("archetype-mode-label");
+  if (modeLabelEl) {
+    modeLabelEl.textContent = isPinned
+      ? `PINNED · ${activeMeta.name}`
+      : `AUTO · ${activeMeta.name} (${activeProb}%)`;
+  }
+  const timeChipEl = document.getElementById("archetype-time-chip");
+  if (timeChipEl) timeChipEl.textContent = timeTxt;
+
+  const autoBtnEl = document.getElementById("btn-archetype-auto");
+  if (autoBtnEl) {
+    autoBtnEl.classList.toggle("is-active", !isPinned);
+    autoBtnEl.classList.toggle("is-reset-cta", isPinned);
+    autoBtnEl.textContent = isPinned ? "↺ Auto" : "Auto";
+    autoBtnEl.setAttribute("aria-pressed", String(!isPinned));
+  }
+
+  // 2. Clickable 3D Preview Cards for every archetype >= 20% (always >= 1)
+  // If user pinned a <20% scenario from the full 7 list, keep it visible at the bottom with a Pinned tag.
+  const cardIds = [...viableIds];
+  if (isPinned && !cardIds.includes(activeId)) {
+    cardIds.push(activeId);
+  }
+  const cardsEl = document.getElementById("scenario-cards-list");
+  if (cardsEl) {
+    cardsEl.innerHTML = cardIds
+      .map((id) => {
+        const meta = getArchetypeMeta(id);
+        const pct = probs[id] ?? 0;
+        const isActive = id === activeId;
+        const isDom = id === dist.dominant_id;
+        const badgeText = isActive && isPinned ? "Pinned" : isDom ? "Most Likely" : "Preview";
+        return `
+          <button
+            type="button"
+            class="scenario-card${isActive ? " is-active" : ""}${isActive && isPinned ? " is-pinned" : ""}"
+            data-archetype-action="${escapeHtmlText(id)}"
+            aria-pressed="${isActive ? "true" : "false"}"
+            style="--arch-accent:${escapeHtmlText(meta.accent_hex)};--arch-swatch:${escapeHtmlText(meta.swatch_gradient)};"
+          >
+            <span class="scenario-card-swatch" aria-hidden="true"></span>
+            <span class="scenario-card-info">
+              <span class="scenario-card-title-row">
+                <span class="scenario-card-name">${escapeHtmlText(meta.name)}</span>
+                <span class="scenario-card-tag">${escapeHtmlText(badgeText)}</span>
+              </span>
+              <span class="scenario-card-sub">${escapeHtmlText(meta.subtitle)}</span>
+            </span>
+            <span class="scenario-card-right">
+              <span class="scenario-card-pct">${pct}%</span>
+              <span class="scenario-card-hint">3D live</span>
+            </span>
+          </button>`;
+      })
+      .join("");
+  }
+
+  // 3. Active Archetype Field Reference (Shadow Edge, Contrast, Color Cast, Best For, Tactical Lever)
+  const fr = activeMeta.field_reference || {};
+  const shadowEl = document.getElementById("ref-shadow-edge");
+  const contrastEl = document.getElementById("ref-contrast");
+  const colorEl = document.getElementById("ref-color-cast");
+  const bestEl = document.getElementById("ref-best-for");
+  const leverEl = document.getElementById("ref-tactical-lever");
+  if (shadowEl) shadowEl.textContent = fr.shadow_edge || "--";
+  if (contrastEl) contrastEl.textContent = fr.contrast || "--";
+  if (colorEl) colorEl.textContent = fr.color_cast || "--";
+  if (bestEl) bestEl.textContent = fr.best_for || "--";
+  if (leverEl) leverEl.textContent = fr.tactical_lever || "--";
+
+  // 4. Collapsible Full 7-Archetype 100% Breakdown Bar
+  const totalPct = LIGHT_ARCHETYPE_ORDER.reduce((acc, k) => acc + (Number(probs[k]) || 0), 0);
+  const sumEl = document.getElementById("archetype-sum-label");
+  if (sumEl) sumEl.textContent = `${totalPct}%`;
+
+  const stackedBarEl = document.getElementById("archetype-stacked-bar");
+  if (stackedBarEl) {
+    stackedBarEl.innerHTML = rankedIds
+      .filter((k) => (probs[k] || 0) > 0)
+      .map((k) => {
+        const meta = getArchetypeMeta(k);
+        const pct = probs[k] || 0;
+        return `<span class="archetype-stacked-seg" style="width:${pct}%;background:${escapeHtmlText(meta.accent_hex)};" title="${escapeHtmlText(meta.name)} ${pct}%"></span>`;
+      })
+      .join("");
+  }
+
+  const all7El = document.getElementById("archetype-all7-list");
+  if (all7El) {
+    all7El.innerHTML = rankedIds
+      .map((k) => {
+        const meta = getArchetypeMeta(k);
+        const pct = probs[k] || 0;
+        const isActive = k === activeId;
+        return `
+          <button
+            type="button"
+            class="archetype-all7-row${isActive ? " is-active" : ""}"
+            data-archetype-action="${escapeHtmlText(k)}"
+            aria-pressed="${isActive ? "true" : "false"}"
+            title="Preview ${escapeHtmlText(meta.name)} live in 3D"
+          >
+            <span class="archetype-all7-dot" style="background:${escapeHtmlText(meta.accent_hex)};"></span>
+            <span class="archetype-all7-name">${escapeHtmlText(meta.name)}</span>
+            <span class="archetype-all7-track"><span class="archetype-all7-fill" style="width:${pct}%;background:${escapeHtmlText(meta.accent_hex)};"></span></span>
+            <span class="archetype-all7-pct">${pct}%</span>
+          </button>`;
+      })
+      .join("");
+  }
+
+  // 5. Floating >= 20% Scenario Pills on the 3D Viewport (3D Map & Tripod Modes)
+  const vpPillsEl = document.getElementById("viewport-scenario-pills");
+  if (vpPillsEl) {
+    const autoPillHtml = `
+      <button
+        type="button"
+        class="vp-scenario-pill is-auto${!isPinned ? " is-active" : ""}"
+        data-archetype-action="auto"
+        aria-pressed="${!isPinned ? "true" : "false"}"
+        title="Auto — follow most likely archetype as you scrub time"
+      >
+        <span>${isPinned ? "↺ Auto" : "Auto"}</span>
+      </button>
+      <span class="vp-scenario-divider" aria-hidden="true"></span>`;
+
+    const scenarioPillsHtml = cardIds
+      .map((id) => {
+        const meta = getArchetypeMeta(id);
+        const pct = probs[id] ?? 0;
+        const isActive = id === activeId;
+        return `
+          <button
+            type="button"
+            class="vp-scenario-pill${isActive ? " is-active" : ""}"
+            data-archetype-action="${escapeHtmlText(id)}"
+            aria-pressed="${isActive ? "true" : "false"}"
+            style="--arch-accent:${escapeHtmlText(meta.accent_hex)};"
+            title="${escapeHtmlText(meta.name)} (${pct}%) — ${escapeHtmlText(meta.subtitle)}"
+          >
+            <span class="vp-scenario-pill-dot" style="background:${escapeHtmlText(meta.accent_hex)};"></span>
+            <span>${escapeHtmlText(meta.short_name || meta.name)}</span>
+            <span class="vp-scenario-pill-pct">${pct}%</span>
+          </button>`;
+      })
+      .join("");
+    vpPillsEl.innerHTML = autoPillHtml + scenarioPillsHtml;
+  }
+
+  // Live conditions update when scrubbing hourly timeline
+  if (hourlyMet) {
+    const condEl = document.getElementById("brief-temp-wind");
+    if (condEl && Number.isFinite(hourlyMet.tempF) && Number.isFinite(hourlyMet.windMph)) {
+      condEl.textContent = `${hourlyMet.tempF}°F · ${hourlyMet.windMph} mph`;
+    }
+  }
+}
+
 function syncBriefVerdictHero(w) {
   if (!w) return;
-  const cal = w.calibrated_probabilities || {};
   const inv = w.inversion_model || {};
-  const p50 = Math.round(cal.transmittance_p50_pct ?? w.transmittance_p50_pct ?? w.ray_transmittance_pct ?? 0);
-  const p10 = Math.round(cal.transmittance_p10_pct ?? w.transmittance_p10_pct ?? Math.max(0, p50 - 20));
-  const p90 = Math.round(cal.transmittance_p90_pct ?? w.transmittance_p90_pct ?? Math.min(100, p50 + 20));
-  const score = Number(w.alpenglow_score ?? 0);
-
-  let tier = "GAMBLE";
-  let dotCls = "is-gamble";
-  if (score >= 66 || (p50 >= 62 && score >= 52)) {
-    tier = "GO";
-    dotCls = "is-go";
-  } else if (score < 38 || p50 < 24) {
-    tier = "BUST";
-    dotCls = "is-bust";
-  }
-
-  const dotEl = document.getElementById("brief-verdict-dot");
-  if (dotEl) {
-    dotEl.classList.remove("is-go", "is-gamble", "is-bust");
-    dotEl.classList.add(dotCls);
-  }
-  const badgeEl = document.getElementById("brief-verdict-badge");
-  if (badgeEl) badgeEl.textContent = `${tier} · ${score}/100`;
-
-  const oddsEl = document.getElementById("brief-light-odds");
-  if (oddsEl) oddsEl.textContent = `${p50}%`;
-
-  const bandEl = document.getElementById("brief-prob-range");
-  const medEl = document.getElementById("brief-prob-median");
-  if (bandEl) {
-    bandEl.style.left = `${Math.max(0, Math.min(100, p10))}%`;
-    bandEl.style.width = `${Math.max(3, Math.min(100 - p10, p90 - p10))}%`;
-  }
-  if (medEl) {
-    medEl.style.left = `${Math.max(0, Math.min(100, p50))}%`;
-  }
-  const p10El = document.getElementById("brief-p10-label");
-  const p50El = document.getElementById("brief-p50-label");
-  const p90El = document.getElementById("brief-p90-label");
-  if (p10El) p10El.textContent = `P10 ${p10}%`;
-  if (p50El) p50El.textContent = `P50 ${p50}%`;
-  if (p90El) p90El.textContent = `P90 ${p90}%`;
-
-  const noteEl = document.getElementById("brief-causal-note");
-  if (noteEl) {
-    const rawRec = String(w.recommendation || w.verdict || "")
-      .replace(/`([^`]+)`/g, "$1")
-      .trim();
-    const shortSentence = rawRec.split(/(?<=[.!?])\s+/)[0] || rawRec;
-    noteEl.textContent = shortSentence;
-  }
 
   const peakEl = document.getElementById("brief-peak-time");
   if (peakEl) {
@@ -4002,6 +5161,12 @@ function syncBriefVerdictHero(w) {
     const temp = w.temp_sunset_f != null ? `${Math.round(w.temp_sunset_f)}°F` : "--";
     const wind = w.wind_mph != null ? `${Math.round(w.wind_mph)} mph` : "--";
     condEl.textContent = `${temp} · ${wind}`;
+  }
+
+  _lastArchetypeUiKey = "";
+  if (w.light_archetypes?.probabilities) {
+    const activeId = state.pinnedArchetypeId || w.light_archetypes.dominant_id;
+    renderLightArchetypeScenarioUI(w.light_archetypes, activeId);
   }
 }
 
@@ -4875,6 +6040,13 @@ async function loadLandmarkScenario(customCoord = null) {
   state.cachedTruthReport = null;
   state.cachedTruthKey = "";
   state.weatherReport = null;
+  state.pinnedArchetypeId =
+    pendingBootArchetype && ARCHETYPE_VISUAL_PROFILES[pendingBootArchetype]
+      ? pendingBootArchetype
+      : null;
+  pendingBootArchetype = null;
+  _lastArchetypeUiKey = "";
+  _lastHybridGodRaysKey = "";
 
   const lmSel = document.getElementById("landmark-select");
   const dtInp = document.getElementById("shoot-date");
@@ -4888,12 +6060,10 @@ async function loadLandmarkScenario(customCoord = null) {
   const label = customCoord ? customCoord.name : state.landmark;
   loadingTextEl.textContent = `Loading 3D terrain & sightlines for ${label}…`;
 
-  const badgeEl = document.getElementById("brief-verdict-badge");
-  const oddsEl = document.getElementById("brief-light-odds");
-  const noteEl = document.getElementById("brief-causal-note");
-  if (badgeEl) badgeEl.textContent = "SOLVING CORRIDOR";
-  if (oddsEl) oddsEl.textContent = "--%";
-  if (noteEl) noteEl.textContent = "Solving 380 km curved-Earth solar corridor and local inversion height…";
+  const modeEl = document.getElementById("archetype-mode-label");
+  const leverEl = document.getElementById("ref-tactical-lever");
+  if (modeEl) modeEl.textContent = "AUTO · SOLVING LIGHT";
+  if (leverEl) leverEl.textContent = "Solving 380 km curved-Earth solar corridor and 4-layer cloud column…";
 
   try {
     let planUrl;
@@ -4932,7 +6102,12 @@ async function loadLandmarkScenario(customCoord = null) {
     if (reqSeq !== scenarioLoadSeq) return;
     state.terrainPatch = terrainPatchData;
 
-    if (report.golden_hour_windows && report.golden_hour_windows.length > 0) {
+    if (pendingBootHour !== null) {
+      state.currentMinutes = pendingBootHour * 60;
+      pendingBootHour = null;
+      timeScrubber.value = String(state.currentMinutes);
+      syncSliderValue(timeScrubber);
+    } else if (report.golden_hour_windows && report.golden_hour_windows.length > 0) {
       state.currentMinutes = parseHHMMToMinutes(report.golden_hour_windows[0].peak_time_local);
       timeScrubber.value = String(state.currentMinutes);
       syncSliderValue(timeScrubber);
@@ -4973,14 +6148,14 @@ async function loadLandmarkScenario(customCoord = null) {
       .catch((wErr) => {
         if (reqSeq !== scenarioLoadSeq) return;
         console.warn("Weather corridor fetch failed:", wErr);
-        if (badgeEl) badgeEl.textContent = "FORECAST UNAVAILABLE";
-        if (noteEl) noteEl.textContent = "3D terrain & solar geometry are ready; atmospheric corridor forecast is temporarily unavailable.";
+        if (modeEl) modeEl.textContent = "AUTO · GEOMETRY READY";
+        if (leverEl) leverEl.textContent = "3D terrain & solar geometry ready; atmospheric corridor forecast temporarily unavailable.";
       });
   } catch (err) {
     console.error("Failed to load scenario:", err);
     document.getElementById("summary-subtitle").textContent = `Error loading scenario: ${err.message}`;
-    if (badgeEl) badgeEl.textContent = "LOAD ERROR";
-    if (noteEl) noteEl.textContent = `Could not load ${label}: ${err.message}`;
+    if (modeEl) modeEl.textContent = "LOAD ERROR";
+    if (leverEl) leverEl.textContent = `Could not load ${label}: ${err.message}`;
   } finally {
     if (reqSeq === scenarioLoadSeq) {
       loadingEl.hidden = true;
@@ -5758,6 +6933,13 @@ function buildOfflineFieldCardHtml() {
   const fogP10 = Math.round(inv.fog_top_p10_ft ?? Math.max(0, fogP50 - 320));
   const fogP90 = Math.round(inv.fog_top_p90_ft ?? (fogP50 + 320));
   const fogVerdict = inv.breakout_verdict || (lm.summit_elevation_ft > fogP50 ? "Above Fog Sea" : "Check Fog Lid");
+  const activeArchId = state.activeArchetypeId || wr?.light_archetypes?.dominant_id || "filtered_gold";
+  const activeArchMeta = getArchetypeMeta(activeArchId);
+  const activeArchProb =
+    state.activeArchetypeDist?.probabilities?.[activeArchId] ??
+    wr?.light_archetypes?.probabilities?.[activeArchId] ??
+    "--";
+  const activeArchRef = activeArchMeta.field_reference || {};
 
   const vps = sr?.top_viewpoints || [];
   const vpRowsHtml = vps.length
@@ -5790,7 +6972,7 @@ function buildOfflineFieldCardHtml() {
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>PhotoPlanner Field Card — ${escapeFieldCardHtml(lm.name)} (${escapeFieldCardHtml(state.date)})</title>
+<title>LightFinder Field Card — ${escapeFieldCardHtml(lm.name)} (${escapeFieldCardHtml(state.date)})</title>
 <style>
   :root { color-scheme: dark light; }
   * { box-sizing: border-box; }
@@ -5825,12 +7007,17 @@ function buildOfflineFieldCardHtml() {
         <h1>${escapeFieldCardHtml(lm.name)} — Backcountry Field Card</h1>
         <div class="meta">Date: <strong>${escapeFieldCardHtml(state.date)}</strong> · Phase: <strong>${escapeFieldCardHtml(wr?.phase || "Sunset")}</strong> · GPS: ${Number(lm.summit_lat || 0).toFixed(5)}, ${Number(lm.summit_lon || 0).toFixed(5)} · Summit: ${Math.round(lm.summit_elevation_ft || 0).toLocaleString()} ft ASL</div>
       </div>
-      <div class="badge">Alpenglow ${wr?.alpenglow_score ?? "--"}/100 · ${focalMm}mm FF</div>
+      <div class="badge">${escapeFieldCardHtml(activeArchMeta.name)} ${activeArchProb}% · ${focalMm}mm FF</div>
     </header>
 
     <div class="grid">
       <section class="card">
-        <h2>Calibrated Light Odds (380 km)</h2>
+        <h2>Active Light Archetype</h2>
+        <div class="big">${escapeFieldCardHtml(activeArchMeta.name)} <small style="font-weight:600;color:#94a3b8;">(${activeArchProb}%)</small></div>
+        <div class="sub">${escapeFieldCardHtml(activeArchRef.shadow_edge || "")} · ${escapeFieldCardHtml(activeArchRef.color_cast || "")} · Lever: ${escapeFieldCardHtml(activeArchRef.tactical_lever || "")}</div>
+      </section>
+      <section class="card">
+        <h2>Calibrated Corridor (380 km)</h2>
         <div class="big">P50 ${p50}% <small style="font-weight:600;color:#94a3b8;">(P10 ${p10}% – P90 ${p90}%)</small></div>
         <div class="sub">${escapeFieldCardHtml(wr?.verdict || "Evaluating")} · ${wr?.color_temperature_kelvin ?? 2400} K · Gate: ${escapeFieldCardHtml(wr?.corridor_raycast?.dominant_blocker_label || "Clear")}</div>
       </section>
@@ -5840,14 +7027,9 @@ function buildOfflineFieldCardHtml() {
         <div class="sub">${escapeFieldCardHtml(fogVerdict)} · Cloud-Sea ${inv.cloud_sea_score ?? "--"}/100 · Under-Deck ${inv.under_deck_score ?? "--"}/100</div>
       </section>
       <section class="card">
-        <h2>Active Lens &amp; Sky Setup</h2>
+        <h2>Active Lens &amp; Astro Setup</h2>
         <div class="big">${focalMm}mm Full-Frame</div>
-        <div class="sub">FOV ${Math.round(hfovDeg)}° H × ${Math.round(vfovDeg)}° V · Sun Az ${wr?.sun_azimuth_deg ?? "--"}° ${escapeFieldCardHtml(wr?.corridor_direction || "")} · Temp ${wr?.temp_sunset_f ?? "--"}°F</div>
-      </section>
-      <section class="card">
-        <h2>Astro &amp; Reflection Window</h2>
-        <div class="big">${escapeFieldCardHtml(astro.dark_sky_window_local || "Check Night Tab")}</div>
-        <div class="sub">Moon: ${escapeFieldCardHtml(astro.moon_phase_label || "--")} (${astro.moon_illumination_pct ?? "--"}%) · Terrain Moonset: ${escapeFieldCardHtml(astro.terrain_moonset_local || "--")}${mirror ? ` · Mirror Index ${Math.round(mirror.mirror_index || 0)}/100` : ""}</div>
+        <div class="sub">FOV ${Math.round(hfovDeg)}° H × ${Math.round(vfovDeg)}° V · Dark Sky ${escapeFieldCardHtml(astro.dark_sky_window_local || "Check Night Tab")}${mirror ? ` · Mirror ${Math.round(mirror.mirror_index || 0)}/100` : ""}</div>
       </section>
     </div>
 
@@ -5869,7 +7051,7 @@ function buildOfflineFieldCardHtml() {
     </section>
 
     <footer>
-      <span>Generated offline by PhotoPlanner 3D (Calibrated Corridor + Raycast Engine)</span>
+      <span>Generated offline by LightFinder 3D (7-Archetype Corridor + Raycast Engine)</span>
       <span>Snapshot: ${new Date().toISOString().slice(0, 16).replace("T", " ")} UTC · Ready for Airplane Mode / Print</span>
     </footer>
   </div>
@@ -5883,7 +7065,7 @@ function exportOfflineFieldCard() {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "_")
     .replace(/^_|_$/g, "");
-  const filename = `PhotoPlanner_FieldCard_${slug}_${state.date || "today"}.html`;
+  const filename = `LightFinder_FieldCard_${slug}_${state.date || "today"}.html`;
   const blob = new Blob([html], { type: "text/html;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -6542,8 +7724,17 @@ function animate(nowMs = performance.now()) {
   if (terrainShaderMaterial?.uniforms?.uCloudTime) {
     terrainShaderMaterial.uniforms.uCloudTime.value = nowSec;
   }
+  if (skyDomeMat?.uniforms?.uCloudTime) {
+    skyDomeMat.uniforms.uCloudTime.value = nowSec;
+  }
+  if (fogSeaSliceMat?.uniforms?.uCloudTime) {
+    fogSeaSliceMat.uniforms.uCloudTime.value = nowSec;
+  }
   for (let i = 0; i < activeGodRayMaterials.length; i++) {
     activeGodRayMaterials[i].uniforms.uCloudTime.value = nowSec;
+  }
+  for (let i = 0; i < activeHybridGodRayMaterials.length; i++) {
+    activeHybridGodRayMaterials[i].uniforms.uCloudTime.value = nowSec;
   }
 
   if (state.isPlayingSun) {
@@ -6858,12 +8049,69 @@ function animate(nowMs = performance.now()) {
     }).observe(origSummaryEl, { childList: true, characterData: true, subtree: true });
   }
 
-  // 8. Calibrated "Alert Me" Watchlist Popover (/api/watchlists)
+  // 8. LightFinder 7-Archetype "Alert Me" Watchlist Popover (/api/watchlists)
   const alertPopover = document.getElementById("alert-popover");
   const alertTitle = document.getElementById("alert-popover-title");
   const alertForm = document.getElementById("alert-create-form");
   const alertStatus = document.getElementById("alert-form-status");
   const alertSavedList = document.getElementById("alert-saved-list");
+  const alertArchPicker = document.getElementById("alert-archetype-picker");
+  const alertArchHint = document.getElementById("alert-archetype-hint");
+  const alertMinSelect = document.getElementById("alert-min-p50");
+  const alertPhaseSelect = document.getElementById("alert-phase-select");
+
+  function getSelectedAlertArchetypes() {
+    if (!alertArchPicker) return [];
+    return Array.from(alertArchPicker.querySelectorAll(".alert-arch-chip.is-selected"))
+      .map((btn) => btn.dataset.alertArch)
+      .filter((id) => Boolean(id && LIGHT_ARCHETYPE_META[id]));
+  }
+
+  function setSelectedAlertArchetypes(ids) {
+    if (!alertArchPicker) return;
+    const wanted = new Set((ids || []).filter((id) => Boolean(LIGHT_ARCHETYPE_META[id])));
+    alertArchPicker.querySelectorAll(".alert-arch-chip").forEach((btn) => {
+      const sel = wanted.has(btn.dataset.alertArch);
+      btn.classList.toggle("is-selected", sel);
+      btn.setAttribute("aria-pressed", sel ? "true" : "false");
+    });
+    updateAlertArchetypeHint();
+  }
+
+  function updateAlertArchetypeHint() {
+    if (!alertArchHint) return;
+    const selected = getSelectedAlertArchetypes();
+    const minPct = Number(alertMinSelect?.value || 50);
+    if (!selected.length) {
+      alertArchHint.textContent = `Any light · P50 beam ≥ ${minPct}%`;
+      return;
+    }
+    if (selected.length === 1) {
+      const meta = LIGHT_ARCHETYPE_META[selected[0]];
+      alertArchHint.textContent = `${meta?.name || selected[0]} ≥ ${minPct}%`;
+      return;
+    }
+    alertArchHint.textContent = `${selected.length} combined ≥ ${minPct}%`;
+  }
+
+  alertArchPicker?.addEventListener("click", (e) => {
+    const chip = e.target.closest(".alert-arch-chip");
+    if (!chip) return;
+    const nextSel = !chip.classList.contains("is-selected");
+    chip.classList.toggle("is-selected", nextSel);
+    chip.setAttribute("aria-pressed", nextSel ? "true" : "false");
+    updateAlertArchetypeHint();
+  });
+
+  alertMinSelect?.addEventListener("change", updateAlertArchetypeHint);
+
+  function formatAlertPhaseLabel(phase) {
+    const p = String(phase || "sunset").toLowerCase();
+    if (p === "any") return "24h Scan";
+    if (p === "both") return "Rise & Set";
+    if (p === "sunrise") return "Sunrise";
+    return "Sunset";
+  }
 
   async function refreshSavedWatchlists() {
     if (!alertSavedList) return;
@@ -6873,7 +8121,7 @@ function animate(nowMs = performance.now()) {
       const data = await res.json();
       const rules = data.watchlists || [];
       if (!rules.length) {
-        alertSavedList.innerHTML = `<span class="muted-note">No saved alerts yet. Save this spot above to get notified when light clears your odds.</span>`;
+        alertSavedList.innerHTML = `<span class="muted-note">No saved alerts yet. Pick your Light Archetype(s) above and save to get notified.</span>`;
         return;
       }
       alertSavedList.innerHTML = "";
@@ -6881,16 +8129,75 @@ function animate(nowMs = performance.now()) {
         const row = document.createElement("div");
         row.className = "alert-saved-row";
         const dest = r.notify_email || (r.notify_webhook_url ? "Webhook" : "In-App");
+        const archIds = Array.isArray(r.target_archetypes) ? r.target_archetypes : [];
+        const hasArch = archIds.length > 0;
+        const threshold = hasArch
+          ? Math.round(Number(r.min_archetype_prob_pct || 50))
+          : Math.round(Number(r.min_calibrated_p50_pct || 50));
+        const tagsHtml = hasArch
+          ? archIds
+              .map((aid) => {
+                const meta = LIGHT_ARCHETYPE_META[aid];
+                const col = meta?.accent_hex || "#f59e0b";
+                const lbl = meta?.name || aid;
+                return `<span class="alert-saved-tag"><span class="alert-arch-dot" style="--arch-chip-col:${escapeFieldCardHtml(col)};"></span>${escapeFieldCardHtml(lbl)}</span>`;
+              })
+              .join("")
+          : `<span class="alert-saved-tag">P50 Beam</span>`;
+        const thresholdLabel = hasArch ? `≥${threshold}% odds` : `≥${threshold}% P50`;
+
         row.innerHTML = `
-          <div class="alert-saved-meta">
-            <strong>${escapeFieldCardHtml(r.name)}</strong>
-            <span>${escapeFieldCardHtml(r.phase)} · ≥${Math.round(r.min_calibrated_p50_pct)}% P50 · ${escapeFieldCardHtml(dest)}</span>
+          <div class="alert-saved-top">
+            <div class="alert-saved-meta">
+              <strong>${escapeFieldCardHtml(r.name)}</strong>
+              <div class="alert-saved-tags">${tagsHtml}</div>
+              <span>${escapeFieldCardHtml(formatAlertPhaseLabel(r.phase))} · ${escapeFieldCardHtml(thresholdLabel)} · ${escapeFieldCardHtml(dest)}</span>
+            </div>
+            <div class="alert-saved-actions">
+              <button type="button" class="alert-check-btn" data-eval-rule="${escapeFieldCardHtml(r.id)}" title="Check today's odds">Check</button>
+              <button type="button" class="icon-btn icon-btn-xs" data-del-rule="${escapeFieldCardHtml(r.id)}" title="Delete alert">✕</button>
+            </div>
           </div>
-          <button type="button" class="icon-btn icon-btn-xs" data-del-rule="${escapeFieldCardHtml(r.id)}" title="Delete alert">✕</button>
+          <div class="alert-eval-pill" data-eval-out hidden></div>
         `;
         row.querySelector("[data-del-rule]")?.addEventListener("click", async () => {
           await fetch(`/api/watchlists/${encodeURIComponent(r.id)}`, { method: "DELETE" });
           refreshSavedWatchlists();
+        });
+        row.querySelector("[data-eval-rule]")?.addEventListener("click", async (evClick) => {
+          const btn = evClick.currentTarget;
+          const outEl = row.querySelector("[data-eval-out]");
+          if (!outEl) return;
+          btn.disabled = true;
+          btn.textContent = "…";
+          outEl.hidden = false;
+          outEl.className = "alert-eval-pill";
+          outEl.textContent = "Evaluating live 3D corridor…";
+          try {
+            const qs = new URLSearchParams({ rule_id: r.id, date: state.date });
+            const eRes = await fetch(`/api/alerts/evaluate?${qs.toString()}`);
+            if (!eRes.ok) throw new Error(`HTTP ${eRes.status}`);
+            const eData = await eRes.json();
+            const first = (eData.evaluations || [])[0];
+            if (!first) {
+              outEl.textContent = "No evaluation returned for this rule.";
+            } else {
+              const dec = String(first.decision || "SUPPRESS").toUpperCase();
+              outEl.className = `alert-eval-pill is-${dec.toLowerCase()}`;
+              const bestTime = first.best_time_local ? ` @ ${first.best_time_local}` : "";
+              const archInfo =
+                first.matched_archetype_name && first.combined_target_prob_pct != null
+                  ? `${Math.round(Number(first.combined_target_prob_pct))}% ${first.matched_archetype_name}${bestTime}`
+                  : first.primary_phenomenon || "";
+              const detail = first.reason || first.headline || "";
+              outEl.textContent = `${dec}${archInfo ? ` · ${archInfo}` : ""} — ${detail}`;
+            }
+          } catch (err) {
+            outEl.textContent = `Check failed: ${err.message}`;
+          } finally {
+            btn.disabled = false;
+            btn.textContent = "Check";
+          }
         });
         alertSavedList.appendChild(row);
       });
@@ -6903,6 +8210,19 @@ function animate(nowMs = performance.now()) {
     const lmName = state.shootReport?.target_landmark?.name || state.landmark;
     if (alertTitle) alertTitle.textContent = `Alert for ${lmName}`;
     if (alertStatus) alertStatus.hidden = true;
+    const activeArch = state.pinnedArchetypeId || state.activeArchetypeId || "filtered_gold";
+    setSelectedAlertArchetypes([activeArch]);
+    if (alertPhaseSelect) {
+      const hrNow = Math.floor((state.currentMinutes || 0) / 60);
+      const isMidday = hrNow >= 10 && hrNow <= 15;
+      const isAllDayArch = ["giant_softbox", "high_thin_veil", "harsh_sun", "atmospheric_diffusion", "clearing_storm"].includes(activeArch);
+      if (isMidday && isAllDayArch) {
+        alertPhaseSelect.value = "any";
+      } else {
+        const isSunrise = document.getElementById("tab-corridor-sunrise")?.classList.contains("is-active");
+        alertPhaseSelect.value = isSunrise ? "sunrise" : "sunset";
+      }
+    }
     refreshSavedWatchlists();
   });
 
@@ -6910,13 +8230,17 @@ function animate(nowMs = performance.now()) {
     e.preventDefault();
     const lm = state.shootReport?.target_landmark;
     const spotName = lm?.name || state.landmark;
+    const selectedArchs = getSelectedAlertArchetypes();
+    const minOdds = Number(alertMinSelect?.value || 50);
     const payload = {
       name: spotName,
       lat: lm?.summit_lat ?? 37.5945,
       lon: lm?.summit_lon ?? -122.5028,
       elev_m: lm?.summit_elevation_m ?? null,
-      phase: document.getElementById("alert-phase-select")?.value || "sunset",
-      min_calibrated_p50_pct: Number(document.getElementById("alert-min-p50")?.value || 65),
+      phase: alertPhaseSelect?.value || "sunset",
+      target_archetypes: selectedArchs,
+      min_archetype_prob_pct: selectedArchs.length ? minOdds : 0,
+      min_calibrated_p50_pct: minOdds,
       notify_email: document.getElementById("alert-email-input")?.value?.trim() || null,
       notify_webhook_url: document.getElementById("alert-webhook-input")?.value?.trim() || null,
     };
@@ -6934,7 +8258,10 @@ function animate(nowMs = performance.now()) {
         const errDoc = await res.json().catch(() => ({}));
         throw new Error(errDoc.detail || `HTTP ${res.status}`);
       }
-      if (alertStatus) alertStatus.textContent = `Saved calibrated alert for ${spotName}.`;
+      const archSummary = selectedArchs.length
+        ? selectedArchs.map((a) => LIGHT_ARCHETYPE_META[a]?.name || a).join(" + ")
+        : "P50 Light";
+      if (alertStatus) alertStatus.textContent = `Saved alert for ${spotName} (${archSummary} ≥${minOdds}%).`;
       refreshSavedWatchlists();
     } catch (err) {
       if (alertStatus) alertStatus.textContent = `Error: ${err.message}`;
@@ -7008,6 +8335,9 @@ function animate(nowMs = performance.now()) {
 
 if (Number.isFinite(paramMm) && paramMm >= 14 && paramMm <= 300) {
   state.focalLengthMm = paramMm;
+}
+if (paramArchetype && ARCHETYPE_VISUAL_PROFILES[paramArchetype]) {
+  state.pinnedArchetypeId = paramArchetype;
 }
 syncFluidLabButtons();
 ensureRenderLoopRunning();

@@ -48,6 +48,7 @@ from .nwp_corridor import (
     offset_lat_lon_km,
 )
 from .calibration import load_calibration_bundle
+from .light_archetypes import ARCHETYPE_CATALOG, compute_light_archetypes
 from .raob_sounding import fetch_raob_sounding
 from .station_obs import fetch_nearest_station_observation
 from .terrain_coupling import compute_lake_mirror_index, compute_probabilistic_fog_bands
@@ -2861,19 +2862,55 @@ def solve_weather_and_corridor(
             hrrr_s3_meta=hrrr_s3_data if (has_hrrr_s3 and abs(hr - primary_hr_idx) <= 2) else None,
         )
 
+        hr_sun_el = float((r_out or {}).get("sun_el_deg") or 0.0)
+        hr_fog_top_ft = int(round(snd_h["inv_top_asl_m"] * 3.28084))
+        hr_fog_pct = float(hr_fluid_params.get("fogCloudPct", snd_h["cloud_low_pct"]))
+        hr_high_tau = float(hr_fluid_params.get("highOpticalDepth", 0.0))
+        hr_vis_mi = round(max(0.2, min(48.0, float(snd_h.get("visibility_m", 24000.0)) / 1609.344)), 1)
+        hr_rh_pct = float(snd_h.get("rh_2m_pct", 55.0))
+        hr_inv_dt_f = float(snd_h.get("inv_jump_k", 0.0)) * 1.8
+        hr_disk_vis = float(h_ray.get("terrain_disk_visibility", 1.0))
+
+        hr_light_archetypes = compute_light_archetypes(
+            sun_el_deg=hr_sun_el,
+            p10_pct=float(h_p10),
+            p50_pct=float(h_p50),
+            p90_pct=float(h_p90),
+            cloud_low_pct=float(snd_h["cloud_low_pct"]),
+            cloud_mid_pct=float(snd_h["cloud_mid_pct"]),
+            cloud_high_pct=float(snd_h["cloud_high_pct"]),
+            fog_pct=hr_fog_pct,
+            fog_top_ft=float(hr_fog_top_ft),
+            target_elev_ft=float(target_elev_ft),
+            canvas_glow_score=float(h_glow),
+            aod_550nm=float(hr_col_aod),
+            high_optical_depth=hr_high_tau,
+            inversion_delta_t_f=hr_inv_dt_f,
+            visibility_miles=hr_vis_mi,
+            rh_pct=hr_rh_pct,
+            direct_beam_pct=float(h_prob_pct),
+            terrain_disk_fraction=hr_disk_vis,
+            is_coastal=is_coastal,
+            compact=True,
+        )
+
         hourly_timeline.append(
             {
                 "hour": hr,
                 "minutes_local": hr * 60 + 30,
                 "time_local": (r_out or {}).get("time_local") or f"{hr:02d}:30",
                 "sun_az_deg": (r_out or {}).get("sun_az_deg") or 180.0,
-                "sun_el_deg": (r_out or {}).get("sun_el_deg") or 0.0,
+                "sun_el_deg": hr_sun_el,
                 "temp_f": int(round(snd_h["temp_2m_c"] * 9.0 / 5.0 + 32.0)),
                 "wind_mph": int(round(snd_h["wind_10m_kmh"] * 0.621371)),
                 "cloud_low_pct": snd_h["cloud_low_pct"],
                 "cloud_mid_pct": snd_h["cloud_mid_pct"],
                 "cloud_high_pct": snd_h["cloud_high_pct"],
-                "fog_top_ft": int(round(snd_h["inv_top_asl_m"] * 3.28084)),
+                "fog_pct": int(round(hr_fog_pct)),
+                "fog_top_ft": hr_fog_top_ft,
+                "high_optical_depth": round(hr_high_tau, 2),
+                "visibility_miles": hr_vis_mi,
+                "rh_pct": int(round(hr_rh_pct)),
                 "aod_550nm": snd_h["rust_station"]["aod_550nm"],
                 "expected_transmittance_pct": h_exp_pct,
                 "direct_beam_pct": h_prob_pct,
@@ -2884,6 +2921,7 @@ def solve_weather_and_corridor(
                 "canvas_glow_score": h_glow,
                 "blocker_label": h_blk.get("blocker_type") or "clear",
                 "blocker_distance_km": round(float(h_blk.get("distance_km") or 0.0), 1),
+                "light_archetypes": hr_light_archetypes,
                 "fluid_atmosphere_params": hr_fluid_params,
                 "atmospheric_layers": hr_layers,
             }
@@ -3168,6 +3206,44 @@ def solve_weather_and_corridor(
         upwind_horizon_deg=_upwind_hor_est,
     )
 
+    prim_p10 = float(
+        calibrated_probabilities["transmittance_p10_pct"]
+        if calibrated_probabilities is not None
+        else p10_pct
+    )
+    prim_p50 = float(
+        calibrated_probabilities["transmittance_p50_pct"]
+        if calibrated_probabilities is not None
+        else p50_pct
+    )
+    prim_p90 = float(
+        calibrated_probabilities["transmittance_p90_pct"]
+        if calibrated_probabilities is not None
+        else p90_pct
+    )
+    primary_light_archetypes = compute_light_archetypes(
+        sun_el_deg=float(sun_el_deg),
+        p10_pct=prim_p10,
+        p50_pct=prim_p50,
+        p90_pct=prim_p90,
+        cloud_low_pct=float(st0["cloud_low_pct"]),
+        cloud_mid_pct=float(st0["cloud_mid_pct"]),
+        cloud_high_pct=float(st0["cloud_high_pct"]),
+        fog_pct=float(fluid_atmosphere_params.get("fogCloudPct", st0["cloud_low_pct"])),
+        fog_top_ft=float(inversion_model.get("fog_top_p50_ft", fog_top_ft)),
+        target_elev_ft=float(target_elev_ft),
+        canvas_glow_score=float(canvas_glow_score),
+        aod_550nm=float(primary_col_aod),
+        high_optical_depth=float(fluid_atmosphere_params.get("highOpticalDepth", 0.0)),
+        inversion_delta_t_f=float(inversion_delta_t_f),
+        visibility_miles=float(vis_miles),
+        rh_pct=float(st0.get("rh_2m_pct", 55.0)),
+        direct_beam_pct=float(direct_prob_pct),
+        terrain_disk_fraction=float(primary_ray.get("terrain_disk_visibility", 1.0)),
+        is_coastal=is_coastal,
+        compact=False,
+    )
+
     payload_dict = {
         "date": req_date.isoformat(),
         "phase": "Sunset" if is_sunset else "Sunrise",
@@ -3188,6 +3264,8 @@ def solve_weather_and_corridor(
         "transmittance_p50_pct": p50_pct,
         "transmittance_p90_pct": p90_pct,
         "calibrated_probabilities": calibrated_probabilities,
+        "light_archetypes": primary_light_archetypes,
+        "light_archetype_catalog": ARCHETYPE_CATALOG,
         "color_temperature_kelvin": kelvin,
         "chappuis_rose_index": chappuis_rose,
         "lcl_cloud_base_ft": lcl_cloud_base_ft,

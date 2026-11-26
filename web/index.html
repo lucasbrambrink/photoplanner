@@ -4,9 +4,10 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="color-scheme" content="dark light" />
-  <title>PhotoPlanner — 3D Light &amp; Lens Viewfinder</title>
+  <title>LightFinder — 3D Light &amp; Lens Viewfinder</title>
+  <meta name="description" content="LightFinder — 3D topographic terrain, 7-archetype probabilistic light engine, and 16–200mm lens viewfinder." />
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23f59e0b' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='8' r='3.5'/%3E%3Cpath d='M3 20l6-8 4 5 3-4 5 7H3z'/%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="/styles.css?v=20261121a" />
+  <link rel="stylesheet" href="/styles.css?v=20261125a" />
   <script type="importmap">
     {
       "imports": {
@@ -83,7 +84,7 @@
               <circle cx="12" cy="8" r="3.5" />
               <path d="M3 20l6-8 4 5 3-4 5 7H3z" />
             </svg>
-            <span class="brand-wordmark">PhotoPlanner</span>
+            <span class="brand-wordmark">LightFinder</span>
           </div>
           <div class="sheet-header-right">
             <span class="elev-chip" id="summary-elevation">625 ft</span>
@@ -150,34 +151,63 @@
 
       <!-- Collapsible Body of Floating Sheet -->
       <div class="sheet-body" id="sheet-body">
-        <!-- Hero Verdict Strip: The 5-Second Answer -->
-        <section class="verdict-hero" aria-label="Light Verdict">
-          <div class="verdict-top-row">
-            <div class="verdict-status-wrap">
-              <span class="verdict-dot" id="brief-verdict-dot" aria-hidden="true"></span>
-              <span class="verdict-label" id="brief-verdict-badge">EVALUATING</span>
+        <!-- 7-Archetype Probabilistic 3D Scenario Switcher -->
+        <section class="verdict-hero archetype-hero" id="archetype-brief-section" aria-label="Probabilistic Light Archetypes">
+          <div class="archetype-head-row">
+            <div class="archetype-status-wrap">
+              <span class="archetype-dot" id="archetype-active-dot" aria-hidden="true"></span>
+              <span class="archetype-mode-label" id="archetype-mode-label">AUTO · SOLVING LIGHT</span>
             </div>
-            <div class="verdict-odds-wrap">
-              <span class="verdict-odds-num" id="brief-light-odds">--%</span>
-              <span class="verdict-odds-caption">light odds</span>
-            </div>
-          </div>
-
-          <div class="prob-whisker" title="Calibrated P10–P90 transmittance band (median P50 marked)">
-            <div class="prob-whisker-track">
-              <div class="prob-whisker-band" id="brief-prob-range" style="left: 20%; width: 50%;"></div>
-              <div class="prob-whisker-median" id="brief-prob-median" style="left: 50%;"></div>
-            </div>
-            <div class="prob-whisker-labels">
-              <span id="brief-p10-label">P10 --%</span>
-              <span id="brief-p50-label">P50 --%</span>
-              <span id="brief-p90-label">P90 --%</span>
+            <div class="archetype-head-actions">
+              <span class="archetype-time-chip" id="archetype-time-chip">17:18</span>
+              <button type="button" class="archetype-auto-btn is-active" id="btn-archetype-auto" title="Follow most likely archetype as you scrub the 24-hour timeline">
+                Auto
+              </button>
             </div>
           </div>
 
-          <p class="verdict-reason" id="brief-causal-note">
-            Solving 380 km curved-Earth solar corridor and local inversion height…
-          </p>
+          <!-- Clickable 3D Preview Cards for every Archetype >= 20% (always >= 1) -->
+          <div class="scenario-cards-list" id="scenario-cards-list" role="group" aria-label="Likely Light Scenarios">
+            <div class="scenario-card-skeleton">Solving 380 km solar corridor &amp; 4-layer cloud column…</div>
+          </div>
+
+          <!-- Active Archetype Field Reference -->
+          <div class="archetype-field-ref" id="archetype-field-ref" aria-label="Active Light Archetype Field Reference">
+            <div class="field-ref-grid">
+              <div class="field-ref-item">
+                <span class="field-ref-label">Shadow Edge</span>
+                <strong class="field-ref-val" id="ref-shadow-edge">--</strong>
+              </div>
+              <div class="field-ref-item">
+                <span class="field-ref-label">Contrast</span>
+                <strong class="field-ref-val" id="ref-contrast">--</strong>
+              </div>
+              <div class="field-ref-item">
+                <span class="field-ref-label">Color Cast</span>
+                <strong class="field-ref-val" id="ref-color-cast">--</strong>
+              </div>
+              <div class="field-ref-item">
+                <span class="field-ref-label">Best For</span>
+                <strong class="field-ref-val" id="ref-best-for">--</strong>
+              </div>
+            </div>
+            <div class="field-ref-lever">
+              <span class="field-ref-lever-tag">Lever</span>
+              <span class="field-ref-lever-text" id="ref-tactical-lever">Solving corridor physics…</span>
+            </div>
+          </div>
+
+          <!-- Collapsible Full 7-Archetype 100% Breakdown Bar -->
+          <details class="archetype-breakdown" id="archetype-breakdown-details">
+            <summary class="archetype-breakdown-summary">
+              <div class="archetype-breakdown-top">
+                <span>All 7 Archetypes</span>
+                <span class="archetype-sum-pill" id="archetype-sum-label">100%</span>
+              </div>
+              <div class="archetype-stacked-bar" id="archetype-stacked-bar" aria-hidden="true"></div>
+            </summary>
+            <div class="archetype-all7-list" id="archetype-all7-list" role="group" aria-label="Full 7-Archetype Probability Breakdown"></div>
+          </details>
 
           <div class="brief-tri-stats">
             <div class="tri-stat">
@@ -408,6 +438,9 @@
       </div>
       <p class="muted-note" id="webcam-snap-note">Matches Three.js horizontal FOV &amp; azimuth against scientific sky imagery.</p>
     </aside>
+
+    <!-- Floating >= 20% Light Archetype Scenario Pills (Always Accessible in 3D Map & Tripod View) -->
+    <div class="viewport-scenario-pills" id="viewport-scenario-pills" role="group" aria-label="3D Light Archetype Scenarios"></div>
 
     <!-- =====================================================================
          BOTTOM CENTER: Single Floating Hairline 24-Hour Timeline Pill
@@ -774,30 +807,63 @@
     <div id="alert-popover" class="clean-popover alert-popover" popover>
       <div class="popover-head">
         <div>
-          <span class="eyebrow">CALIBRATED LIGHT ALERTS</span>
+          <span class="eyebrow">LIGHTFINDER ALERTS</span>
           <h3 id="alert-popover-title">Don't Miss This Spot</h3>
         </div>
         <button type="button" class="icon-btn icon-btn-xs" popovertarget="alert-popover" popovertargetaction="hide" aria-label="Close">✕</button>
       </div>
       <p class="muted-note">
-        Get alerted only when calibrated <strong>P50 light odds</strong> clear your threshold — zero flat-grid spam.
+        Get alerted when your chosen <strong>Light Archetype(s)</strong> clear your probability threshold — zero spam.
       </p>
       <form id="alert-create-form" class="alert-form">
         <div class="alert-form-row">
-          <label class="block-caption" for="alert-phase-select">Phase</label>
-          <select id="alert-phase-select" class="input-select input-select-sm">
-            <option value="sunset" selected>Sunset</option>
-            <option value="sunrise">Sunrise</option>
-            <option value="both">Sunrise &amp; Sunset</option>
-          </select>
+          <div class="alert-row-label-bar">
+            <label class="block-caption">Target Light Archetypes</label>
+            <span class="alert-arch-hint" id="alert-archetype-hint">Select 1 or more</span>
+          </div>
+          <div id="alert-archetype-picker" class="alert-archetype-picker" role="group" aria-label="Target Light Archetypes">
+            <button type="button" class="alert-arch-chip is-selected" data-alert-arch="filtered_gold" aria-pressed="true" style="--arch-chip-col:#f59e0b;">
+              <span class="alert-arch-dot"></span><span>Filtered Gold</span>
+            </button>
+            <button type="button" class="alert-arch-chip" data-alert-arch="clearing_storm" aria-pressed="false" style="--arch-chip-col:#fbbf24;">
+              <span class="alert-arch-dot"></span><span>Clearing Storm</span>
+            </button>
+            <button type="button" class="alert-arch-chip" data-alert-arch="atmospheric_diffusion" aria-pressed="false" style="--arch-chip-col:#38bdf8;">
+              <span class="alert-arch-dot"></span><span>Diffusion</span>
+            </button>
+            <button type="button" class="alert-arch-chip" data-alert-arch="high_thin_veil" aria-pressed="false" style="--arch-chip-col:#e2e8f0;">
+              <span class="alert-arch-dot"></span><span>High Thin Veil</span>
+            </button>
+            <button type="button" class="alert-arch-chip" data-alert-arch="giant_softbox" aria-pressed="false" style="--arch-chip-col:#94a3b8;">
+              <span class="alert-arch-dot"></span><span>Giant Softbox</span>
+            </button>
+            <button type="button" class="alert-arch-chip" data-alert-arch="blue_hour" aria-pressed="false" style="--arch-chip-col:#6366f1;">
+              <span class="alert-arch-dot"></span><span>Blue Hour</span>
+            </button>
+            <button type="button" class="alert-arch-chip" data-alert-arch="harsh_sun" aria-pressed="false" style="--arch-chip-col:#0ea5e9;">
+              <span class="alert-arch-dot"></span><span>Harsh Sun</span>
+            </button>
+          </div>
         </div>
-        <div class="alert-form-row">
-          <label class="block-caption" for="alert-min-p50">Min Calibrated Odds</label>
-          <select id="alert-min-p50" class="input-select input-select-sm">
-            <option value="55">55% (Balanced)</option>
-            <option value="65" selected>65% (High Confidence)</option>
-            <option value="75">75% (Rare Burners Only)</option>
-          </select>
+        <div class="alert-form-grid-2">
+          <div class="alert-form-row">
+            <label class="block-caption" for="alert-phase-select">Window</label>
+            <select id="alert-phase-select" class="input-select input-select-sm">
+              <option value="sunset" selected>Sunset</option>
+              <option value="sunrise">Sunrise</option>
+              <option value="both">Sunrise &amp; Sunset</option>
+              <option value="any">Any Hour (24h)</option>
+            </select>
+          </div>
+          <div class="alert-form-row">
+            <label class="block-caption" for="alert-min-p50">Min Light Odds</label>
+            <select id="alert-min-p50" class="input-select input-select-sm">
+              <option value="35">35% (Early Watch)</option>
+              <option value="50" selected>50% (Likely)</option>
+              <option value="65">65% (High Conf.)</option>
+              <option value="75">75% (Rare Lock)</option>
+            </select>
+          </div>
         </div>
         <div class="alert-form-row">
           <label class="block-caption" for="alert-email-input">Email (Optional)</label>
@@ -805,10 +871,10 @@
         </div>
         <div class="alert-form-row">
           <label class="block-caption" for="alert-webhook-input">Push / Webhook URL (ntfy / Discord / Slack)</label>
-          <input type="url" id="alert-webhook-input" class="input-text" placeholder="https://ntfy.sh/my-photo-alerts" />
+          <input type="url" id="alert-webhook-input" class="input-text" placeholder="https://ntfy.sh/my-lightfinder-alerts" />
         </div>
         <button type="submit" class="btn-accent btn-sm alert-submit-btn" id="btn-save-alert">
-          Save Calibrated Alert
+          Save Light Alert
         </button>
         <div class="muted-note" id="alert-form-status" hidden></div>
       </form>
@@ -822,6 +888,6 @@
     </div>
   </main>
 
-  <script type="module" src="/app.js?v=20261123a"></script>
+  <script type="module" src="/app.js?v=20261125b"></script>
 </body>
 </html>
