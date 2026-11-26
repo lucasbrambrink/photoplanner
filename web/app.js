@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { VolumetricAtmosphereEngine } from "./volumetric-engine.js?v=20261121a";
+import { VolumetricAtmosphereEngine } from "./volumetric-engine.js?v=20261121b";
 
 // Conditional Popover API polyfill loader (content-first-noise-reduction)
 if (!Object.hasOwn(HTMLElement.prototype, "popover")) {
@@ -36,13 +36,30 @@ const initialCustomCoord =
   Number.isFinite(paramLat) && Number.isFinite(paramLon)
     ? { lat: paramLat, lon: paramLon, name: paramLandmark || `GPS (${paramLat.toFixed(4)}, ${paramLon.toFixed(4)})` }
     : null;
+let savedCustomCoord = null;
+if (!initialCustomCoord && !paramLandmark) {
+  try {
+    const rawCoord = localStorage.getItem("pp_custom_coord_v4");
+    if (rawCoord) {
+      const parsed = JSON.parse(rawCoord);
+      if (parsed && Number.isFinite(parsed.lat) && Number.isFinite(parsed.lon) && parsed.name) {
+        savedCustomCoord = parsed;
+      }
+    }
+  } catch (_) {}
+}
 const DEFAULT_BENCHMARK_LANDMARK = "Montara Mountain";
 const DEFAULT_BENCHMARK_DATE = "2025-06-05";
-const savedLandmark = paramLandmark || localStorage.getItem("pp_landmark_v4") || DEFAULT_BENCHMARK_LANDMARK;
+const savedLandmark =
+  paramLandmark ||
+  savedCustomCoord?.name ||
+  localStorage.getItem("pp_landmark_v4") ||
+  DEFAULT_BENCHMARK_LANDMARK;
 const savedDate = (paramDate && /^\d{4}-\d{2}-\d{2}$/.test(paramDate) ? paramDate : null) || localStorage.getItem("pp_date_v4") || DEFAULT_BENCHMARK_DATE;
 
 const state = {
   landmark: savedLandmark,
+  customCoord: initialCustomCoord || savedCustomCoord,
   date: savedDate,
   maxMiles: 16.0,
   weatherEngine: "ensemble", // "ensemble" | "graphcast" | "hrrr" | "ecmwf" | "nowcast"
@@ -6687,7 +6704,7 @@ function toggleWebcamDrawer(forceShow = null) {
   }
 }
 
-async function fetchWebcamTruthForScenario(phase = "sunset") {
+async function fetchWebcamTruthForScenario(phase = "sunset", signal = undefined) {
   const lm = state.shootReport?.target_landmark;
   if (!lm) return;
   const reqId = ++_activeWebcamReqId;
@@ -6697,7 +6714,8 @@ async function fetchWebcamTruthForScenario(phase = "sunset") {
   const sunAz = win ? win.sun_azimuth_deg : phase === "sunrise" ? 102.5 : 259.1;
   try {
     const res = await fetch(
-      `/api/webcam-truth?lat=${lm.summit_lat}&lon=${lm.summit_lon}&date=${encodeURIComponent(state.date)}&phase=${encodeURIComponent(phase)}&elev_m=${lm.summit_elevation_m}&sun_az=${sunAz}`
+      `/api/webcam-truth?lat=${lm.summit_lat}&lon=${lm.summit_lon}&date=${encodeURIComponent(state.date)}&phase=${encodeURIComponent(phase)}&elev_m=${lm.summit_elevation_m}&sun_az=${sunAz}`,
+      { signal, priority: "low" }
     );
     if (!res.ok || reqId !== _activeWebcamReqId) return;
     state.webcamReport = await res.json();
@@ -6705,6 +6723,7 @@ async function fetchWebcamTruthForScenario(phase = "sunset") {
     state.selectedWebcamFrameIdx = -1;
     renderWebcamTruthUI();
   } catch (err) {
+    if (err?.name === "AbortError") return;
     console.warn("Webcam truth fetch skipped:", err);
   }
 }
@@ -6823,11 +6842,13 @@ function renderSidebar() {
 // Load Landmark Shoot Plan, Terrain Patch & Weather Forecast (Non-Blocking)
 // ============================================================================
 let scenarioLoadSeq = 0;
+let _activeScenarioAbortController = null;
 
-async function fetchBinaryOrJsonTerrainPatch(lat, lon, spanM = 28000, gridSize = 700) {
+async function fetchBinaryOrJsonTerrainPatch(lat, lon, spanM = 28000, gridSize = 700, signal = undefined) {
   try {
     const binRes = await fetch(
-      `/api/terrain-patch.bin?lat=${lat}&lon=${lon}&span_m=${spanM}&grid_size=${gridSize}`
+      `/api/terrain-patch.bin?lat=${lat}&lon=${lon}&span_m=${spanM}&grid_size=${gridSize}`,
+      { signal }
     );
     if (binRes.ok) {
       const buf = await binRes.arrayBuffer();
@@ -6838,17 +6859,31 @@ async function fetchBinaryOrJsonTerrainPatch(lat, lon, spanM = 28000, gridSize =
       return meta;
     }
   } catch (err) {
+    if (err?.name === "AbortError") throw err;
     console.warn("Binary terrain stream fallback to JSON:", err);
   }
   const jsonRes = await fetch(
-    `/api/terrain-patch?lat=${lat}&lon=${lon}&span_m=${spanM}&grid_size=${gridSize}`
+    `/api/terrain-patch?lat=${lat}&lon=${lon}&span_m=${spanM}&grid_size=${gridSize}`,
+    { signal }
   );
   if (!jsonRes.ok) throw new Error(`Terrain API error ${jsonRes.status}`);
   return jsonRes.json();
 }
 
-async function loadLandmarkScenario(customCoord = null) {
+async function loadLandmarkScenario(customCoord = undefined) {
   const reqSeq = ++scenarioLoadSeq;
+  if (_activeScenarioAbortController) {
+    _activeScenarioAbortController.abort();
+  }
+  const abortController = new AbortController();
+  _activeScenarioAbortController = abortController;
+  const { signal } = abortController;
+
+  if (customCoord !== undefined) {
+    state.customCoord = customCoord;
+  }
+  const activeCoord = state.customCoord;
+
   loadingEl.hidden = false;
   inspectorCard.hidden = true;
   window.getSelection?.()?.removeAllRanges?.();
@@ -6869,38 +6904,51 @@ async function loadLandmarkScenario(customCoord = null) {
   _lastRibbonRenderKey = "";
   _lastHybridGodRaysKey = "";
 
-  const label = customCoord ? customCoord.name : state.landmark;
+  const label = activeCoord ? activeCoord.name : state.landmark;
   const lmSel = document.getElementById("landmark-select");
   const dtInp = document.getElementById("shoot-date");
   const spotInp = document.getElementById("spot-search-input");
-  if (lmSel && !customCoord) lmSel.value = state.landmark;
+  if (lmSel && !activeCoord) lmSel.value = state.landmark;
   if (spotInp) spotInp.value = label;
   if (dtInp) dtInp.value = state.date;
   try {
-    if (!customCoord) localStorage.setItem("pp_landmark_v4", state.landmark);
+    if (activeCoord) {
+      localStorage.setItem("pp_custom_coord_v4", JSON.stringify(activeCoord));
+    } else {
+      localStorage.removeItem("pp_custom_coord_v4");
+      localStorage.setItem("pp_landmark_v4", state.landmark);
+    }
     localStorage.setItem("pp_date_v4", state.date);
   } catch (_) {}
 
-  loadingTextEl.textContent = `Loading 3D terrain & sightlines for ${label}…`;
-
+  // Immediately clear stale previous-location header & hero badge while loading
+  const summaryTitleEl = document.getElementById("summary-title");
+  const summaryElevEl = document.getElementById("summary-elevation");
+  const summarySubEl = document.getElementById("summary-subtitle");
   const modeEl = document.getElementById("archetype-mode-label");
   const leverEl = document.getElementById("ref-tactical-lever");
+  if (summaryTitleEl) summaryTitleEl.textContent = label;
+  if (summaryElevEl) summaryElevEl.textContent = "…";
+  if (summarySubEl) summarySubEl.textContent = `Scanning 1m LiDAR summit, trail sightlines & 3D terrain for ${label}…`;
   if (modeEl) modeEl.textContent = "AUTO · SOLVING LIGHT";
   if (leverEl) leverEl.textContent = "Solving 380 km curved-Earth solar corridor and 4-layer cloud column…";
 
+  loadingTextEl.textContent = `1/2 Ray-casting sightlines for ${label}…`;
+
   try {
     let planUrl;
-    if (customCoord) {
-      planUrl = `/api/shoot-coord?lat=${customCoord.lat}&lon=${customCoord.lon}&name=${encodeURIComponent(customCoord.name)}&date=${encodeURIComponent(state.date)}&max_miles=${state.maxMiles}&top_k=3`;
+    if (activeCoord) {
+      planUrl = `/api/shoot-coord?lat=${activeCoord.lat}&lon=${activeCoord.lon}&name=${encodeURIComponent(activeCoord.name)}&date=${encodeURIComponent(state.date)}&max_miles=${state.maxMiles}&top_k=3`;
     } else {
       planUrl = `/api/shoot-plan?landmark=${encodeURIComponent(state.landmark)}&date=${encodeURIComponent(state.date)}&max_miles=${state.maxMiles}&top_k=3`;
     }
 
-    const planRes = await fetch(planUrl);
+    const planRes = await fetch(planUrl, { signal });
     if (!planRes.ok) throw new Error(`API error ${planRes.status}`);
     const report = await planRes.json();
-    if (reqSeq !== scenarioLoadSeq) return;
+    if (reqSeq !== scenarioLoadSeq || signal.aborted) return;
     state.shootReport = report;
+    renderSidebar();
 
     const lm = report.target_landmark;
     const sunsetWin = report.golden_hour_windows?.[0];
@@ -6910,19 +6958,25 @@ async function loadLandmarkScenario(customCoord = null) {
     const initReplay = isPast ? "truth" : "auto";
     const truthKey = buildTruthCacheKey(lm.summit_lat, lm.summit_lon, state.date, "sunset");
 
-    // Start weather corridor request in parallel, but render 3D terrain immediately when DEM arrives!
-    const weatherPromise = fetch(
-      `/api/weather-forecast?lat=${lm.summit_lat}&lon=${lm.summit_lon}&date=${encodeURIComponent(state.date)}&phase=sunset&sun_az=${initAz}&sun_el=${initEl}&elev_m=${lm.summit_elevation_m}&engine=${encodeURIComponent(state.weatherEngine)}&replay_mode=${initReplay}`
-    );
+    loadingTextEl.textContent = `2/2 Streaming 3D terrain mesh for ${lm.name || label}…`;
 
     const activeSpanM = state.terrainSpanM || 28000;
-    const terrainPatchData = await fetchBinaryOrJsonTerrainPatch(
+    const terrainPatchPromise = fetchBinaryOrJsonTerrainPatch(
       lm.summit_lat,
       lm.summit_lon,
       activeSpanM,
-      gridSizeForTerrainSpan(activeSpanM)
+      gridSizeForTerrainSpan(activeSpanM),
+      signal
     );
-    if (reqSeq !== scenarioLoadSeq) return;
+
+    // Start weather corridor request in parallel, but render 3D terrain immediately when DEM arrives!
+    const weatherPromise = fetch(
+      `/api/weather-forecast?lat=${lm.summit_lat}&lon=${lm.summit_lon}&date=${encodeURIComponent(state.date)}&phase=sunset&sun_az=${initAz}&sun_el=${initEl}&elev_m=${lm.summit_elevation_m}&engine=${encodeURIComponent(state.weatherEngine)}&replay_mode=${initReplay}`,
+      { signal, priority: "low" }
+    );
+
+    const terrainPatchData = await terrainPatchPromise;
+    if (reqSeq !== scenarioLoadSeq || signal.aborted) return;
     state.terrainPatch = terrainPatchData;
 
     if (pendingBootHour !== null) {
@@ -6948,10 +7002,10 @@ async function loadLandmarkScenario(customCoord = null) {
     // Stream weather corridor asynchronously with full error isolation
     weatherPromise
       .then(async (weatherRes) => {
-        if (reqSeq !== scenarioLoadSeq) return;
+        if (reqSeq !== scenarioLoadSeq || signal.aborted) return;
         if (!weatherRes.ok) throw new Error(`Weather HTTP ${weatherRes.status}`);
         const wDoc = await weatherRes.json();
-        if (reqSeq !== scenarioLoadSeq) return;
+        if (reqSeq !== scenarioLoadSeq || signal.aborted) return;
         state.weatherReport = wDoc;
         if (isPast) {
           state.cachedTruthReport = state.weatherReport;
@@ -6971,14 +7025,15 @@ async function loadLandmarkScenario(customCoord = null) {
         wakeRenderLoop(true);
       })
       .catch((wErr) => {
-        if (reqSeq !== scenarioLoadSeq) return;
+        if (wErr?.name === "AbortError" || reqSeq !== scenarioLoadSeq) return;
         console.warn("Weather corridor fetch failed:", wErr);
         if (modeEl) modeEl.textContent = "AUTO · GEOMETRY READY";
         if (leverEl) leverEl.textContent = "3D terrain & solar geometry ready; atmospheric corridor forecast temporarily unavailable.";
       });
 
-    fetchWebcamTruthForScenario("sunset");
+    fetchWebcamTruthForScenario("sunset", signal);
   } catch (err) {
+    if (err?.name === "AbortError") return;
     console.error("Failed to load scenario:", err);
     document.getElementById("summary-subtitle").textContent = `Error loading scenario: ${err.message}`;
     if (modeEl) modeEl.textContent = "LOAD ERROR";
@@ -7482,27 +7537,50 @@ timeScrubber.addEventListener("change", () => {
   scheduleScrubberSettleBake();
 });
 
-document.getElementById("query-form").addEventListener("submit", (e) => {
+document.getElementById("query-form").addEventListener("submit", async (e) => {
   e.preventDefault();
-  state.landmark = document.getElementById("landmark-select").value;
   state.date = document.getElementById("shoot-date").value;
   state.maxMiles = parseFloat(document.getElementById("max-miles").value);
-  loadLandmarkScenario();
+  const typedSpot = document.getElementById("spot-search-input")?.value?.trim() || "";
+  const activeName = state.customCoord ? state.customCoord.name : state.landmark;
+  if (typedSpot && typedSpot.toLowerCase() !== activeName.toLowerCase()) {
+    try {
+      const qs = new URLSearchParams({ q: typedSpot, limit: "5" });
+      const res = await fetch(`/api/search-spots?${qs.toString()}`);
+      if (res.ok) {
+        const data = await res.json();
+        const match = data.results?.[0];
+        if (match) {
+          const lmSelect = document.getElementById("landmark-select");
+          if (match.preset_landmark && lmSelect) {
+            lmSelect.value = match.preset_landmark;
+            state.landmark = match.preset_landmark;
+            loadLandmarkScenario(null);
+          } else {
+            state.landmark = match.name;
+            loadLandmarkScenario({ lat: match.lat, lon: match.lon, name: match.name });
+          }
+          return;
+        }
+      }
+    } catch (_) {}
+  }
+  loadLandmarkScenario(state.customCoord);
 });
 
 document.getElementById("landmark-select").addEventListener("change", (e) => {
   state.landmark = e.target.value;
-  loadLandmarkScenario();
+  loadLandmarkScenario(null);
 });
 
 document.getElementById("shoot-date").addEventListener("change", (e) => {
   state.date = e.target.value;
-  loadLandmarkScenario();
+  loadLandmarkScenario(state.customCoord);
 });
 
 document.getElementById("max-miles").addEventListener("change", (e) => {
   state.maxMiles = parseFloat(e.target.value);
-  loadLandmarkScenario();
+  loadLandmarkScenario(state.customCoord);
 });
 
 if (btnOrbitMode) {
@@ -8767,6 +8845,7 @@ function animate(nowMs = performance.now()) {
   const searchDropdown = document.getElementById("spot-search-results");
   let searchDebounce = 0;
   let searchResults = [];
+  let searchLastQuery = "";
   let searchActiveIdx = -1;
 
   function hideSearchDropdown() {
@@ -8776,21 +8855,26 @@ function animate(nowMs = performance.now()) {
 
   function selectSearchSpot(spot) {
     if (!spot) return;
+    clearTimeout(searchDebounce);
     hideSearchDropdown();
-    if (searchInput) searchInput.value = spot.name;
+    if (searchInput) {
+      searchInput.value = spot.name;
+      searchInput.blur();
+    }
     const lmSelect = document.getElementById("landmark-select");
     if (spot.preset_landmark && lmSelect) {
       lmSelect.value = spot.preset_landmark;
       state.landmark = spot.preset_landmark;
-      loadLandmarkScenario();
+      loadLandmarkScenario(null);
     } else {
       state.landmark = spot.name;
       loadLandmarkScenario({ lat: spot.lat, lon: spot.lon, name: spot.name });
     }
   }
 
-  function renderSearchDropdown(items) {
+  function renderSearchDropdown(items, queryStr = "") {
     searchResults = items || [];
+    searchLastQuery = queryStr;
     searchActiveIdx = -1;
     if (!searchDropdown) return;
     if (!searchResults.length) {
@@ -8816,6 +8900,12 @@ function animate(nowMs = performance.now()) {
         e.preventDefault();
         selectSearchSpot(spot);
       });
+      btn.addEventListener("click", (e) => {
+        if (!searchDropdown.hidden) {
+          e.preventDefault();
+          selectSearchSpot(spot);
+        }
+      });
       btn.addEventListener("mouseenter", () => {
         searchActiveIdx = idx;
       });
@@ -8828,9 +8918,10 @@ function animate(nowMs = performance.now()) {
     try {
       const qs = new URLSearchParams({ q: query, limit: "10" });
       const res = await fetch(`/api/search-spots?${qs.toString()}`);
-      if (!res.ok) return;
+      if (!res.ok || document.activeElement !== searchInput) return;
       const data = await res.json();
-      renderSearchDropdown(data.results || []);
+      if (document.activeElement !== searchInput) return;
+      renderSearchDropdown(data.results || [], query);
     } catch (_) {
       // Ignore transient network errors while typing
     }
@@ -8844,10 +8935,41 @@ function animate(nowMs = performance.now()) {
   searchInput?.addEventListener("input", () => {
     clearTimeout(searchDebounce);
     const q = searchInput.value.trim();
-    searchDebounce = setTimeout(() => fetchSpotSuggestions(q), 140);
+    searchDebounce = setTimeout(() => fetchSpotSuggestions(q), 120);
   });
 
-  searchInput?.addEventListener("keydown", (e) => {
+  searchInput?.addEventListener("keydown", async (e) => {
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.key === "Escape") {
+      hideSearchDropdown();
+      return;
+    }
+    if (e.key === "Enter") {
+      e.preventDefault();
+      clearTimeout(searchDebounce);
+      const q = searchInput.value.trim();
+      if (
+        !searchDropdown?.hidden &&
+        searchResults.length > 0 &&
+        (searchActiveIdx >= 0 || searchLastQuery.toLowerCase() === q.toLowerCase())
+      ) {
+        selectSearchSpot(searchResults[Math.max(0, searchActiveIdx)]);
+        return;
+      }
+      if (q) {
+        try {
+          const qs = new URLSearchParams({ q, limit: "5" });
+          const res = await fetch(`/api/search-spots?${qs.toString()}`);
+          if (res.ok) {
+            const data = await res.json();
+            if (data.results?.length) {
+              selectSearchSpot(data.results[0]);
+            }
+          }
+        } catch (_) {}
+      }
+      return;
+    }
     if (!searchDropdown || searchDropdown.hidden) return;
     const items = searchDropdown.querySelectorAll(".spot-result-item");
     if (e.key === "ArrowDown") {
@@ -8858,11 +8980,6 @@ function animate(nowMs = performance.now()) {
       e.preventDefault();
       searchActiveIdx = Math.max(0, searchActiveIdx - 1);
       items.forEach((el, i) => el.classList.toggle("is-highlighted", i === searchActiveIdx));
-    } else if (e.key === "Enter" && searchResults.length > 0) {
-      e.preventDefault();
-      selectSearchSpot(searchResults[Math.max(0, searchActiveIdx)]);
-    } else if (e.key === "Escape") {
-      hideSearchDropdown();
     }
   });
 
@@ -9174,4 +9291,4 @@ if (paramArchetype && ARCHETYPE_VISUAL_PROFILES[paramArchetype]) {
 }
 syncFluidLabButtons();
 ensureRenderLoopRunning();
-loadLandmarkScenario(initialCustomCoord);
+loadLandmarkScenario(state.customCoord);

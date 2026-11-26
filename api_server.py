@@ -375,7 +375,10 @@ def api_usgs_ortho(
     lon: float = -119.53315,
     span_m: float = 28000.0,
 ) -> Response:
-    jpg = legacy_server.fetch_usgs_ortho_jpeg(lat, lon, span_m)
+    try:
+        jpg = legacy_server.fetch_usgs_ortho_jpeg(lat, lon, span_m)
+    except Exception:
+        return Response(status_code=503)
     return Response(
         content=jpg,
         media_type="image/jpeg",
@@ -886,7 +889,7 @@ def serve_index(
     index_path = legacy_server.WEB_DIR / "index.html"
     spot_label = (name or landmark or "").strip()
     if not spot_label:
-        return FileResponse(index_path)
+        return FileResponse(index_path, headers={"Cache-Control": "no-cache"})
 
     raw_html = index_path.read_text(encoding="utf-8")
     phase_txt = "Sunrise" if (phase or "").strip().lower() == "sunrise" else "Sunset"

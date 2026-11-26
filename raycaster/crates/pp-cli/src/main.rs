@@ -277,7 +277,7 @@ fn default_sun_el() -> f64 {
     1.5
 }
 fn default_near_grid_m() -> usize {
-    1800
+    1200
 }
 fn default_az_bins() -> usize {
     180
@@ -1427,7 +1427,7 @@ fn main() -> Result<()> {
         } => {
             let shoot_date: NaiveDate = date.parse()?;
             let db = RecreationDbHarness::open(&cli.recreation_db)?;
-            let terrain = load_hybrid_terrain(&cli.elevation_dir, lat, lon, 2000);
+            let terrain = load_hybrid_terrain(&cli.elevation_dir, lat, lon, 1200);
             let report = find_best_viewpoints_for_seed(
                 &db,
                 &terrain,
@@ -1453,7 +1453,7 @@ fn main() -> Result<()> {
         } => {
             let shoot_date: NaiveDate = date.parse()?;
             let db = RecreationDbHarness::open(&cli.recreation_db)?;
-            let terrain = load_hybrid_terrain(&cli.elevation_dir, target_lat, target_lon, 2000);
+            let terrain = load_hybrid_terrain(&cli.elevation_dir, target_lat, target_lon, 1200);
             let report = analyze_custom_tripod_point(
                 &db,
                 &terrain,

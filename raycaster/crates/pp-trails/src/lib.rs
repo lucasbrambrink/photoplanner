@@ -6,7 +6,7 @@ use pp_raycast::{
     LandmarkTarget3D, LightNotch, LineOfSightResult, SubjectAstroNightSummary,
     SubjectGoldenHourWindow,
 };
-use pp_terrain::{ElevationSurface, HybridTerrain};
+use pp_terrain::{meters_per_deg_lon, ElevationSurface, HybridTerrain, METERS_PER_DEG_LAT};
 use rayon::prelude::*;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -874,7 +874,7 @@ pub fn find_best_viewpoints_for_seed(
         route_sample_ranges.push((start, flat_vps.len()));
     }
 
-    let total_trail_vertices_evaluated = flat_vps.len();
+    let mut total_trail_vertices_evaluated = flat_vps.len();
     let flat_los_results = cast_camera_line_of_sight_batch(terrain, &flat_vps, &target_3d);
 
     let mut candidates: Vec<LandmarkViewpointHikeOption> = all_routes
@@ -998,6 +998,133 @@ pub fn find_best_viewpoints_for_seed(
             Some(vp_opt)
         })
         .collect();
+
+    // If no indexed recreation trails exist in this region (e.g. Mt. Tamalpais, Mount Diablo, Point Reyes,
+    // Rockies, PNW), synthesize raycasted 3D topographic ridge viewpoints around the summit!
+    if candidates.is_empty() {
+        let m_per_lat = METERS_PER_DEG_LAT;
+        let m_per_lon = meters_per_deg_lon(target_3d.summit_lat);
+        let radii_m = [1450.0_f64, 2350.0_f64, 3450.0_f64];
+        let mut ridge_pts: Vec<(f64, f64, f64, f64, usize)> = Vec::new();
+        for (rad_idx, &dist_m) in radii_m.iter().enumerate() {
+            for az_step in 0..36 {
+                let az_deg = (az_step as f64) * 10.0;
+                let az_rad = az_deg.to_radians();
+                let d_north_m = dist_m * az_rad.cos();
+                let d_east_m = dist_m * az_rad.sin();
+                let v_lat = target_3d.summit_lat + d_north_m / m_per_lat;
+                let v_lon = target_3d.summit_lon + d_east_m / m_per_lon;
+                let z1 = terrain.elevation_m(v_lat, v_lon);
+                if z1 > 8.0 {
+                    ridge_pts.push((v_lat, v_lon, z1, az_deg, rad_idx));
+                }
+            }
+        }
+        let batch_coords: Vec<(f64, f64, f64)> =
+            ridge_pts.iter().map(|&(la, lo, z, _, _)| (la, lo, z)).collect();
+        total_trail_vertices_evaluated += batch_coords.len();
+        let ridge_los = cast_camera_line_of_sight_batch(terrain, &batch_coords, &target_3d);
+
+        for (idx, &(lat1, lon1, z1, az_deg, rad_idx)) in ridge_pts.iter().enumerate() {
+            let los = &ridge_los[idx];
+            if !los.is_visible {
+                continue;
+            }
+            // Build a 680m local ridge approach segment outward from the summit
+            let az_rad = az_deg.to_radians();
+            let th_lat = lat1 + (680.0 * az_rad.cos()) / m_per_lat;
+            let th_lon = lon1 + (680.0 * az_rad.sin()) / m_per_lon;
+            let mut path_3d = Vec::with_capacity(5);
+            let mut prev_z = terrain.elevation_m(th_lat, th_lon);
+            let mut gain_m = 0.0_f64;
+            for s in 0..=4 {
+                let frac = (s as f64) / 4.0;
+                let p_lat = th_lat + (lat1 - th_lat) * frac;
+                let p_lon = th_lon + (lon1 - th_lon) * frac;
+                let pz = terrain.elevation_m(p_lat, p_lon);
+                if s > 0 && pz > prev_z {
+                    gain_m += pz - prev_z;
+                }
+                prev_z = pz;
+                path_3d.push([p_lon, p_lat, (pz * 10.0).round() / 10.0]);
+            }
+
+            let hike_miles = 0.42 + (rad_idx as f64) * 0.35;
+            let hike_mins = ((hike_miles * 22.0) + (gain_m * 0.06)).round().max(12.0) as u32;
+            let mut schedules = Vec::new();
+            let mut best_light_bonus = 0.0_f64;
+
+            for win in &gh_windows {
+                let cam_from_target_az = (los.bearing_to_landmark_deg + 180.0).rem_euclid(360.0);
+                let angle_diff = ((cam_from_target_az - win.sun_azimuth_deg + 540.0)
+                    .rem_euclid(360.0)
+                    - 180.0)
+                    .abs();
+                let (lighting_style, angle_bonus) = if angle_diff <= 35.0 {
+                    ("Direct Front Alpenglow (Warm Full-Face Light)", 18.0)
+                } else if angle_diff <= 105.0 {
+                    (
+                        "3/4 Side-Relief Alpenglow (Dramatic 3D Ridge Texture & Shadows)",
+                        24.0,
+                    )
+                } else if angle_diff <= 145.0 {
+                    ("Grazing Edge / Rim Light", 14.0)
+                } else {
+                    ("Backlit Silhouette / Sunburst Alignment", 12.0)
+                };
+                if angle_bonus > best_light_bonus {
+                    best_light_bonus = angle_bonus;
+                }
+                let arrival_local = subtract_minutes_from_hhmm(&win.window_start_local, 20);
+                let depart_local =
+                    subtract_minutes_from_hhmm(&win.window_start_local, 20 + hike_mins as i64);
+                schedules.push(ViewpointWindowSchedule {
+                    phase: win.phase.clone(),
+                    shooting_window_local: format!(
+                        "{} – {}",
+                        win.window_start_local, win.window_end_local
+                    ),
+                    peak_light_local: win.peak_time_local.clone(),
+                    recommended_trailhead_departure_local: depart_local,
+                    target_viewpoint_arrival_local: arrival_local,
+                    sun_azimuth_deg: win.sun_azimuth_deg,
+                    sun_elevation_deg: win.sun_elevation_deg,
+                    camera_to_sun_angle_deg: (angle_diff * 10.0).round() / 10.0,
+                    lighting_style: lighting_style.to_string(),
+                    valley_shadow_contrast_pct: win.valley_shadow_contrast_pct,
+                });
+            }
+
+            let elev_ratio = (z1 / target_3d.summit_elevation_m.max(100.0)).clamp(0.15, 1.0);
+            let prominence_bonus = elev_ratio * 6.0;
+            let overall_score =
+                ((los.composition_score + best_light_bonus + prominence_bonus) * 10.0).round()
+                    / 10.0;
+            let sector = &los.compass_direction;
+            candidates.push(LandmarkViewpointHikeOption {
+                viewpoint_rank: 0,
+                viewpoint_label: format!("{} Ridge Overlook (Looking {})", target_3d.name, sector),
+                viewpoint_lat: (lat1 * 100_000.0).round() / 100_000.0,
+                viewpoint_lon: (lon1 * 100_000.0).round() / 100_000.0,
+                viewpoint_elevation_m: (z1 * 10.0).round() / 10.0,
+                viewpoint_elevation_ft: (z1 * 3.28084).round(),
+                route_id: 9000 + (idx as i64),
+                route_name: format!("{} {} Ridge Approach", target_3d.name, sector),
+                route_type: "Ridge Spur".to_string(),
+                trailhead_name: format!("{} Ridge Spur Access", target_3d.name),
+                trailhead_lat: (th_lat * 100_000.0).round() / 100_000.0,
+                trailhead_lon: (th_lon * 100_000.0).round() / 100_000.0,
+                hike_distance_to_vp_miles: (hike_miles * 100.0).round() / 100.0,
+                total_route_distance_miles: (hike_miles * 2.0 * 100.0).round() / 100.0,
+                elevation_gain_to_vp_feet: (gain_m * 3.28084).round(),
+                hike_duration_to_vp_minutes: hike_mins,
+                sightline: los.clone(),
+                overall_score,
+                schedules,
+                trail_path_to_vp: path_3d,
+            });
+        }
+    }
 
     // Sort candidates by overall photographic score descending
     candidates.sort_by(|a, b| b.overall_score.partial_cmp(&a.overall_score).unwrap());

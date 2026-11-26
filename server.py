@@ -189,6 +189,19 @@ def get_landmarks_list() -> list[dict]:
 
 
 _RASTER_CACHE: dict[str, tuple[int, int, float, float, float, float, object]] = {}
+_RASTER_META_LOCK = __import__("threading").Lock()
+_RASTER_INFLIGHT_LOCKS: dict[str, object] = {}
+
+
+def _get_raster_inflight_lock(key: str):
+    import threading
+
+    with _RASTER_META_LOCK:
+        lk = _RASTER_INFLIGHT_LOCKS.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            _RASTER_INFLIGHT_LOCKS[key] = lk
+        return lk
 
 
 def decode_arcgis_f32_geotiff_bytes(
@@ -266,8 +279,36 @@ def decode_arcgis_f32_geotiff_bytes(
 DEFAULT_TERRAIN_SPAN_M = 28000.0
 
 
-def fetch_or_load_full_3dep_raster(
+def _find_cached_nearby_full_3dep_tif(
     lat: float, lon: float, span_m: float
+) -> Path | None:
+    """Finds an existing `usgs_3dep_full_*` GeoTIFF on disk centered within ~420m (covering summit-snapped coords)."""
+    if not CACHE_DIR.exists():
+        return None
+    target_span = int(span_m)
+    best_path: Path | None = None
+    best_dist2 = 1e9
+    for cand in CACHE_DIR.glob(f"usgs_3dep_full_*_{target_span}_*.tif"):
+        try:
+            if cand.stat().st_size < 16_384:
+                continue
+            parts = cand.stem.split("_")
+            if len(parts) < 6:
+                continue
+            c_lat = float(parts[3])
+            c_lon = float(parts[4])
+            if abs(c_lat - lat) <= 0.0042 and abs(c_lon - lon) <= 0.0052:
+                d2 = (c_lat - lat) ** 2 + (c_lon - lon) ** 2
+                if d2 < best_dist2:
+                    best_dist2 = d2
+                    best_path = cand
+        except Exception:
+            continue
+    return best_path
+
+
+def fetch_or_load_full_3dep_raster(
+    lat: float, lon: float, span_m: float, timeout_s: float = 24.0
 ) -> tuple[int, int, float, float, float, float, object]:
     """Fetches a high-density USGS 3DEP F32 GeoTIFF covering the entire `span_m x span_m` view with matched aspect ratio."""
     import math
@@ -276,7 +317,7 @@ def fetch_or_load_full_3dep_raster(
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     m_per_lat = 111_132.92
     m_per_lon = 111_412.84 * math.cos(math.radians(lat))
-    half_m = span_m * 0.52  # 4% margin so boundary samples never clip
+    half_m = span_m * 0.56  # 12% total margin so summit-snapped (±400m) patches never clip
     dlat = half_m / m_per_lat
     dlon = half_m / m_per_lon
 
@@ -284,6 +325,13 @@ def fetch_or_load_full_3dep_raster(
     max_lat = lat + dlat
     min_lon = lon - dlon
     max_lon = lon + dlon
+
+    # Reuse any nearby prewarmed GeoTIFF first
+    existing = _find_cached_nearby_full_3dep_tif(lat, lon, span_m)
+    if existing is not None:
+        if existing.name in _RASTER_CACHE:
+            return _RASTER_CACHE[existing.name]
+        return decode_arcgis_f32_geotiff_bytes(existing.read_bytes(), cache_id=existing.name)
 
     if span_m >= 36000.0:
         h_px = 1440
@@ -297,7 +345,16 @@ def fetch_or_load_full_3dep_raster(
     if cache_id in _RASTER_CACHE:
         return _RASTER_CACHE[cache_id]
 
-    if not disk_path.exists() or disk_path.stat().st_size < 16_384:
+    inflight_key = f"full:{int(span_m)}:{round(lat, 3):.3f}:{round(lon, 3):.3f}"
+    with _get_raster_inflight_lock(inflight_key):
+        existing_after_wait = _find_cached_nearby_full_3dep_tif(lat, lon, span_m)
+        if existing_after_wait is not None:
+            if existing_after_wait.name in _RASTER_CACHE:
+                return _RASTER_CACHE[existing_after_wait.name]
+            return decode_arcgis_f32_geotiff_bytes(
+                existing_after_wait.read_bytes(), cache_id=existing_after_wait.name
+            )
+
         url = (
             "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage"
             f"?bbox={min_lon:.6f},{min_lat:.6f},{max_lon:.6f},{max_lat:.6f}"
@@ -305,17 +362,34 @@ def fetch_or_load_full_3dep_raster(
             "&interpolation=+RSP_BilinearInterpolation&f=image"
         )
         req = urllib.request.Request(url, headers={"User-Agent": "PhotoPlanner/0.4"})
-        with urllib.request.urlopen(req, timeout=24) as resp:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             tiff_bytes = resp.read()
+        if len(tiff_bytes) < 16_384:
+            raise RuntimeError(f"USGS 3DEP returned truncated payload ({len(tiff_bytes)} B)")
         disk_path.write_bytes(tiff_bytes)
-    else:
-        tiff_bytes = disk_path.read_bytes()
+        return decode_arcgis_f32_geotiff_bytes(tiff_bytes, cache_id=cache_id)
 
-    return decode_arcgis_f32_geotiff_bytes(tiff_bytes, cache_id=cache_id)
+
+def _prewarm_full_3dep_raster(
+    lat: float, lon: float, span_m: float = DEFAULT_TERRAIN_SPAN_M
+) -> None:
+    """Starts an asynchronous background download of the 3DEP GeoTIFF while Rust scans trails."""
+    import threading
+
+    if _find_cached_nearby_full_3dep_tif(lat, lon, span_m) is not None:
+        return
+
+    def _worker() -> None:
+        try:
+            fetch_or_load_full_3dep_raster(lat, lon, span_m, timeout_s=12.0)
+        except Exception:
+            pass
+
+    threading.Thread(target=_worker, name="pp-3dep-prewarm", daemon=True).start()
 
 
 def fetch_or_load_core_3dep_raster(
-    lat: float, lon: float
+    lat: float, lon: float, timeout_s: float = 7.5
 ) -> tuple[int, int, float, float, float, float, object] | None:
     """Fetches a ~2m ultra-fine USGS 3DEP F32 GeoTIFF covering the inner 2,400m x 2,400m landmark core."""
     import math
@@ -332,28 +406,37 @@ def fetch_or_load_core_3dep_raster(
     min_lon = lon - dlon
     max_lon = lon + dlon
 
-    h_px = 760
+    h_px = 640
     w_px = int(round(h_px * (dlon / dlat)))
-    disk_path = CACHE_DIR / f"usgs_3dep_core_{lat:.4f}_{lon:.4f}_2400_{w_px}x{h_px}.tif"
+    legacy_w = int(round(760 * (dlon / dlat)))
+    legacy_path = CACHE_DIR / f"usgs_3dep_core_{lat:.4f}_{lon:.4f}_2400_{legacy_w}x760.tif"
+    disk_path = (
+        legacy_path
+        if legacy_path.exists() and legacy_path.stat().st_size >= 16_384
+        else CACHE_DIR / f"usgs_3dep_core_{lat:.4f}_{lon:.4f}_2400_{w_px}x{h_px}.tif"
+    )
     cache_id = disk_path.name
     if cache_id in _RASTER_CACHE:
         return _RASTER_CACHE[cache_id]
 
     try:
-        if not disk_path.exists() or disk_path.stat().st_size < 16_384:
-            url = (
-                "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage"
-                f"?bbox={min_lon:.6f},{min_lat:.6f},{max_lon:.6f},{max_lat:.6f}"
-                f"&bboxSR=4326&size={w_px},{h_px}&imageSR=4326&format=tiff&pixelType=F32"
-                "&interpolation=+RSP_BilinearInterpolation&f=image"
-            )
-            req = urllib.request.Request(url, headers={"User-Agent": "PhotoPlanner/0.4"})
-            with urllib.request.urlopen(req, timeout=14) as resp:
-                tiff_bytes = resp.read()
-            disk_path.write_bytes(tiff_bytes)
-        else:
-            tiff_bytes = disk_path.read_bytes()
-        return decode_arcgis_f32_geotiff_bytes(tiff_bytes, cache_id=cache_id)
+        with _get_raster_inflight_lock(f"core:{lat:.4f}:{lon:.4f}"):
+            if not disk_path.exists() or disk_path.stat().st_size < 16_384:
+                url = (
+                    "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage"
+                    f"?bbox={min_lon:.6f},{min_lat:.6f},{max_lon:.6f},{max_lat:.6f}"
+                    f"&bboxSR=4326&size={w_px},{h_px}&imageSR=4326&format=tiff&pixelType=F32"
+                    "&interpolation=+RSP_BilinearInterpolation&f=image"
+                )
+                req = urllib.request.Request(url, headers={"User-Agent": "PhotoPlanner/0.4"})
+                with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                    tiff_bytes = resp.read()
+                if len(tiff_bytes) < 16_384:
+                    return None
+                disk_path.write_bytes(tiff_bytes)
+            else:
+                tiff_bytes = disk_path.read_bytes()
+            return decode_arcgis_f32_geotiff_bytes(tiff_bytes, cache_id=cache_id)
     except Exception:
         return None
 
@@ -1164,6 +1247,10 @@ def run_shoot_landmark(landmark: str, date_str: str, max_miles: float, top_k: in
         return _CACHE[cache_key]
 
     if _should_use_rust_general_engine():
+        for lm_entry in get_landmarks_list():
+            if lm_entry["name"] == landmark:
+                _prewarm_full_3dep_raster(float(lm_entry["lat"]), float(lm_entry["lon"]), DEFAULT_TERRAIN_SPAN_M)
+                break
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
             tmp_path = Path(tmp.name)
         try:
@@ -1218,6 +1305,7 @@ def run_shoot_coordinate(
         return _CACHE[cache_key]
 
     if _should_use_rust_general_engine():
+        _prewarm_full_3dep_raster(lat, lon, DEFAULT_TERRAIN_SPAN_M)
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
             tmp_path = Path(tmp.name)
         try:
@@ -1350,22 +1438,55 @@ def _sample_raster_numpy_2d(
     z10 = arr[r0 + 1, c0]
     z11 = arr[r0 + 1, c0 + 1]
     val = (z00 * (1.0 - dc) + z01 * dc) * (1.0 - dr) + (z10 * (1.0 - dc) + z11 * dc) * dr
-    fallback = np.float32(0.0 if is_coastal else 1200.0)
-    val = np.where(inside, val, fallback)
     if is_coastal:
-        val = np.maximum(np.float32(0.0), val)
+        val = np.where(inside, np.maximum(np.float32(0.0), val), np.float32(0.0))
     return val, inside
 
 
+def _fallback_rust_terrain_grid(lat: float, lon: float, span_m: float, grid_size: int):
+    """Fast SRTM1 + cached 1m LiDAR fallback via Rust `photoplanner terrain-patch` if USGS ArcGIS times out."""
+    import numpy as np
+
+    if not RUST_BIN.exists():
+        raise RuntimeError(f"Rust photoplanner binary missing at {RUST_BIN}")
+    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tmp:
+        tmp_bin = Path(tmp.name)
+    try:
+        cmd = [
+            str(RUST_BIN),
+            "--elevation-dir",
+            str(ELEVATION_DIR),
+            "--recreation-db",
+            str(RECREATION_DB),
+            "terrain-patch",
+            "--lat",
+            f"{lat:.5f}",
+            "--lon",
+            f"{lon:.5f}",
+            "--span-m",
+            f"{span_m:.1f}",
+            "--grid-size",
+            str(grid_size),
+            "--bin-out",
+            str(tmp_bin),
+        ]
+        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=20)
+        raw = tmp_bin.read_bytes()
+        hdr_len = struct.unpack("<I", raw[:4])[0]
+        return np.frombuffer(raw, dtype="<f4", offset=4 + hdr_len).reshape((grid_size, grid_size)).copy()
+    finally:
+        if tmp_bin.exists():
+            os.remove(tmp_bin)
+
+
 def _compute_terrain_patch_grid(lat: float, lon: float, span_m: float, grid_size: int) -> tuple[dict, bytes, list[float]]:
+    from concurrent.futures import ThreadPoolExecutor
     import math
     import numpy as np
 
     span_m = max(4000.0, min(64000.0, float(span_m)))
     grid_size = max(240, min(768, grid_size))
-    is_coastal = is_sf_peninsula_coord(lat, lon)
-    full_raster = fetch_or_load_full_3dep_raster(lat, lon, span_m)
-    core_raster = fetch_or_load_core_3dep_raster(lat, lon)
+    peninsula_coastal = is_sf_peninsula_coord(lat, lon)
 
     m_per_lat = 111_132.92
     m_per_lon = 111_412.84 * math.cos(math.radians(lat))
@@ -1377,11 +1498,9 @@ def _compute_terrain_patch_grid(lat: float, lon: float, span_m: float, grid_size
     patch_min_lon = lon - half_span / m_per_lon
     patch_max_lon = lon + half_span / m_per_lon
 
-    fine_rasters = []
-    if core_raster is not None:
-        cw, ch, c_lon_nw, c_lat_nw, c_dx, c_dy, _ = core_raster
-        fine_rasters.append((c_lon_nw, c_lon_nw + cw * c_dx, c_lat_nw - ch * c_dy, c_lat_nw, core_raster))
-
+    # 1. Discover any overlapping 1m LiDAR tiles already cached by `shoot-coordinate` / `shoot-landmark`
+    fine_1m_rasters = []
+    has_center_1m_tile = False
     if CACHE_DIR.exists():
         for tif_file in CACHE_DIR.glob("usgs_3dep_1m_*.tif"):
             try:
@@ -1403,9 +1522,35 @@ def _compute_terrain_patch_grid(lat: float, lon: float, span_m: float, grid_size
                     and r_lat_nw >= patch_min_lat
                     and r_lat_se <= patch_max_lat
                 ):
-                    fine_rasters.append((r_lon_nw, r_lon_se, r_lat_se, r_lat_nw, r_1m))
+                    fine_1m_rasters.append((r_lon_nw, r_lon_se, r_lat_se, r_lat_nw, r_1m))
+                    if r_lon_nw <= lon <= r_lon_se and r_lat_se <= lat <= r_lat_nw:
+                        has_center_1m_tile = True
             except Exception:
                 pass
+
+    # 2. Fetch full 3DEP raster (+ optional 2.4km core raster ONLY if no 1m tile covers summit) concurrently
+    full_raster = None
+    core_raster = None
+    if has_center_1m_tile:
+        try:
+            full_raster = fetch_or_load_full_3dep_raster(lat, lon, span_m)
+        except Exception:
+            full_raster = None
+    else:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_full = pool.submit(fetch_or_load_full_3dep_raster, lat, lon, span_m)
+            fut_core = pool.submit(fetch_or_load_core_3dep_raster, lat, lon)
+            try:
+                full_raster = fut_full.result()
+            except Exception:
+                full_raster = None
+            core_raster = fut_core.result()
+
+    fine_rasters = []
+    if core_raster is not None:
+        cw, ch, c_lon_nw, c_lat_nw, c_dx, c_dy, _ = core_raster
+        fine_rasters.append((c_lon_nw, c_lon_nw + cw * c_dx, c_lat_nw - ch * c_dy, c_lat_nw, core_raster))
+    fine_rasters.extend(fine_1m_rasters)
 
     offs = -half_span + np.arange(grid_size, dtype=np.float64) * step_m
     sample_lats = lat + offs[:, None] / m_per_lat
@@ -1413,15 +1558,20 @@ def _compute_terrain_patch_grid(lat: float, lon: float, span_m: float, grid_size
     lats_2d = np.broadcast_to(sample_lats, (grid_size, grid_size))
     lons_2d = np.broadcast_to(sample_lons, (grid_size, grid_size))
 
-    z_grid, _ = _sample_raster_numpy_2d(full_raster, lats_2d, lons_2d, is_coastal)
+    if full_raster is not None:
+        z_grid, _ = _sample_raster_numpy_2d(full_raster, lats_2d, lons_2d, peninsula_coastal)
+    else:
+        z_grid = _fallback_rust_terrain_grid(lat, lon, span_m, grid_size)
+
     # Overlay fine 1m / core rasters in reverse order so first fine raster wins (matching prior precedence)
     for _, _, _, _, r_fine in reversed(fine_rasters):
-        fine_vals, fine_mask = _sample_raster_numpy_2d(r_fine, lats_2d, lons_2d, is_coastal)
+        fine_vals, fine_mask = _sample_raster_numpy_2d(r_fine, lats_2d, lons_2d, peninsula_coastal)
         z_grid = np.where(fine_mask, fine_vals, z_grid)
 
     z_f32 = np.round(z_grid, 2).astype("<f4")
     min_z = float(np.min(z_f32))
     max_z = float(np.max(z_f32))
+    is_coastal = bool(peninsula_coastal or (-15.0 <= min_z <= 2.5 and lon <= -117.0))
     meta = {
         "center_lat": lat,
         "center_lon": lon,
@@ -1532,8 +1682,8 @@ def fetch_usgs_ortho_jpeg(lat: float, lon: float, span_m: float) -> bytes:
     max_lon = lon + dlon
     max_lat = lat + dlat
 
-    # 2.4K ultra-sharp aerial imagery with matched (dlon : dlat) aspect ratio
-    w_px = 2400
+    # 1.6K crisp aerial imagery with matched (dlon : dlat) aspect ratio & fast export
+    w_px = 1600
     h_px = int(round(w_px * (dlat / dlon)))
 
     url = (
@@ -1542,9 +1692,10 @@ def fetch_usgs_ortho_jpeg(lat: float, lon: float, span_m: float) -> bytes:
         f"&bboxSR=4326&imageSR=4326&size={w_px},{h_px}&format=jpg&f=image"
     )
     req = urllib.request.Request(url, headers={"User-Agent": "PhotoPlanner/0.4"})
-    with urllib.request.urlopen(req, timeout=18) as resp:
+    with urllib.request.urlopen(req, timeout=9) as resp:
         img_bytes = resp.read()
-    disk_path.write_bytes(img_bytes)
+    if len(img_bytes) > 1000:
+        disk_path.write_bytes(img_bytes)
     return img_bytes
 
 

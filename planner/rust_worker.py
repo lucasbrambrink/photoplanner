@@ -250,7 +250,7 @@ class RustWorkerClient:
         sun_el_deg: float,
         batch_input: dict[str, Any] | None = None,
         skip_lut: bool = False,
-        near_grid_m: int = 1800,
+        near_grid_m: int = 1200,
         az_bins: int = 180,
         alt_bins: int = 32,
         timeout: float = 90.0,

@@ -97,7 +97,7 @@
         </div>
 
         <form id="query-form" class="sheet-controls" aria-label="Subject and Date">
-          <div class="spot-search-wrap" id="spot-search-wrap">
+          <search class="spot-search-wrap" id="spot-search-wrap">
             <svg class="spot-search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <circle cx="11" cy="11" r="8" />
               <line x1="21" y1="21" x2="16.65" y2="16.65" />
@@ -105,16 +105,21 @@
             <input
               type="search"
               id="spot-search-input"
+              name="spot"
               class="input-search"
               value="Montara Mountain"
               placeholder="Search any US peak, lake, or GPS…"
               autocomplete="off"
+              autocorrect="off"
+              autocapitalize="none"
+              spellcheck="false"
+              enterkeyhint="search"
               aria-label="Search any US photography peak, lake, or GPS coordinates"
               aria-autocomplete="list"
               aria-controls="spot-search-results"
             />
             <div class="spot-search-dropdown" id="spot-search-results" role="listbox" hidden></div>
-          </div>
+          </search>
 
           <!-- Hidden legacy preset select kept in sync for quick benchmarks -->
           <select id="landmark-select" name="landmark" hidden>
